@@ -1,9 +1,13 @@
 services:
   backend:
-    build: .
+    build:
+      context: .
+      args:
+        GPU: "1"
     container_name: openshorts-backend
     ports:
       - "8000:8000"
+    gpus: all
     volumes:
       - .:/app
       - /app/__pycache__
