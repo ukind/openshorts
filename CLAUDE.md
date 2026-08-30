@@ -120,6 +120,17 @@ Gemini era de las medidas continuas, no del modelo.
 `layout_picker.apply()` sólo **añade**: una elección explícita del usuario nunca
 se desactiva porque el modelo diga `none`.
 
+### Third-party LLM endpoint (optional, phase 1)
+
+`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` reroute the text stages to any
+OpenAI-compatible `/v1/chat/completions`. Per-task overrides:
+`LLM_MODEL_THUMBNAIL`, `LLM_MODEL_SAAS` (chain: `LLM_MODEL_<TASK>` then
+`LLM_MODEL`, never `GEMINI_MODEL*`).
+
+- Reroutes: clips score/detail, layout picker, thumbnail text, SaaS analyze/scripts.
+- Stays Gemini: image gen, silent-video, editor effects, SaaS grounded research, cloud/managed.
+- Half-configured (no model) → inert + warning; the default path is byte-identical when unset.
+
 ### Thumbnail Studio (`thumbnail.py`, `/api/thumbnail/*`)
 
 Titles come from the transcript plus 10 frames at 1024px, never the whole

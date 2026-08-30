@@ -5,6 +5,13 @@ Every call carries `Authorization: Bearer osk_...` or `X-API-Key: osk_...`.
 Self-hosted instances need no key, but do need a Gemini key, either in the
 server's environment or as an `X-Gemini-Key` header.
 
+Self-hosted instances can route the AI text stages to any OpenAI-compatible
+endpoint with three env vars (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`) or
+the header triple `X-LLM-Base-Url` + `X-LLM-Key` (+ optional `X-LLM-Model`).
+See the server README for the full capability matrix and recipes. The Gemini
+key is still needed for image generation, silent-video analysis, and editor
+effects (class C/D/E stages stay Gemini-pinned in phase 1).
+
 The MCP server at `https://mcp.openshorts.app/mcp` wraps exactly these
 endpoints, forwarding your auth headers, so the two paths cannot drift.
 

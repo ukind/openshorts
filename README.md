@@ -413,6 +413,128 @@ lives in [`examples/n8n/`](examples/n8n/).
 
 ---
 
+## Using an OpenAI-compatible endpoint (instead of, or alongside, Gemini)
+
+OpenShorts uses Google Gemini by default for all AI work. Every TEXT stage can
+instead run on ANY OpenAI-compatible chat-completions endpoint — Ollama Cloud,
+a local Ollama, MiniMax, OpenRouter, vLLM, llama.cpp server, an OpenAI-compatible
+proxy — selected with three environment variables. Gemini stays the default:
+with the variables unset, nothing changes.
+
+### Configuration (server env)
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `LLM_BASE_URL` | yes | Base URL of the OpenAI-compatible API, e.g. `https://ollama.com/v1` |
+| `LLM_API_KEY` | yes | API key (Ollama Cloud key, MiniMax key, OpenRouter key, ...). Any value works for a local Ollama (`ollama`). |
+| `LLM_MODEL` | yes | Default model for all rerouted stages, e.g. `gpt-oss:120b` |
+| `LLM_MODEL_THUMBNAIL` | no | Model for thumbnail title/concept text (defaults to `LLM_MODEL`) |
+| `LLM_MODEL_SAAS` | no | Model for SaaS analyze/script text (defaults to `LLM_MODEL`) |
+
+All three of `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` are required: a
+partially-set endpoint stays INERT (Gemini keeps running) with a one-line
+warning naming what is missing. There is no `LLM_MODEL_EDITOR` yet — the
+editor effects stage and the other Gemini-only stages below do not reroute.
+
+### What reroutes, what stays on Gemini
+
+| Stage | Reroutes to the endpoint? | Notes |
+|---|---|---|
+| Clip scoring + detail (the 2-pass analysis) | yes | including the blocked-content bisect ladder |
+| Layout picker (12 frames) | yes | degrades to the default layout on any failure, exactly as with Gemini |
+| Thumbnail titles / concepts / description (TEXT) | yes | image GENERATION stays on Gemini |
+| SaaS analyze + script generation | yes | |
+| SaaS web research (Google-Search grounding) | no — Gemini-only | skipped with a log line when only the endpoint is configured |
+| Thumbnail image generation | no — Gemini-only | needs a Gemini key as before |
+| Silent-video clip detection (vision) | no — Gemini-only | the endpoint cannot watch video |
+| Editor effects (/api/edit, /api/effects) | no — Gemini-only | video upload stages |
+| Cloud/managed mode | no — Gemini-pinned | `LLM_*` env vars are stripped from managed jobs |
+
+Structured output: requests ask for `response_format=json_schema` first, fall
+back to JSON mode, then to a plain request (every prompt embeds its JSON shape
+in-band and responses are parsed tolerantly — the same ladder the Gemini path
+uses). Provider policy refusals raise the SAME blocked-content error the Gemini
+path raises (never retried; alerts classify it as "blocked content (user video)").
+Provider outages (429/5xx/timeout) retry 3x with backoff on the CLIP PIPELINE
+(main.py's _run_gemini_stage owns the retry loop); the thumbnail and SaaS text
+endpoints call the endpoint once per request (no ladder) and surface the first
+transient as their error. Bad keys and unknown models fail immediately with the
+provider's message.
+
+### Recipes
+
+Ollama Cloud (hosted; get an API key at ollama.com):
+
+```bash
+LLM_BASE_URL=https://ollama.com/v1
+LLM_API_KEY=sk-...your-ollama-key...
+LLM_MODEL=gpt-oss:120b
+```
+
+Local Ollama (same machine; any non-empty key value works):
+
+```bash
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_API_KEY=ollama
+LLM_MODEL=qwen3:32b
+```
+
+MiniMax M3 (OpenAI-compatible endpoint):
+
+```bash
+LLM_BASE_URL=https://api.minimax.io/v1
+LLM_API_KEY=eyJ...your-minimax-key...
+LLM_MODEL=MiniMax-M3
+```
+
+OpenRouter (one key, many models):
+
+```bash
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=sk-or-v1-...
+LLM_MODEL=anthropic/claude-sonnet-4
+```
+
+vLLM, llama.cpp and anything else speaking `/v1/chat/completions` works the
+same way. Vision stages (layout picking, thumbnail title brainstorm) need a
+model that accepts base64 images; they are sent as data URLs.
+
+### Per-request BYOK (API / MCP callers)
+
+Self-host callers can override the endpoint per request with headers (base-url
+AND key must be sent together — a header key is never sent to an env-configured
+base URL):
+
+```bash
+curl -X POST http://localhost:8000/api/thumbnail/analyze \
+  -H "X-LLM-Base-Url: https://ollama.com/v1" \
+  -H "X-LLM-Key: $OLLAMA_KEY" \
+  -H "X-LLM-Model: gpt-oss:120b" \
+  -F "file=@video.mp4"
+```
+
+Caveat: like `X-Gemini-Key`, header-provided config does NOT survive a
+redeploy-resume — an interrupted job falls back to the server's env (and, with
+no env config, fails with the normal missing-key message). Env-configured
+endpoints survive restarts and resumes.
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Warning "...no model is set... backend stays inactive" | `LLM_MODEL` (or the per-task var) is missing; Gemini keeps running |
+| `LLM provider rejected the request (HTTP 401)` | Wrong API key |
+| `HTTP 404` naming the model | Model does not exist on that endpoint (`ollama pull` it, or fix the name) |
+| `LLM provider response was truncated (finish_reason=length)` | Model context too small for transcript + frames — pick a larger-context model |
+| `LLM provider timeout` / `transient error (HTTP 429/5xx)` | Retried 3x automatically; if it still ends the job, the endpoint was down — try again later |
+| `The AI provider blocked this video's content (...)` | The endpoint's policies refuse this material — same meaning as Gemini's blocked error, never retried |
+| Jobs use Gemini despite LLM_* being set | The three required vars are not all set (check the startup warning), or you are on cloud/managed mode (pinned to Gemini) |
+
+Rollback: unset the `LLM_*` variables and restart — the pipeline returns to
+Gemini with no code or data changes.
+
+---
+
 ## Security & Performance
 
 - **Non-Root Execution**: Containers run as dedicated `appuser`
