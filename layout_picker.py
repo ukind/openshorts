@@ -129,15 +129,25 @@ def sample_frames(video_path, n=None, width=None):
 
 
 def pick(video_path, video_duration):
-    """The layout Gemini picks for this video, or "none" on any failure.
+    """The layout the model (Gemini, or the third-party endpoint when
+    configured) picks for this video, or "none" on any failure.
 
-    Never raises: a missing answer has to degrade to today's routing rather
-    than break the job.
+    Never raises: a missing answer has to degrade to today's routing
+    rather than break the job.
     """
     if not ENABLED:
         return "none"
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    llm = None
+    try:
+        # Lazy like the genai import below: the disabled path (and CI) must
+        # not pay for it. active_config() never raises; it may print a
+        # one-line warning when the endpoint is half-configured.
+        import llm_client
+        llm = llm_client.active_config()
+    except Exception:
+        llm = None
+    if llm is None and not api_key:
         return "none"
 
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
@@ -154,20 +164,33 @@ def pick(video_path, video_duration):
             print("   ⚠️ No readable frames — keeping the default layout.")
             return "none"
 
-        client = genai.Client(api_key=api_key)
-        parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
-                 for b in frames]
-        response = client.models.generate_content(
-            model=model_name,
-            contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=gemini_worker.LayoutChoice,
-            ))
-        gemini_worker.raise_if_blocked(response)
-        answer = json.loads(response.text) or {}
+        if llm is not None:
+            # Third-party endpoint: same 12 frames, same closed-choice
+            # schema. The third-party backend wins when configured, symmetric
+            # with get_viral_clips — mixed routing would be worse than either.
+            answer, _cost = llm_client.chat(
+                gemini_worker.LAYOUT_CHOICE_PROMPT,
+                gemini_worker.LayoutChoice,
+                images=frames, config=llm)
+        else:
+            client = genai.Client(api_key=api_key)
+            parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
+                     for b in frames]
+            response = client.models.generate_content(
+                model=model_name,
+                contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=gemini_worker.LayoutChoice,
+                ))
+            gemini_worker.raise_if_blocked(response)
+            answer = json.loads(response.text) or {}
     except Exception as e:
-        print(f"   ⚠️ Layout choice failed ({e}) — keeping the default layout.")
+        # D9: "LLM provider" is reserved for terminal error lines. A degraded
+        # fallback must not leak the phrase into the log tail: llm_client
+        # failures log their class name only; the Gemini arm keeps HEAD's text.
+        reason = type(e).__name__ if type(e).__module__ == "llm_client" else e
+        print(f"   ⚠️ Layout choice failed ({reason}) — keeping the default layout.")
         return "none"
 
     decision = str(answer.get("layout", "none")).strip().lower()

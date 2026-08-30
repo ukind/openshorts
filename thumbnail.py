@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from gemini_worker import GeminiBlockedError
 
 # Text/analysis model (titles, concepts, description). Deliberately NOT tied to
 # GEMINI_MODEL: the pipeline runs flash-lite for a closed-choice layout pick,
@@ -59,7 +60,7 @@ def _frame_parts(video_path, n=TITLE_FRAMES, width=TITLE_FRAME_WIDTH):
 # Titles
 # ---------------------------------------------------------------------------
 
-def analyze_video_for_titles(api_key, video_path, transcript=None):
+def analyze_video_for_titles(api_key, video_path, transcript=None, llm_config=None):
     """
     Suggests YouTube titles from the transcript plus a handful of frames.
     Two calls: a wide brainstorm, then a critic that scores and picks a
@@ -74,8 +75,21 @@ def analyze_video_for_titles(api_key, video_path, transcript=None):
     else:
         print("🎬 [Thumbnail] Using pre-computed transcript (Whisper already done)...")
 
-    client = genai.Client(api_key=api_key)
-    frames = _frame_parts(video_path)
+    # Third-party endpoint: the SAME 10 frames @1024px the Gemini arm sends
+    # (_frame_parts defaults via TITLE_FRAMES/TITLE_FRAME_WIDTH), degraded to
+    # [] on any failure — mirrors _frame_parts. Gemini arm keeps _frame_parts.
+    if llm_config is not None:
+        import llm_client
+        from layout_picker import sample_frames
+        try:
+            frames = sample_frames(video_path, n=TITLE_FRAMES,
+                                   width=TITLE_FRAME_WIDTH)
+        except Exception as e:
+            print(f"⚠️ [Thumbnail] Could not sample frames: {e}")
+            frames = []
+    else:
+        frames = _frame_parts(video_path)
+    client = genai.Client(api_key=api_key) if (api_key and llm_config is None) else None
     language = transcript.get("language", "en")
     segments = transcript.get("segments", [])
     video_duration = segments[-1]["end"] if segments else 0
@@ -114,15 +128,21 @@ OUTPUT JSON:
 }}"""
 
     print("🤖 [Thumbnail] Brainstorming titles...")
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=frames + [brainstorm_prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
     try:
-        draft = _parse_json(response.text)
+        if llm_config is not None:
+            text, _cost = llm_client.chat(brainstorm_prompt, config=llm_config,
+                                          images=frames, json_mode=True)
+        else:
+            response = client.models.generate_content(
+                model=TEXT_MODEL,
+                contents=frames + [brainstorm_prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            text = response.text
+        draft = _parse_json(text)
     except (json.JSONDecodeError, AttributeError):
-        print(f"❌ [Thumbnail] Failed to parse brainstorm JSON: {getattr(response, 'text', '')}")
+        print(f"❌ [Thumbnail] Failed to parse brainstorm JSON: "
+              f"{text if llm_config is not None else getattr(response, 'text', '')}")
         return {
             "titles": ["Could not generate titles - please try again"],
             "thumbnail_texts": [],
@@ -163,18 +183,25 @@ OUTPUT JSON:
 }}"""
 
     print("🧐 [Thumbnail] Scoring titles...")
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=[critic_prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
     try:
-        picked = _parse_json(response.text)
+        if llm_config is not None:
+            text, _cost = llm_client.chat(critic_prompt, config=llm_config,
+                                          json_mode=True)
+        else:
+            response = client.models.generate_content(
+                model=TEXT_MODEL, contents=[critic_prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            text = response.text
+        picked = _parse_json(text)
         titles = [t for t in picked.get("titles", []) if isinstance(t, str) and t.strip()]
         if not titles:
             raise ValueError("no titles")
+    except GeminiBlockedError:
+        raise  # provider policy refusal (llm path): propagate, never degrade
     except (json.JSONDecodeError, AttributeError, ValueError):
-        print(f"⚠️ [Thumbnail] Critic failed, falling back to the brainstorm: {getattr(response, 'text', '')[:300]}")
+        print(f"⚠️ [Thumbnail] Critic failed, falling back to the brainstorm: "
+              f"{text if llm_config is not None else getattr(response, 'text', '')[:300]}")
         titles = candidates[:10]
         picked = {"thumbnail_texts": [], "recommended": []}
 
@@ -193,11 +220,11 @@ OUTPUT JSON:
     }
 
 
-def refine_titles(api_key, context, user_message, conversation_history=None):
+def refine_titles(api_key, context, user_message, conversation_history=None, llm_config=None):
     """
     Takes video context + user feedback and returns refined title suggestions.
     """
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key) if (api_key and llm_config is None) else None
 
     history_text = ""
     if conversation_history:
@@ -231,24 +258,26 @@ OUTPUT JSON:
     "language": "ISO 639-1 code of the language the titles are written in"
 }}"""
 
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        )
-    )
-
     try:
-        result = _parse_json(response.text)
+        if llm_config is not None:
+            import llm_client
+            text, _cost = llm_client.chat(prompt, config=llm_config, json_mode=True)
+        else:
+            response = client.models.generate_content(
+                model=TEXT_MODEL, contents=[prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"))
+            text = response.text
+        result = _parse_json(text)
         titles = [t for t in result.get("titles", []) if isinstance(t, str) and t.strip()]
         texts = [str(t) for t in result.get("thumbnail_texts", [])][:len(titles)]
         texts += [""] * (len(titles) - len(texts))
         return {"titles": titles, "thumbnail_texts": texts,
                 "language": str(result.get("language") or "")[:5]}
     except (json.JSONDecodeError, AttributeError):
-        print(f"❌ [Thumbnail] Failed to parse refined titles: {response.text}")
-        return {"titles": ["Could not refine titles - please try again"], "thumbnail_texts": [], "language": ""}
+        print(f"❌ [Thumbnail] Failed to parse refined titles: "
+              f"{text if llm_config is not None else getattr(response, 'text', '')}")
+        return {"titles": ["Could not refine titles - please try again"],
+                "thumbnail_texts": [], "language": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +396,8 @@ def _crop_face_reference(frame_path, face_box, out_path):
 # ---------------------------------------------------------------------------
 
 def plan_thumbnail_concepts(client, title, count, video_context="", extra_prompt="",
-                            thumbnail_text_hint="", has_person=False, language="en"):
+                            thumbnail_text_hint="", has_person=False, language="en",
+                            llm_config=None):
     """
     One text call that designs `count` DIFFERENT thumbnails before any pixel is
     drawn. Asking the image model to invent the concept and render it in one
@@ -403,15 +433,19 @@ Per concept give:
 OUTPUT JSON:
 {{"concepts": [{{"text": "...", "text_position": "left", "text_color": "yellow", "scene": "...", "why": "..."}}, ...]}}"""
 
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
     try:
-        concepts = _parse_json(response.text).get("concepts", [])
+        if llm_config is not None:
+            import llm_client
+            text, _cost = llm_client.chat(prompt, config=llm_config, json_mode=True)
+        else:
+            response = client.models.generate_content(
+                model=TEXT_MODEL, contents=[prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"))
+            text = response.text
+        concepts = _parse_json(text).get("concepts", [])
     except (json.JSONDecodeError, AttributeError):
-        print(f"⚠️ [Thumbnail] Concept JSON unreadable, using a generic concept: {getattr(response, 'text', '')[:200]}")
+        print(f"⚠️ [Thumbnail] Concept JSON unreadable, using a generic concept: "
+              f"{text if llm_config is not None else getattr(response, 'text', '')[:200]}")
         concepts = []
     return normalise_concepts(concepts, count, title, thumbnail_text_hint)
 
@@ -593,7 +627,8 @@ Style: high contrast, saturated colours, crisp subject separation, cinematic lig
 
 def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_image_path=None,
                        extra_prompt="", count=3, video_context="", burn_text=True,
-                       thumbnail_text_hint="", language="en", frame_reference=None):
+                       thumbnail_text_hint="", language="en", frame_reference=None,
+                       llm_config=None):
     """
     Generates `count` thumbnails, each from its own concept, in parallel.
     frame_reference: {"path", "face"} from extract_face_frames, used as the
@@ -618,7 +653,8 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
 
     concepts = plan_thumbnail_concepts(
         client, title, count, video_context=video_context, extra_prompt=extra_prompt,
-        thumbnail_text_hint=thumbnail_text_hint, has_person=bool(reference_images), language=language)
+        thumbnail_text_hint=thumbnail_text_hint, has_person=bool(reference_images),
+        language=language, llm_config=llm_config)
     for i, c in enumerate(concepts):
         print(f"🎨 [Thumbnail] Concept {i + 1}: \"{c['text']}\" ({c['text_position']}) - {c['why']}")
 
@@ -666,12 +702,13 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
 # Description
 # ---------------------------------------------------------------------------
 
-def generate_youtube_description(api_key, title, transcript_segments, language, video_duration):
+def generate_youtube_description(api_key, title, transcript_segments, language,
+                                 video_duration, llm_config=None):
     """
     Uses Gemini to generate a YouTube description with chapter markers from transcript segments.
     Returns: { "description": "full description text with chapters" }
     """
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key) if (api_key and llm_config is None) else None
 
     # Format segments for the prompt
     formatted_segments = []
@@ -714,12 +751,14 @@ REQUIREMENTS:
 OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code blocks). The description should be ready to paste directly into YouTube."""
 
     print("🤖 [Thumbnail] Generating YouTube description with chapters...")
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=[prompt],
-    )
-
-    description = response.text.strip()
+    if llm_config is not None:
+        import llm_client
+        # Plain-text shape: HEAD's Gemini call omits response_mime_type here and
+        # the prompt asks for raw description text — json_object would be wrong.
+        description = llm_client.chat(prompt, config=llm_config)[0].strip()
+    else:
+        response = client.models.generate_content(model=TEXT_MODEL, contents=[prompt])
+        description = response.text.strip()
     # Clean up any accidental markdown wrappers
     if description.startswith("```"):
         lines = description.split("\n")

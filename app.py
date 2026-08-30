@@ -140,6 +140,35 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     return os.environ.get("GEMINI_API_KEY")
 
 
+async def resolve_llm(request: Request, task: Optional[str] = None):
+    """Resolve the third-party OpenAI-compatible LLM endpoint config.
+
+    Cloud (hosted) stays Gemini-pinned: always None. Self-host: the BYOK
+    header triple X-LLM-Base-Url + X-LLM-Key (+ optional X-LLM-Model) wins
+    when base+key are both present — a header key must never travel to an
+    env-configured base_url — else the LLM_* env with per-task
+    LLM_MODEL_<TASK> resolution (``task``: "thumbnail" / "saas" today).
+    None when no full config resolves (llm_client prints a warning on a
+    half-configured env). NB: like X-Gemini-Key, header-provided config
+    does NOT survive a redeploy resume — the manifest rebuilds env from
+    os.environ only (app.py:876).
+    """
+    if BILLING_ENABLED:
+        return None
+    try:
+        import llm_client
+    except Exception:
+        return None  # guarded like layout_picker's SDK import: gate, not 500
+    cfg = llm_client.config_from(
+        request.headers.get("X-LLM-Base-Url"),
+        request.headers.get("X-LLM-Key"),
+        task=task,
+        model=request.headers.get("X-LLM-Model"))
+    if cfg is not None:
+        return cfg
+    return llm_client.active_config(task)
+
+
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
     """Resolve the Upload-Post key and the profile to post as.
 
@@ -196,6 +225,11 @@ def gemini_missing_error():
             "message": "This action needs an active plan. Choose a plan or add your own API key.",
         })
     return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+
+
+LLM_ENDPOINT_HINT = ("Missing X-Gemini-Key header. Set a Gemini key, or use "
+    "an OpenAI-compatible endpoint: server env LLM_BASE_URL + LLM_API_KEY + "
+    "LLM_MODEL, or X-LLM-Base-Url + X-LLM-Key (+ X-LLM-Model) headers.")
 
 
 # Probe rate limiter. In-memory, resets on restart by design — the hard monthly
@@ -879,6 +913,10 @@ def _resume_interrupted_jobs() -> set:
                 env["GEMINI_API_KEY"] = managed_keys.gemini_key()
             except Exception:
                 pass
+        if BILLING_ENABLED:
+            # Cloud stays Gemini-pinned on resume too (same sweep as spawn).
+            for _k in [k for k in env if k.startswith("LLM_")]:
+                env.pop(_k, None)
         if m.get("watermark"):
             env["WATERMARK"] = "1"
         else:
@@ -2071,9 +2109,11 @@ async def process_endpoint(
     upload_id: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
-    if not api_key:
+    llm_cfg = await resolve_llm(request)
+    if not api_key and llm_cfg is None:
+        if not BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
         raise gemini_missing_error()
-
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
     force_low = str(force_low_quality).lower() in ("1", "true", "yes")
 
@@ -2196,6 +2236,19 @@ async def process_endpoint(
     cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
+    if llm_cfg is not None:
+        # Per-request provider override travels to the subprocess as env —
+        # the same road GEMINI_API_KEY takes (and the same resume caveat).
+        env["LLM_BASE_URL"] = llm_cfg.base_url
+        env["LLM_API_KEY"] = llm_cfg.api_key
+        env["LLM_MODEL"] = llm_cfg.model
+    elif BILLING_ENABLED:
+        # Cloud is Gemini-pinned: a stray LLM_* in the server env must not
+        # reroute managed jobs to a third-party endpoint (resolve_llm is
+        # already None under billing; this closes the env-copy hole).
+        # Prefix sweep, not a fixed list: future LLM_* knobs inherit it.
+        for _k in [k for k in env if k.startswith("LLM_")]:
+            env.pop(_k, None)
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job
@@ -4760,7 +4813,10 @@ async def thumbnail_analyze(
 ):
     """Analyze a video and suggest viral YouTube titles."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    llm_cfg = await resolve_llm(request, task="thumbnail")
+    if not api_key and llm_cfg is None:
+        if not BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
         raise gemini_missing_error()
 
     pre_transcript = None
@@ -4815,7 +4871,7 @@ async def thumbnail_analyze(
     try:
         # Run analysis in thread pool (skips Whisper if pre_transcript is available)
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, analyze_video_for_titles, api_key, video_path, pre_transcript)
+        result = await loop.run_in_executor(None, analyze_video_for_titles, api_key, video_path, pre_transcript, llm_cfg)
 
         # Store/update session context
         if session_id not in thumbnail_sessions:
@@ -4862,7 +4918,10 @@ async def thumbnail_titles(
 ):
     """Refine title suggestions or accept a manual title."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    llm_cfg = await resolve_llm(request, task="thumbnail")
+    if not api_key and llm_cfg is None:
+        if not BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
         raise gemini_missing_error()
 
     # Manual title mode - just create a session with the user's title
@@ -4901,7 +4960,8 @@ async def thumbnail_titles(
             api_key,
             session["context"],
             req.message,
-            session["conversation"]
+            session["conversation"],
+            llm_cfg
         )
 
         new_titles = result.get("titles", [])
@@ -4943,6 +5003,7 @@ async def thumbnail_generate(
     api_key = await resolve_gemini(request)
     if not api_key:
         raise gemini_missing_error()
+    llm_cfg = await resolve_llm(request, task="thumbnail")
 
     # Image generation is the one expensive managed Gemini call — paid plans only.
     if BILLING_ENABLED:
@@ -5003,7 +5064,7 @@ async def thumbnail_generate(
                 generate_thumbnail, api_key, title, session_id, face_path, bg_path,
                 extra_prompt, count, video_context, burn_text=burn_text,
                 thumbnail_text_hint=text_hint, language=language,
-                frame_reference=frame_reference),
+                frame_reference=frame_reference, llm_config=llm_cfg),
         )
 
         if not thumbnails:
@@ -5069,7 +5130,10 @@ async def thumbnail_describe(
 ):
     """Generate a YouTube description with chapters from the transcript."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    llm_cfg = await resolve_llm(request, task="thumbnail")
+    if not api_key and llm_cfg is None:
+        if not BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
         raise gemini_missing_error()
 
     if req.session_id not in thumbnail_sessions:
@@ -5090,7 +5154,8 @@ async def thumbnail_describe(
             req.title,
             segments,
             session.get("language", "en"),
-            session.get("video_duration", 0)
+            session.get("video_duration", 0),
+            llm_cfg
         )
         return {"description": result.get("description", "")}
 
@@ -5269,7 +5334,10 @@ async def saasshorts_analyze(
 ):
     """Analyze a URL or manual description and generate video scripts."""
     gemini_key = await resolve_gemini(request)
-    if not gemini_key:
+    llm = await resolve_llm(request, task="saas")
+    if not gemini_key and llm is None:
+        if not BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
         raise gemini_missing_error()
 
     if not req.url and not req.description:
@@ -5288,8 +5356,16 @@ async def saasshorts_analyze(
             if req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
-                web_research = research_saas_online(req.url, gemini_key)
-                analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
+                if gemini_key:
+                    web_research = research_saas_online(req.url, gemini_key)
+                else:
+                    # Grounded research is class E (Gemini-only): with a
+                    # third-party endpoint and no Gemini key, skip it rather
+                    # than crash — the analysis runs on the scrape alone.
+                    print("[SaaSShorts] No Gemini key — skipping grounded web "
+                          "research (third-party endpoint in use).")
+                analysis = analyze_saas(scraped, gemini_key,
+                                        web_research=web_research, llm_config=llm)
             else:
                 # Manual description: build analysis from description
                 analysis = {
@@ -5302,7 +5378,9 @@ async def saasshorts_analyze(
                     "tone": "casual and authentic",
                 }
 
-            scripts = generate_scripts(analysis, gemini_key, req.num_scripts, req.style, req.language, req.actor_gender)
+            scripts = generate_scripts(analysis, gemini_key, req.num_scripts,
+                                       req.style, req.language, req.actor_gender,
+                                       llm_config=llm)
             return {
                 "analysis": analysis,
                 "scripts": scripts,

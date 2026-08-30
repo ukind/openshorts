@@ -258,7 +258,8 @@ def scrape_website(url: str) -> dict:
     return result
 
 
-def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None) -> dict:
+def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None,
+                 llm_config=None) -> dict:
     """
     Deep analysis of a SaaS product combining website scraping + web research.
     Uses Gemini 3 Flash for synthesis.
@@ -268,7 +269,10 @@ def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None)
 
     print(f"[SaaSShorts] 🧠 Analyzing {scraped_data['url']} (with web research)...")
 
-    client = genai.Client(api_key=gemini_key)
+    # The client stays at HEAD's position (before prompt build); only built
+    # when the Gemini arm runs.
+    if llm_config is None:
+        client = genai.Client(api_key=gemini_key)
 
     # Build web research context
     research_context = ""
@@ -354,13 +358,16 @@ Return a JSON object:
 IMPORTANT: Use REAL pain points from user reviews when available. Real frustrations make the best UGC content.
 Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-
-    raw = response.text
+    if llm_config is not None:
+        import llm_client
+        raw, _cost = llm_client.chat(prompt, config=llm_config, json_mode=True)
+    else:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        raw = response.text
     if not raw:
         raise Exception("Gemini returned empty response for SaaS analysis")
 
@@ -394,6 +401,7 @@ def generate_scripts(
     style: str = "ugc",
     language: str = "en",
     actor_gender: str = "female",
+    llm_config=None,
 ) -> list:
     """Generate video scripts based on SaaS analysis."""
     from google import genai
@@ -402,7 +410,8 @@ def generate_scripts(
     lang_name = "Spanish" if language == "es" else "English"
     print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang_name})...")
 
-    client = genai.Client(api_key=gemini_key)
+    if llm_config is None:
+        client = genai.Client(api_key=gemini_key)
 
     style_guide = {
         "ugc": "Natural, authentic UGC style. Person talking to camera like sharing a discovery with a friend. Casual, genuine.",
@@ -536,16 +545,23 @@ RULES:
 - Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
 - Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=8192,
-        ),
-    )
-
-    raw = response.text
+    if llm_config is not None:
+        import llm_client
+        # ARRAY response, PLAIN TEXT: json_object constrains output to an object
+        # and would break the array-slice parse below (the parser greps for the
+        # first open bracket and last close bracket). 8192 mirrors the Gemini
+        # arm's max_output_tokens.
+        raw, _cost = llm_client.chat(prompt, config=llm_config, max_tokens=8192)
+    else:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=8192,
+            ),
+        )
+        raw = response.text
     if not raw:
         raise Exception("Gemini returned empty response for script generation")
 

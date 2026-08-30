@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types as genai_types
 
 import gemini_worker
+import llm_client   # opt-in third-party backend; inert without LLM_* env
 import layout_picker
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, snap_clip_to_words,
@@ -1439,9 +1440,11 @@ def transcribe_video(video_path):
 
     return transcript
 
-def _run_gemini_stage(client, model_name, prompt, schema):
+def _run_gemini_stage(client, model_name, prompt, schema, llm=None):
     """One schema-enforced Gemini call with transient-error backoff.
-    Returns (parsed_dict, cost_analysis)."""
+    Returns (parsed_dict, cost_analysis). With ``llm`` (an llm_client
+    LlmConfig) the same one call goes to the OpenAI-compatible endpoint
+    instead; the Gemini arm below is verbatim the pre-branch code."""
     config = genai_types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
@@ -1449,6 +1452,11 @@ def _run_gemini_stage(client, model_name, prompt, schema):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
+            if llm is not None:
+                # Third-party backend: the JSON ladder, blocked/transient
+                # mapping and cost all live in llm_client. This loop stays
+                # the single owner of RETRY policy for both backends.
+                return llm_client.chat(prompt, schema, config=llm)
             response = client.models.generate_content(model=model_name, contents=prompt, config=config)
             # Policy blocks are deterministic — retrying only burns quota and
             # time, and the user deserves the real reason instead of a generic
@@ -1467,6 +1475,19 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             return parsed, gemini_worker._calculate_cost_analysis(response, model_name)
         except gemini_worker.GeminiBlockedError:
             raise  # deterministic policy block — never retry
+        except llm_client.LlmTransientError:
+            # Third-party outage/empty body: the same backoff the Gemini arm
+            # gives its own blips. The message is deliberately NOT echoed
+            # here — recovered blips must not put "LLM provider" into the
+            # job log tail where the alert classifier's fallback reads it
+            # (D9). The text surfaces only on the final raise.
+            if attempt == max_attempts:
+                raise
+            wait = 5 * (2 ** (attempt - 1))
+            print(f"⚠️ Third-party endpoint blip (attempt {attempt}/{max_attempts}), retrying in {wait}s")
+            time.sleep(wait)
+        except llm_client.LlmError:
+            raise  # provider rejected the request (401/404/402/truncated): deterministic
         except Exception as e:
             msg = str(e)
             transient = any(tok in msg for tok in (
@@ -1481,32 +1502,28 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             time.sleep(wait)
 
 
-def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label):
-    """Run a Gemini stage over ``items``; on a policy block, bisect.
-
-    Google's prompt filter (PROHIBITED_CONTENT) fires on some COMBINATIONS of
-    transcript windows that pass individually (27-aug-2026: windows 5+6 of a
-    software walkthrough blocked 3/3, each alone fine, all three models).
-    A block is deterministic for a given prompt, so instead of failing the
-    job the batch is split in halves until the offending combination is
-    isolated; a single item that still blocks is dropped with a log line.
-    Returns the merged list found under ``key`` in each response."""
+def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label, llm=None):
+    """Run a Gemini stage over ``items``; on a policy block, bisect. (Docstring
+    unchanged from HEAD.) Thread ``llm`` only when set: tests and external
+    monkeypatchers patch _run_gemini_stage with the historical 4-arg
+    signature, and the pinned suites rely on that shape."""
     if not items:
         return []
     prompt = build_prompt(items)
+    stage_kwargs = {"llm": llm} if llm is not None else {}
     try:
-        parsed, cost = _run_gemini_stage(client, model_name, prompt, schema)
+        parsed, cost = _run_gemini_stage(client, model_name, prompt, schema, **stage_kwargs)
         if cost:
             costs.append(cost)
         return list(parsed.get(key) or [])
     except gemini_worker.GeminiBlockedError as e:
         if len(items) == 1:
-            print(f"   🚫 {label}: Gemini blocked window {items[0].get('id')} on its own; skipping it ({e})")
+            print(f"   🚫 {label}: Gemini blocked window {items[0].get('id')} on its own; skipping it ({e})")  # HEAD string — provider-neutral rewording would change default-path logs
             return []
         mid = len(items) // 2
-        print(f"   🚫 {label}: Gemini blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")
-        return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
-                + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
+        print(f"   🚫 {label}: Gemini blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")  # HEAD string
+        return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label, llm=llm)
+                + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label, llm=llm))
 
 
 def get_viral_clips(transcript_result, video_duration):
@@ -1517,14 +1534,20 @@ def get_viral_clips(transcript_result, video_duration):
     the expensive detail reasoning focused on the shortlist. Cuts are snapped to
     word boundaries so clips don't start/end mid-word.
     """
-    print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
+    llm = llm_client.active_config()
+    if llm is not None:
+        print("🤖 Analyzing with the third-party endpoint (2-pass: score → detail)...")
+    else:
+        print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key and llm is None:
         print("❌ Error: GEMINI_API_KEY not found in environment variables.")
         return None
-
-    client = genai.Client(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+    # The llm arm never touches the client; None is fine when only the
+    # third-party endpoint is configured.
+    client = genai.Client(api_key=api_key) if api_key else None
+    model_name = (llm.model if llm is not None
+                  else os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite')
     language = str(transcript_result.get('language') or 'unknown')
     print(f"\U0001f916  Model: {model_name} | language: {language}")
 
@@ -1560,7 +1583,7 @@ def get_viral_clips(transcript_result, video_duration):
         for b in range(0, len(windows), SCORE_BATCH):
             scored.extend(_run_stage_split(
                 client, model_name, windows[b:b + SCORE_BATCH], _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+                gemini_worker.ScoreResponse, "windows", costs, "score", llm=llm))
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -1585,7 +1608,7 @@ def get_viral_clips(transcript_result, video_duration):
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
         shorts = _run_stage_split(client, model_name, shortlist, _detail_prompt,
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+                                  gemini_worker.DetailResponse, "shorts", costs, "detail", llm=llm)
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
             # order, so slicing kept the earliest clips and silently dropped
@@ -1609,6 +1632,12 @@ def get_viral_clips(transcript_result, video_duration):
                 "total_cost": sum(c.get("total_cost", 0) for c in costs),
                 "model": model_name,
             }
+            if llm is not None:
+                # Third-party models are usually unknown to MODEL_PRICES: keep the
+                # estimated flag so the UI marks the number as an estimate. Gemini
+                # jobs keep their historical aggregate shape exactly.
+                cost_analysis["price_estimated"] = any(
+                    c.get("price_estimated") for c in costs)
             print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
@@ -1624,7 +1653,13 @@ def get_viral_clips(transcript_result, video_duration):
         # reason instead of a generic "no clips found".
         print(f"🚫 {e}")
         raise
-    except Exception as e:
+    except (llm_client.LlmError, llm_client.LlmTransientError) as e:
+        # Deterministic provider rejection, or a transient that outlived the
+        # retry ladder: propagate with the real reason instead of collapsing
+        # into "no usable clips" (which the alert classifier would mislabel
+        # as a user-content problem).
+        print(f"❌ Third-party LLM error: {e}")
+        raise
         print(f"❌ Gemini Error: {e}")
         return None
 
@@ -1654,7 +1689,9 @@ def get_visual_clips(video_path, video_duration, language="en"):
     print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found.")
+        print("❌ Error: GEMINI_API_KEY not found. Silent-video analysis "
+              "watches the footage on Gemini; the third-party LLM endpoint "
+              "cannot replace it.")
         return None
     client = genai.Client(api_key=api_key)
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
