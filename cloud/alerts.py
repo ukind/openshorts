@@ -42,9 +42,25 @@ def _looks_like_proxy_error(err: str) -> bool:
     return any(k in e for k in _PROXY_HINTS)
 
 
+# Reachability note (review C8, advisor-confirmed): the production callers of
+# _classify_failure (_record_job_alert, app.py:1265, and the high-failure-rate
+# alert below) are CLOUD-only, and the BILLING env sweep strips LLM_* — so no
+# managed job can currently emit an "LLM provider ..." string. The branch
+# ships anyway per design D9 (defense-in-depth for the proxy-hint echo) and
+# for any self-host alert consumer added later; the tests exercise the
+# function directly.
+
 def _classify_failure(err: str) -> str:
     """One-word category for the last error, so the alert points the right way."""
     e = (err or "").lower()
+    # Third-party LLM provider error: checked FIRST. Namespaced
+    # "LLM provider ..." messages can never be proxy/transcription/ffmpeg
+    # errors, but provider bodies can echo _PROXY_HINTS phrases
+    # ("insufficient balance", "402 payment required"). A blocked-content
+    # message says "The AI provider blocked this video" — it never contains
+    # "llm provider", so it falls through to the existing blocked class.
+    if "llm provider" in e:
+        return "llm provider"
     if _looks_like_proxy_error(e):
         return "proxy"
     if "no_audio" in e or "no audio" in e:
