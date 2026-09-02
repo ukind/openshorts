@@ -2135,8 +2135,8 @@ function App() {
                       <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4 shadow"></div>
                     </label>
                   </div>
-                  <p className="text-xs text-muted mt-2">When on, samples 12-16 frames across the full video and asks AI for viral moments before cheap scoring — HOOK to PAYOFF. Game-aware if a profile is selected.</p>
-                  <div className="text-micro text-muted mt-1">{enableDeep ? 'Deep ON — full scan before candidates' : 'Deep OFF — cheap + transcript only'}</div>
+                  <p className="text-xs text-muted mt-2">Before the regular candidate search, the AI watches the whole video from start to finish and notes the best moments — HOOK to PAYOFF. With Gemini it actually views the footage; with OpenAI-compatible models it inspects a frame sample across the full duration. The strongest finds are then always among the final clips, and a selected game profile steers what counts as a moment.</p>
+                  <div className="text-micro text-muted mt-1">{enableDeep ? 'Deep ON — the AI sees the whole video before picking' : 'Deep OFF — cheap + transcript only'}</div>
                   {enableDeep && (
                     <div className="mt-3 pt-3 border-t border-rule space-y-2">
                       <div className="flex items-center justify-between gap-2">
