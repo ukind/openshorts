@@ -98,7 +98,7 @@ Turn any clip into a narrated short: AI caption suggestions → TTS voiceover �
 - Profiles are stored, editable, importable/exportable
 
 ### 6. Subtitle editor — style every word, preview live
-![Subtitle editor](screenshots/subtitle-editor-top.png)
+![Subtitle editor — timing strip with playhead](screenshots/subtitle-editor-timing.png)
 
 Open on any generated clip for a full caption studio rather than a font picker:
 
@@ -106,7 +106,7 @@ Open on any generated clip for a full caption studio rather than a font picker:
 - **Live Remotion preview** with karaoke word-highlighting that plays in sync with the video — what you see is exactly what gets burned
 - **Fine styling sliders**: vertical position, size, words per block, block duration, spacing, letter spacing, colors, outline, opacity, per-word highlight color, animations (pop, glow, karaoke, none)
 - **Word-level editing**: click any word in the text to fix a mishear or drop in an emoji at the playhead — edits keep the original word timings (LCS-matched), so nothing drifts
-- **Timing strip**: drag words and trim handles directly on a zoomable timeline (3s/5s/10s/20s/Full), pan by dragging empty track, follow-playhead mode
+- **Timing strip with playhead**: drag words and trim handles directly on a zoomable timeline (3s/5s/10s/20s/Full), pan by dragging empty track, and follow-playhead mode keeps the active word centered as the red playhead moves (edit text blurred above for privacy)
 - **Burn anywhere**: renders through the same Remotion/ASS pipeline used by auto-captions, so browser preview and final clip match; emoji renders are handled with a proper color-emoji font
 
 ### History — every project, reopenable
