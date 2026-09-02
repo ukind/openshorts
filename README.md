@@ -7,7 +7,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/mutonby/openshorts?style=social)](https://github.com/mutonby/openshorts)
 [![Last Commit](https://img.shields.io/github/last-commit/mutonby/openshorts)](https://github.com/mutonby/openshorts/commits/main)
 
-**Open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
+**Open source AI video platform** with 5 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, **YouTube Studio**, **VoiceOver (AI-narrated shorts)** and **Game Profiles (per-game viral scoring)**.
 
 ![Your podcast, and the vertical clip OpenShorts makes of it: both speakers stacked, captions on the seam](screenshots/split-before-after.gif)
 
@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/b45fa983-16b4-48b5-ac5b-a267836b9ad9
 
 ---
 
-## 3 Tools in 1 Platform
+## 5 Tools in 1 Platform
 
 ### 1. Clip Generator
 Turn your long-form videos — podcasts, webinars, livestreams, vlogs, interviews — into viral-ready 9:16 shorts for TikTok, Instagram Reels, and YouTube Shorts.
@@ -76,18 +76,76 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 - JSON-LD structured data for search engines
 - Avatar gallery with prompt history
 
+### 4. VoiceOver — AI-narrated shorts with styled captions
+Turn any clip into a narrated short: AI caption suggestions → TTS voiceover → ducked mix → burned captions, all in one guided workflow.
+
+![VoiceOver workflow](screenshots/voiceover-page.png)
+
+- **Caption suggestions with live preview**: the AI proposes caption sets (Gaming, Dramatic, GenZ, Creepypasta…), each one previewed in a real Remotion player beside the options — words highlight as the clip plays, exactly like the final burn
+- **Two TTS providers**: local **Qwen3-TTS VoiceDesign** (free, runs on your GPU, 12-dimension voice personas) or **ElevenLabs** — selectable per job
+- **Voice & Style Presets manager**: 10 seeded voice personas and 10 caption style prompts, fully editable. Voice presets are tagged with caption styles (a "Gaming Hype" voice carries the `gaming` tag); picking a style reorders matching voices to the top of the dropdown and auto-selects the first one
+- **Emoji-aware captions**: the LLM sprinkles emojis into captions, timed to hold 1–2 s on screen so their animation plays; display text keeps emojis while the spoken audio stays clean
+- **Non-English TTS done right**: Italian (and any language) gets slang expansion (`nn` → *non*, `1v1` → *uno contro uno*), number-to-words conversion, and article-elision splitting so the voice says *"l' ho fatto"* correctly — while burned captions keep the natural written form
+- **Auto ducking**: background audio is sidechain-compressed under the narration and the mix is extended if the voiceover runs long
+- **Session persistence**: switch tabs or refresh mid-generation and the workflow keeps its state; projects reopen from History with captions restored
+
+### 5. Game Profiles — tune viral scoring per game
+![Game Profiles](screenshots/game-profiles.png)
+
+- Pick a game; the AI researches it (Steam metadata, genre, typical moments) and builds a profile with **custom scoring weights**
+- Optional **custom notes** get prompt priority: *"prefer clutch saves"* or *"find the funny fails"* steer clip selection explicitly
+- The profile injects into every selection pass (cheap signals, scoring, deep scan), and a **semantic vision pass** cross-checks each candidate window's frames against the profile (screams, HUD damage numbers, kills) to adjust scores
+- Profiles are stored, editable, importable/exportable
+
+### History — every project, reopenable
+![History](screenshots/history.png)
+
+- All generated projects grouped per source video — clip jobs **and** VoiceOver jobs together
+- One click reopens a project: clips, edit state, and (for VoiceOver) the caption suggestions are restored as if you never left
+
 ---
 
 ## Key Features
 
 ### Clip Generator
+![Candidate detection toggles](screenshots/clip-detection-toggles.png)
+
 - **Viral Moment Detection**: Google Gemini 3.1 Flash-Lite analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
 - **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
+- **Multimodal candidate detection** (all toggleable per job): the transcript is always analyzed, plus optional cheap signals that catch moments nobody is narrating — PySceneDetect scene cuts, audio spikes/screams, visual motion — each seeding extra candidate windows so a silent jumpscare followed by a scream still becomes a clip
+- **Vision pass**: each shortlisted window gets 6 frames (3 uniform + 3 peak-biased around screams/loudness) analyzed against the Game Profile, adjusting scores on visual evidence
+- **Deep full-VOD scan**: for long videos, 12-16 frames across the *whole* VOD (or a low-res native-video proxy for Gemini) surface the best moments before cheap scoring ranks around them — the strongest clips always get a slot
+- **Robust LLM output handling**: tolerant JSON parsing with repair, per-clip validation with duration swap-repair, snap-to-word-boundary cuts, and IoU-based overlap dedup so two windows finding the same moment never render twice
+- **Parallel transcript enhancement**: an optional LLM polish pass fixes Whisper mishears (homophones, game jargon) in concurrent chunks while preserving word timings; emojis are added conservatively and timed 1-2 s so their animation plays
 - **Smart 9:16 Cropping**: AI reframing per scene — TRACK mode (MediaPipe + YOLOv8 face tracking), GENERAL mode (blurred background), SPLIT mode (two speakers stacked, captions on the seam) and SCREENCAST mode (screen over presenter); the layout is picked per video by Gemini or forced from the dashboard
 - **Auto Subtitles**: faster-whisper with word-level timestamps, styled and burned into clips
 - **AI Voice Dubbing**: ElevenLabs integration for 30+ languages with voice cloning
 - **Hook Text Overlays**: AI-generated attention-grabbing text overlays
 - **AI Video Effects**: Gemini-generated FFmpeg filters for professional effects
+
+### Clip detection flow
+
+```mermaid
+flowchart TD
+    A[Source video] --> B[faster-whisper transcription\nword-level timestamps]
+    B --> C{Silent video?}
+    C -- yes --> V[Gemini watches the full video\nvisual clip picking]
+    C -- no --> E[Optional LLM polish pass\nfix mishears + emojis]
+    E --> D{Deep full-VOD scan?}
+    D -- on --> F[Gemini: 12-16 frames or native\nlow-res proxy over whole VOD\ntop moments as priority candidates]
+    D -- off --> G
+    F --> G[Cheap signals\nscene cuts · audio spikes · visual motion]
+    G --> H[Transcript windows\n+ cheap-seeded + deep candidates]
+    H --> I[Pass 1 — score every window\nbatched LLM calls]
+    I --> J{Vision pass on?\n+ Game Profile}
+    J -- yes --> K[6 frames per window\nsemantic score adjustment]
+    J -- no --> L
+    K --> L[Shortlist best windows]
+    L --> M[Pass 2 — detail extraction\nsurrounding transcript + word timestamps\n+ scene-cut hints per window]
+    M --> N[Validate · snap to words\ndedup overlapping picks]
+    N --> O[Render clips\nreframe · captions · hooks]
+    V --> O
+```
 
 ### AI Shorts Pipeline
 1. **Analyze**: Scrape website URL + web research, or generate from manual description
@@ -209,6 +267,14 @@ pip install qwen-tts        # plus SoX on your PATH (apt install sox / brew inst
 
 The first voiceover generation downloads the Qwen3-TTS VoiceDesign model (~4 GB) into the
 HuggingFace cache. Without the package, the VoiceOver page simply offers ElevenLabs only.
+
+Voices are **designed, not cloned**: each voice preset is a 12-dimension persona
+(gender, pitch, speed, volume, timbre…) sent as a design instruction to the model. Create
+and edit personas in the **Voice/Style Presets** page — every voice is tagged with the
+caption styles it fits, and the VoiceOver page brings matching voices to the top when you
+pick a style. For non-English narration the pipeline preprocesses the speak-text per
+language (slang expansion, numbers to words, article elisions) so pronunciation is
+correct, while the burned captions keep the original written form.
 
 ---
 
@@ -339,6 +405,24 @@ know:
 7. **Composite** — FFmpeg assembly with ASS subtitles and hook overlays
 8. **Gallery** — Upload to public S3 with metadata for SEO pages
 9. **Publish** — Upload-Post to TikTok, Instagram, YouTube
+
+### VoiceOver
+1. **Captions** — the selected AI (Gemini or OpenAI) proposes a caption set in the chosen style; each suggestion is previewed live in Remotion
+2. **Edit** — per-word editing in the preview, style sliders (size, density, spacing, colors) with real-time re-render
+3. **Speak** — per-caption TTS (Qwen3-TTS VoiceDesign locally or ElevenLabs); Italian and other languages get slang/number/elision preprocessing on the speak side only
+4. **Time** — word-level captions are matched 1:1 to the spoken audio; emojis get guaranteed 1-2 s windows so their animation plays
+5. **Mix** — narration ducked over the original audio (sidechain compression, timeline extension if the voice runs long)
+6. **Burn** — captions burned via Remotion, result saved and openable from History
+
+```mermaid
+flowchart LR
+    C[Clip] --> CS[Caption suggestions\nstyled, with emojis]
+    CS --> PV[Live Remotion preview\n+ word editor]
+    PV --> TTS[TTS per caption\nQwen local / ElevenLabs]
+    TTS --> W[Word timing sync\nemoji 1-2s windows]
+    W --> MX[Ducked mix\nvoiceover over original]
+    MX --> BR[Burn captions\nfinal narrated short]
+```
 
 ---
 
