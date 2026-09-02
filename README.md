@@ -129,7 +129,7 @@ Open on any generated clip for a full caption studio rather than a font picker:
 - **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
 - **Multimodal candidate detection** (all toggleable per job): the transcript is always analyzed, plus optional cheap signals that catch moments nobody is narrating — PySceneDetect scene cuts, audio spikes/screams, visual motion — each seeding extra candidate windows so a silent jumpscare followed by a scream still becomes a clip
 - **Vision pass**: each shortlisted window gets 6 frames (3 uniform + 3 peak-biased around screams/loudness) analyzed against the Game Profile, adjusting scores on visual evidence
-- **Deep full-VOD scan**: for long videos, 12-16 frames across the *whole* VOD (or a low-res native-video proxy for Gemini) surface the best moments before cheap scoring ranks around them — the strongest clips always get a slot. Game-profile aware when a profile is selected. Because deep candidates fill the target slots first, enabling deep **auto-disables the per-window vision pass** (explicit header override can force both)
+- **Deep full-VOD scan**: for long videos, the AI watches the whole VOD (native low-res video proxy for Gemini, 12-16 sampled frames for OpenAI-compatible models) and its best moments bypass candidate scoring entirely — they are prepended straight into the final selection with their own titles, and the remaining slots are filled from the scored candidates. Game-profile aware when a profile is selected. Because deep already saw the whole footage, enabling deep **auto-disables the per-window vision pass** (explicit header override can force both)
 - **VOD title & description for Twitch**: after clip selection, a dedicated LLM pass writes a Twitch-ready VOD title plus a description with timestamped highlights (~10 moments ranked by viral potential, absolute seconds converted to `MM:SS`), surfaced in the dashboard with copy buttons — independent of whether deep ran
 - **Robust LLM output handling**: tolerant JSON parsing with repair, per-clip validation with duration swap-repair, snap-to-word-boundary cuts, and IoU-based overlap dedup so two windows finding the same moment never render twice
 - **Parallel transcript enhancement**: an optional LLM polish pass fixes Whisper mishears (homophones, game jargon) in concurrent chunks while preserving word timings; emojis are added conservatively and timed 1-2 s so their animation plays
@@ -299,8 +299,8 @@ correct, while the burned captions keep the original written form.
 
 ### 1. Clone
 ```bash
-git clone https://github.com/mutonby/openshorts.git
-cd OpenShorts
+git clone https://github.com/Marsic1/openshorts.git
+cd openshorts
 ```
 
 ### 2. Configure (optional)
