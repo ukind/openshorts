@@ -1,7 +1,7 @@
-"""SQLAlchemy models for cloud mode.
+﻿"""SQLAlchemy models for cloud mode.
 
 Money and quota live here, so the accounting tables (subscriptions, credit_topups,
-usage_ledger) are designed for atomic, restart-safe metering — see cloud/metering.py.
+usage_ledger) are designed for atomic, restart-safe metering â€” see cloud/metering.py.
 """
 import uuid
 from sqlalchemy import (
@@ -83,7 +83,7 @@ class UsageLedger(Base):
     minutes = Column(Numeric(10, 2), nullable=False)             # total reserved
     minutes_from_plan = Column(Numeric(10, 2), nullable=False, default=0)
     minutes_from_topup = Column(Numeric(10, 2), nullable=False, default=0)
-    # [{topup_id, minutes}] — exact FIFO allocation, so release can refund precisely.
+    # [{topup_id, minutes}] â€” exact FIFO allocation, so release can refund precisely.
     topup_allocations = Column(JSONB, nullable=True)
     status = Column(String(12), nullable=False, default="reserved")  # reserved | committed | released
     period_end = Column(DateTime(timezone=True), nullable=True)   # sub period this counts against
@@ -100,7 +100,7 @@ class SignupAttribution(Base):
 
     Its own table rather than columns on ``users`` because the schema bootstrap
     is ``create_all`` (see cloud/database.py), which creates missing tables but
-    never ALTERs an existing one — a new table lands on deploy with no migration.
+    never ALTERs an existing one â€” a new table lands on deploy with no migration.
 
     ``referrer_host`` is the grouping key ("github.com", "www.youtube.com",
     "google"); the full ``referrer`` is kept for the long tail. Rows are only
@@ -126,13 +126,13 @@ class SignupAttribution(Base):
 class ApiKey(Base):
     """A user-issued ``osk_...`` token for programmatic access (MCP, scripts, CI).
 
-    Only the sha256 of the raw token is stored — the raw value is shown once at
+    Only the sha256 of the raw token is stored â€” the raw value is shown once at
     creation and never again. ``prefix`` keeps the first characters so the UI
     can tell keys apart. Revocation is a timestamp rather than a delete so a
     leaked-then-revoked key stays visible in the user's list with its history.
 
     Its own table (not columns on ``users``) because the schema bootstrap is
-    ``create_all`` — see [SignupAttribution] above for the same reasoning.
+    ``create_all`` â€” see [SignupAttribution] above for the same reasoning.
     """
     __tablename__ = "api_keys"
     id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -152,6 +152,31 @@ class UploadPostProfile(Base):
                      primary_key=True)
     profile_username = Column(Text, unique=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GameProfile(Base):
+    """A persistent game profile for clip generation.
+
+    Stores game metadata and scoring weights to avoid repeated Steam lookups
+    and AI analysis during VOD processing.
+    """
+    __tablename__ = "game_profiles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    name = Column(Text, nullable=False)
+    game_title = Column(Text, nullable=False)
+    steam_app_id = Column(Integer, nullable=True)
+    steam_description = Column(Text, nullable=True)
+    steam_genres = Column(JSONB, nullable=True)
+    steam_tags = Column(JSONB, nullable=True)
+    custom_description = Column(Text, nullable=True)
+    ai_analysis = Column(JSONB, nullable=True)
+    recommended_weights = Column(JSONB, nullable=True)
+    active_weights = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class UserVideo(Base):
@@ -179,7 +204,7 @@ class ClipExpiryWarning(Base):
 
     Its own table rather than a column on ``user_videos`` because the schema
     bootstrap is ``create_all`` (see cloud/database.py), which creates missing
-    tables but never ALTERs an existing one — see [SignupAttribution] above for
+    tables but never ALTERs an existing one â€” see [SignupAttribution] above for
     the same reasoning. The CASCADE means rows disappear on their own when
     ``purge_free_expired`` deletes the clip they refer to, so this never needs
     its own cleanup pass.
@@ -217,7 +242,7 @@ class Project(Base):
 
 class StripeEvent(Base):
     __tablename__ = "stripe_events"
-    id = Column(Text, primary_key=True)  # Stripe event.id — dedupe key
+    id = Column(Text, primary_key=True)  # Stripe event.id â€” dedupe key
     type = Column(Text, nullable=True)
     created = Column(DateTime(timezone=True), nullable=True)
     processed_at = Column(DateTime(timezone=True), server_default=func.now())

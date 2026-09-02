@@ -14,14 +14,14 @@ import itertools
 import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 
@@ -36,7 +36,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "8192"))  # 8GB default, override via env
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -44,7 +44,7 @@ MAX_FILE_SIZE_MB = 2048  # 2GB limit
 #
 # Drafts are the safer default for an automated pipeline: nothing reaches an
 # audience without the account owner seeing it first, and TikTok's own editor is
-# where covers, sounds and hashtags actually get chosen. The UI must say so —
+# where covers, sounds and hashtags actually get chosen. The UI must say so â€”
 # a user who expects a published post and finds a draft will read it as a bug.
 TIKTOK_POST_MODE = os.environ.get("TIKTOK_POST_MODE", "MEDIA_UPLOAD").strip()
 JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "3600"))  # job/file retention (issue #46)
@@ -89,23 +89,47 @@ async def _user_from_request(request: Request):
     return await get_current_user_optional(request)
 
 
-async def resolve_gemini(request: Request) -> Optional[str]:
-    """Resolve the Gemini API key for a request.
-
-    Cloud (hosted) is PAID-ONLY: there is no BYOK for the core pipeline, so the
-    ``X-Gemini-Key`` header is ignored — an entitled user (active plan or trial)
-    gets the managed server key, everyone else gets ``None`` (→ 402, start trial).
-    Self-host keeps BYOK: header wins, else the env fallback.
-    """
+async def resolve_gemini(request: Request) -> tuple:
+    """Resolve Gemini settings: request Settings/header > environment > default."""
+    header_model = request.headers.get("X-Gemini-Model")
+    header_key = request.headers.get("X-Gemini-Key")
+    model = (header_model.strip() if header_model is not None and header_model.strip()
+             else os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite")
     if BILLING_ENABLED:
         user = await _user_from_request(request)
         if managed_keys.has_active_entitlement(user):
-            return managed_keys.gemini_key()
-        return None
-    header = request.headers.get("X-Gemini-Key")
-    if header:
-        return header
-    return os.environ.get("GEMINI_API_KEY")
+            return managed_keys.gemini_key(), model
+        return None, model
+    key = header_key.strip() if header_key is not None else os.environ.get("GEMINI_API_KEY", "").strip()
+    return key, model
+
+
+def resolve_openai(request: Request) -> tuple:
+    """Resolve OpenAI settings: request Settings/header > environment > default.
+    API key is optional for OpenAI-compatible local servers.
+    """
+    header_key = request.headers.get("X-OpenAI-Key")
+    header_model = request.headers.get("X-OpenAI-Model")
+    header_base = (request.headers.get("X-OpenAI-Base-Url") or
+                   request.headers.get("X-OpenAI-Base-URL"))
+    api_key = header_key.strip() if header_key is not None else os.environ.get("OPENAI_API_KEY", "").strip()
+    model = (header_model.strip() if header_model is not None and header_model.strip()
+             else os.environ.get("OPENAI_MODEL") or "gpt-4o-mini")
+    base_url = (header_base.strip() if header_base is not None and header_base.strip()
+                else os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1")
+    return api_key, model, base_url
+
+
+async def resolve_ai_provider(request: Request) -> tuple:
+    """Resolve provider and provider-specific settings."""
+    header_provider = (request.headers.get("X-AI-Provider") or "").lower().strip()
+    env_provider = (os.environ.get("AI_PROVIDER") or "gemini").lower().strip()
+    provider = header_provider if header_provider in ("gemini", "openai") else env_provider
+    if provider not in ("gemini", "openai"):
+        provider = "gemini"
+    gemini_key, gemini_model = await resolve_gemini(request)
+    openai_key, openai_model, openai_base = resolve_openai(request)
+    return provider, gemini_key, openai_key, openai_model, openai_base, gemini_model
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -141,7 +165,7 @@ def gemini_missing_error():
     return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
 
-# Probe rate limiter. In-memory, resets on restart by design — the hard monthly
+# Probe rate limiter. In-memory, resets on restart by design â€” the hard monthly
 # quota lives in the metering ledger; this only stops someone hammering the
 # proxy with metadata probes.
 _probe_times: dict = {}  # user_id -> [monotonic timestamps]
@@ -183,11 +207,11 @@ async def reserve_process_minutes(request, url, input_path, job_id):
 
     BYOK / self-host requests don't consume minutes (priority 2, no reservation).
     For a managed (entitled, no BYOK header) request this probes the input
-    duration, enforces the per-user concurrent-job limit, and reserves minutes —
+    duration, enforces the per-user concurrent-job limit, and reserves minutes â€”
     raising 402 (quota) or 429 (too many jobs) as needed.
 
     NOTE: in cloud mode ``resolve_gemini`` ignores ``X-Gemini-Key`` (paid-only,
-    no BYOK), so we must NOT skip metering just because that header is present —
+    no BYOK), so we must NOT skip metering just because that header is present â€”
     otherwise a client could send a dummy header and run unlimited managed jobs
     on the operator's key for free. Only skip metering when billing is off.
     """
@@ -212,7 +236,7 @@ async def reserve_process_minutes(request, url, input_path, job_id):
     # job cap.
     _check_probe_rate(user.id)
 
-    # Probe input duration (blocking → run in a thread).
+    # Probe input duration (blocking â†’ run in a thread).
     loop = asyncio.get_event_loop()
     try:
         if url:
@@ -247,12 +271,12 @@ async def reserve_managed_action(request, minutes, job_id, job_type):
         return None
     if minutes <= 0:
         # Free action (e.g. burning captions). Skip the ledger entirely rather
-        # than writing a 0-minute row on every call — the endpoint's own
+        # than writing a 0-minute row on every call â€” the endpoint's own
         # entitlement gate is what bounds it.
         return None
     user = await _user_from_request(request)
     if not managed_keys.has_active_entitlement(user):
-        return None  # BYOK header path (self-host) — not metered
+        return None  # BYOK header path (self-host) â€” not metered
     try:
         return await _metering.reserve_minutes(user.id, minutes, job_id, job_type)
     except _metering.QuotaExceeded as e:
@@ -283,7 +307,7 @@ async def require_managed_entitlement(request):
 
 async def _owner_id(request):
     """The authenticated cloud user's id to stamp on a new job/session, or None
-    for self-host / BYOK / anonymous (BILLING off → nothing to scope)."""
+    for self-host / BYOK / anonymous (BILLING off â†’ nothing to scope)."""
     if not BILLING_ENABLED:
         return None
     user = await _user_from_request(request)
@@ -306,7 +330,7 @@ async def _assert_job_owner(request, record):
         return
     user = await _user_from_request(request)
     # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
-    # the .owner sidecar store its string form — UUID != str is always True.
+    # the .owner sidecar store its string form â€” UUID != str is always True.
     if user is None or str(user.id) != str(owner):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -314,7 +338,7 @@ async def _assert_job_owner(request, record):
 # PriorityQueue holds (priority, seq, job_id). Lower priority dispatches first:
 # pro=0, starter/creator=1, BYOK/anonymous/self-host=2. The seq counter keeps
 # FIFO order within a priority and makes the tuples always comparable. With
-# BILLING disabled every job enqueues at priority 2 → plain FIFO as before.
+# BILLING disabled every job enqueues at priority 2 â†’ plain FIFO as before.
 job_queue = asyncio.PriorityQueue()
 _job_seq = itertools.count()
 jobs: Dict[str, Dict] = {}
@@ -375,12 +399,18 @@ def _canonical_clip_file(output_dir, base_name, index):
     post-processing (auto-captions, /api/subtitle re-styles, and clip-editor
     recuts) as ``subtitled_<ts>_<clean>.mp4`` / ``recut_<ts>_<clean>.mp4``,
     keeping the original for re-styling. Every place that rebuilds the
-    canonical name from disk — restore after a restart, the R2 upload, the
-    download bundle — must therefore resolve to the newest derived file, or
+    canonical name from disk â€” restore after a restart, the R2 upload, the
+    download bundle â€” must therefore resolve to the newest derived file, or
     clips silently lose their captions (or their recut) on a redeploy.
     """
     clean = f"{base_name}_clip_{index + 1}.mp4"
     try:
+        # VoiceOver jobs derive from <base>.mp4 instead of <base>_clip_<n>.mp4:
+        # <base>_voiceover.mp4 -> <base>_voiceover_captioned.mp4 -> subtitled_* re-styles.
+        vo_derived = (glob.glob(os.path.join(output_dir, f"{base_name}_voiceover_captioned.mp4"))
+                      + glob.glob(os.path.join(output_dir, f"subtitled_*_{base_name}_voiceover.mp4")))
+        if vo_derived:
+            return os.path.basename(max(vo_derived, key=os.path.getmtime))
         # subtitled_*_{clean} also matches subtitled_<ts>_recut_<ts>_{clean},
         # i.e. a captioned recut; the bare recut_ pattern covers recuts that
         # shipped uncaptioned.
@@ -400,12 +430,21 @@ def _strip_burned_captions(output_dir, filename):
     Returns the name unchanged when there is nothing to strip (or when the
     underlying file is gone, e.g. a library restore that only kept the current
     version).
+
+    VoiceOver clips chain one level deeper: ``<name>_voiceover_captioned.mp4``
+    strips back to ``<name>_voiceover.mp4`` so subtitle re-renders always burn
+    onto the clean voiceover file instead of stacking caption layers.
     """
     while True:
         m = re.match(r'^subtitled_\d+_(.+)$', filename)
-        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
-            return filename
-        filename = m.group(1)
+        if m and os.path.exists(os.path.join(output_dir, m.group(1))):
+            filename = m.group(1)
+            continue
+        m = re.match(r'^(.+)_voiceover_captioned\.mp4$', filename)
+        if m and os.path.exists(os.path.join(output_dir, m.group(1) + "_voiceover.mp4")):
+            filename = m.group(1) + "_voiceover.mp4"
+            continue
+        return filename
 
 
 def _reapply_captions(job_id, clip_index, video_path):
@@ -413,7 +452,7 @@ def _reapply_captions(job_id, clip_index, video_path):
 
     Captions must always be the LAST layer. Editing or hooking a clip that
     already had them burned in produced `edited_subtitled_<...>`, and the next
-    subtitle pass then stacked a second caption layer on top of the first —
+    subtitle pass then stacked a second caption layer on top of the first â€"
     visibly doubled and unreadable in real user clips (26-jul-2026). So the
     derivation runs on the clean file and captions go back on afterwards.
 
@@ -432,7 +471,7 @@ def _reapply_captions(job_id, clip_index, video_path):
         clip = clips[clip_index]
         import main as _main
         # A recut clip is a concatenation of source segments, so the flat
-        # start..end window is wrong for it — caption against the clip-relative
+        # start..end window is wrong for it â€” caption against the clip-relative
         # remapped transcript instead (same trick /api/subtitle uses).
         recipe_segments = (clip.get('recipe') or {}).get('segments')
         if recipe_segments:
@@ -443,7 +482,7 @@ def _reapply_captions(job_id, clip_index, video_path):
         return _main.auto_caption_clip(video_path, transcript,
                                        clip['start'], clip['end'])
     except Exception as e:
-        print(f"⚠️  Could not re-apply captions to {video_path}: {e}")
+        print(f"âš ï¸  Could not re-apply captions to {video_path}: {e}")
         return None
 
 
@@ -485,22 +524,22 @@ def _recover_jobs_from_disk():
                 owner = int(raw) if raw.isdigit() else (raw or None)
             jobs[job_id] = {
                 'status': 'completed',
-                'logs': ["♻️ Job recovered from disk after server restart."],
+                'logs': ["â™»ï¸ Job recovered from disk after server restart."],
                 'output_dir': job_path,
                 'user_id': owner,
-                'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
+                'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis'), 'vod_title': data.get('vod_title'), 'vod_description': data.get('vod_description')},
             }
             recovered += 1
         except Exception as e:
-            print(f"⚠️ Could not recover job {job_id}: {e}")
+            print(f"âš ï¸ Could not recover job {job_id}: {e}")
     if recovered:
-        print(f"♻️  Recovered {recovered} completed job(s) from disk.")
+        print(f"â™»ï¸  Recovered {recovered} completed job(s) from disk.")
 
 
 # --- Mid-flight job resume (survive a redeploy without losing work) ----------
 # A job lives only in memory, so killing the container mid-processing used to
 # lose it: the user's clip just stops. We persist a tiny manifest per job and,
-# on startup, re-enqueue any that were interrupted — the user sees it resume
+# on startup, re-enqueue any that were interrupted â€” the user sees it resume
 # instead of vanish. Bounded by MAX_RESUME_ATTEMPTS so a video that reliably
 # crashes the worker can't crashloop the service.
 _RESUME_FILE = ".resume.json"
@@ -520,14 +559,14 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 # The caller's webhook must survive a redeploy: a pipeline that
                 # relies on the callback would otherwise hang forever on a job
                 # that resumed fine. The secret is the caller's own HMAC value,
-                # stored next to their video on the same disk — not a server
+                # stored next to their video on the same disk â€” not a server
                 # credential (those are rebuilt from os.environ on resume).
                 "webhook_url": webhook_url,
                 "webhook_secret": webhook_secret,
                 "base_url": base_url,
             }, f)
     except Exception as e:
-        print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
+        print(f"âš ï¸ Could not write resume manifest for {job_id}: {e}")
 
 
 def _clear_resume_manifest(job_id):
@@ -538,7 +577,7 @@ def _clear_resume_manifest(job_id):
     except FileNotFoundError:
         pass
     except Exception as e:
-        print(f"⚠️ Could not clear resume manifest for {job_id}: {e}")
+        print(f"âš ï¸ Could not clear resume manifest for {job_id}: {e}")
 
 
 def _resume_interrupted_jobs() -> set:
@@ -549,7 +588,7 @@ def _resume_interrupted_jobs() -> set:
     with no metadata yet (analysis never finished).
 
     Returns the set of reservation ids for the resumed jobs, so the caller can
-    keep them out of the orphaned-reservation refund. Does NO DB work — the DB
+    keep them out of the orphaned-reservation refund. Does NO DB work â€” the DB
     engine isn't up yet at this point in startup. A poison job (too many
     attempts) is simply not resumed; its reservation is then refunded as a
     normal orphan.
@@ -565,7 +604,7 @@ def _resume_interrupted_jobs() -> set:
         manifest_path = os.path.join(job_path, _RESUME_FILE)
         if not os.path.isfile(manifest_path):
             continue
-        # Already finished generating clips → recovered as completed elsewhere.
+        # Already finished generating clips â†’ recovered as completed elsewhere.
         if glob.glob(os.path.join(job_path, "*_metadata.json")):
             _clear_resume_manifest(job_id)
             continue
@@ -573,7 +612,7 @@ def _resume_interrupted_jobs() -> set:
             with open(manifest_path) as f:
                 m = json.load(f)
         except Exception as e:
-            print(f"⚠️ Bad resume manifest for {job_id}: {e}")
+            print(f"âš ï¸ Bad resume manifest for {job_id}: {e}")
             continue
 
         attempts = int(m.get("attempts", 0)) + 1
@@ -582,11 +621,11 @@ def _resume_interrupted_jobs() -> set:
         if attempts > MAX_RESUME_ATTEMPTS:
             # Poison job: don't resume. Leaving its reservation out of the keep
             # set lets the orphan sweep refund it, and the user can retry by hand.
-            print(f"🛑 Job {job_id} exceeded {MAX_RESUME_ATTEMPTS} resume attempts — giving up.")
+            print(f"ðŸ›‘ Job {job_id} exceeded {MAX_RESUME_ATTEMPTS} resume attempts â€” giving up.")
             _clear_resume_manifest(job_id)
             continue
 
-        # Rebuild env from scratch — the manifest holds no secrets. Managed
+        # Rebuild env from scratch â€” the manifest holds no secrets. Managed
         # (cloud) jobs get the server key; self-host falls back to its env key.
         env = os.environ.copy()
         if BILLING_ENABLED and user_id is not None:
@@ -608,7 +647,7 @@ def _resume_interrupted_jobs() -> set:
 
         jobs[job_id] = {
             'status': 'queued',
-            'logs': [f"♻️ Resuming your video after a server update (attempt {attempts})."],
+            'logs': [f"â™»ï¸ Resuming your video after a server update (attempt {attempts})."],
             'cmd': m.get("cmd"),
             'env': env,
             'output_dir': job_path,
@@ -624,7 +663,7 @@ def _resume_interrupted_jobs() -> set:
         _enqueue_job(job_id, int(m.get("priority", 2)))
         resumed += 1
     if resumed:
-        print(f"♻️  Re-enqueued {resumed} interrupted job(s) after restart.")
+        print(f"â™»ï¸  Re-enqueued {resumed} interrupted job(s) after restart.")
     return keep_reservations
 
 
@@ -643,7 +682,7 @@ def _enforce_uploads_size_cap():
     """Delete the oldest source uploads while UPLOAD_DIR is over UPLOADS_MAX_GB.
 
     Sources are only needed while a job runs (and for the preview afterwards),
-    but they're the biggest files on disk — up to MAX_FILE_SIZE_MB each.
+    but they're the biggest files on disk â€” up to MAX_FILE_SIZE_MB each.
     """
     cap = UPLOADS_MAX_GB * 1024 ** 3
     if cap <= 0:
@@ -660,14 +699,14 @@ def _enforce_uploads_size_cap():
             except OSError:
                 pass
     files.sort()
-    print(f"🧹 Uploads at {used / 1024**3:.1f} GB (cap {UPLOADS_MAX_GB} GB) — trimming.")
+    print(f"ðŸ§¹ Uploads at {used / 1024**3:.1f} GB (cap {UPLOADS_MAX_GB} GB) â€” trimming.")
     for _mtime, path, size in files:
         if used <= cap:
             break
         try:
             os.remove(path)
             used -= size
-            print(f"🧹 Size cap: removed upload {os.path.basename(path)}")
+            print(f"ðŸ§¹ Size cap: removed upload {os.path.basename(path)}")
         except OSError:
             pass
 
@@ -692,7 +731,7 @@ def _enforce_output_size_cap():
             except OSError:
                 pass
     candidates.sort()  # oldest first
-    print(f"🧹 Output dir at {used / 1024**3:.1f} GB (cap {OUTPUT_MAX_GB} GB) — trimming.")
+    print(f"ðŸ§¹ Output dir at {used / 1024**3:.1f} GB (cap {OUTPUT_MAX_GB} GB) â€” trimming.")
     for _mtime, path, job_id in candidates:
         if used <= cap:
             break
@@ -700,18 +739,18 @@ def _enforce_output_size_cap():
         shutil.rmtree(path, ignore_errors=True)
         jobs.pop(job_id, None)
         used -= size
-        print(f"🧹 Size cap: purged {job_id} ({size / 1024**2:.0f} MB)")
+        print(f"ðŸ§¹ Size cap: purged {job_id} ({size / 1024**2:.0f} MB)")
 
 
 async def cleanup_jobs():
     """Background task to remove old jobs and files."""
     import time
-    print("🧹 Cleanup task started.")
+    print("ðŸ§¹ Cleanup task started.")
     while True:
         try:
             await asyncio.sleep(300) # Check every 5 minutes
             now = time.time()
-            
+
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
             for job_id in os.listdir(OUTPUT_DIR):
@@ -722,7 +761,7 @@ async def cleanup_jobs():
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
-                        print(f"🧹 Purging old job: {job_id}")
+                        print(f"ðŸ§¹ Purging old job: {job_id}")
                         shutil.rmtree(job_path, ignore_errors=True)
                         if job_id in jobs:
                             del jobs[job_id]
@@ -730,7 +769,7 @@ async def cleanup_jobs():
             # Hard disk cap. The time-based sweep above bounds the *age* of what
             # we keep, not its size: a burst of long videos can fill the volume
             # inside one retention window. Drop the oldest jobs until we're back
-            # under the cap — clips are already archived to R2 and get restored
+            # under the cap â€” clips are already archived to R2 and get restored
             # on demand, so this only costs a re-download.
             _enforce_output_size_cap()
             _enforce_uploads_size_cap()
@@ -758,28 +797,28 @@ async def cleanup_jobs():
                 except Exception: pass
 
         except Exception as e:
-            print(f"⚠️ Cleanup error: {e}")
+            print(f"âš ï¸ Cleanup error: {e}")
 
 async def process_queue():
     """Background worker to process jobs from the queue with concurrency limit."""
-    print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
+    print(f"ðŸš€ Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
     while True:
         try:
-            # Wait for a job (priority, seq, job_id) — lowest priority first.
+            # Wait for a job (priority, seq, job_id) â€” lowest priority first.
             _priority, _seq, job_id = await job_queue.get()
 
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
-            print(f"🔄 Acquired slot for job: {job_id}")
+            print(f"ðŸ”„ Acquired slot for job: {job_id}")
 
             # Process in background task to not block the loop (allowing other slots to fill)
             asyncio.create_task(run_job_wrapper(job_id))
-            
+
         except Exception as e:
-            print(f"❌ Queue dispatch error: {e}")
+            print(f"âŒ Queue dispatch error: {e}")
             await asyncio.sleep(1)
 
-# Monthly proxy bandwidth counter (in-memory; an alert threshold, not a bill —
+# Monthly proxy bandwidth counter (in-memory; an alert threshold, not a bill â€”
 # losing it on a deploy just means the alert re-arms from 0 mid-month).
 _proxy_month = {"month": None, "bytes": 0, "alerted": False}
 PROXY_ALERT_GB = 100
@@ -803,7 +842,7 @@ async def _track_proxy_usage(job_id):
                 f"(threshold {PROXY_ALERT_GB} GB). Review free-plan usage.",
             )
         except Exception as e:
-            print(f"⚠️ Proxy alert failed: {e}")
+            print(f"âš ï¸ Proxy alert failed: {e}")
 
 
 async def run_job_wrapper(job_id):
@@ -813,9 +852,9 @@ async def run_job_wrapper(job_id):
         if job:
             await run_job(job_id, job)
     except Exception as e:
-         print(f"❌ Job wrapper error {job_id}: {e}")
+         print(f"âŒ Job wrapper error {job_id}: {e}")
     finally:
-        # The subprocess returned (success or genuine failure) — a terminal
+        # The subprocess returned (success or genuine failure) â€” a terminal
         # state, so drop the resume manifest. It only survives if the container
         # was killed mid-run, which is exactly when we want to resume.
         _clear_resume_manifest(job_id)
@@ -837,7 +876,7 @@ async def run_job_wrapper(job_id):
         # Always release semaphore and mark queue task done
         concurrency_semaphore.release()
         job_queue.task_done()
-        print(f"✅ Released slot for job: {job_id}")
+        print(f"âœ… Released slot for job: {job_id}")
 
 
 async def _archive_managed_job(job_id):
@@ -852,7 +891,7 @@ async def _archive_managed_job(job_id):
     try:
         await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
     except Exception as e:
-        print(f"⚠️  R2 archive error for {job_id}: {e}")
+        print(f"âš ï¸  R2 archive error for {job_id}: {e}")
 
 
 def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
@@ -871,13 +910,13 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
         try:
             await cloud.videos.archive_clip_edit(user_id, job_id, clip_index, output_dir, filename)
         except Exception as e:
-            print(f"⚠️  R2 edit archive error for {job_id}: {e}")
+            print(f"âš ï¸  R2 edit archive error for {job_id}: {e}")
 
     asyncio.create_task(_run())
 
 
 async def _notify_clips_ready(job_id):
-    """Email the owner when their clips finish — processing takes minutes, so
+    """Email the owner when their clips finish â€” processing takes minutes, so
     this lets them close the tab. Once per job (email_sent flag)."""
     if not BILLING_ENABLED:
         return
@@ -903,7 +942,7 @@ async def _notify_clips_ready(job_id):
         await send_clips_ready_email(user.email, title, len(clips),
                                      f"{_cloud_config.settings.frontend_url}/#app")
     except Exception as e:
-        print(f"⚠️  Clips-ready email error for {job_id}: {e}")
+        print(f"âš ï¸  Clips-ready email error for {job_id}: {e}")
 
 
 async def _notify_clip_activity(job_id):
@@ -933,13 +972,13 @@ async def _notify_clip_activity(job_id):
         title = clips[0].get('video_title_for_youtube_short') or clips[0].get('title') or "video"
         n = len(clips)
         await _alerts.send_telegram(
-            f"🎬 Clips created\n{user.email} ({sub.plan}) — “{title}” ({n} clip{'s' if n != 1 else ''})")
+            f"ðŸŽ¬ Clips created\n{user.email} ({sub.plan}) â€” â€œ{title}â€ ({n} clip{'s' if n != 1 else ''})")
     except Exception as e:
-        print(f"⚠️  Clip-activity notify error for {job_id}: {e}")
+        print(f"âš ï¸  Clip-activity notify error for {job_id}: {e}")
 
 
 # Markers that identify a line as an actual error rather than progress noise.
-_ERROR_MARKERS = ("❌", "ERROR:", "Traceback", "FATAL", "Exception",
+_ERROR_MARKERS = ("âŒ", "ERROR:", "Traceback", "FATAL", "Exception",
                   "Process failed with exit code", "No metadata file generated",
                   "Execution error:")
 
@@ -948,13 +987,13 @@ def _job_error_text(logs) -> str:
     """The lines that explain WHY a job failed, for the alert's classifier.
 
     The tail of the log is usually progress noise (scene detection, ffmpeg
-    banners), which made alerts blame whatever word happened to be nearby —
+    banners), which made alerts blame whatever word happened to be nearby â€”
     a silent upload got reported as a broken download path, and a Gemini blip
     as an ffmpeg problem. Pick the error-bearing lines instead, newest last.
     """
     hits = [ln for ln in logs if any(m in ln for m in _ERROR_MARKERS)]
     if not hits:
-        return " ".join(logs[-10:])  # nothing recognisable — fall back to the tail
+        return " ".join(logs[-10:])  # nothing recognisable â€” fall back to the tail
     return " ".join(hits[-6:])
 
 
@@ -969,7 +1008,7 @@ async def _record_job_alert(job_id):
     try:
         await _alerts.record_job_outcome(ok, err)
     except Exception as e:
-        print(f"⚠️  Alert recording error for {job_id}: {e}")
+        print(f"âš ï¸  Alert recording error for {job_id}: {e}")
     await _track_job_outcome(job, ok, err)
 
 
@@ -1009,14 +1048,14 @@ async def _track_job_outcome(job, ok, err):
             reason=(_alerts._classify_failure(err) if not ok and err else None),
         )
     except Exception as e:
-        print(f"⚠️  Analytics error: {e}")
+        print(f"âš ï¸  Analytics error: {e}")
 
 
 # --- Job completion webhooks --------------------------------------------------
 # Agents and pipelines (n8n, cron, MCP clients) need push, not poll: a caller
 # passes webhook_url on /api/process and gets one POST when the job reaches a
 # terminal state. The URL goes through assert_public_url both at submit and at
-# delivery time — the second check is what defeats DNS rebinding between them.
+# delivery time â€” the second check is what defeats DNS rebinding between them.
 WEBHOOK_TIMEOUT = 10.0
 WEBHOOK_RETRY_DELAYS = (0, 10, 60)  # seconds before each attempt
 
@@ -1056,7 +1095,7 @@ async def _webhook_clip_entries(job_id, job):
                     entries[v.clip_index]["download_url"] = _storage.presigned_get(
                         v.r2_key, expires=24 * 3600)
         except Exception as e:
-            print(f"⚠️ Webhook R2 links failed for {job_id}: {e}")
+            print(f"âš ï¸ Webhook R2 links failed for {job_id}: {e}")
     return entries
 
 
@@ -1076,15 +1115,15 @@ async def _deliver_webhook(url, body: bytes, secret):
                                          follow_redirects=False) as client:
                 resp = await client.post(url, content=body, headers=headers)
             if resp.status_code < 300:
-                print(f"🪝 Webhook delivered to {url} (attempt {attempt})")
+                print(f"ðŸª Webhook delivered to {url} (attempt {attempt})")
                 return
-            print(f"⚠️ Webhook attempt {attempt} to {url}: HTTP {resp.status_code}")
+            print(f"âš ï¸ Webhook attempt {attempt} to {url}: HTTP {resp.status_code}")
         except UnsafeURLError as e:
-            print(f"🛑 Webhook URL no longer safe, dropping: {e}")
+            print(f"ðŸ›‘ Webhook URL no longer safe, dropping: {e}")
             return
         except Exception as e:
-            print(f"⚠️ Webhook attempt {attempt} to {url} failed: {e}")
-    print(f"❌ Webhook to {url} gave up after {len(WEBHOOK_RETRY_DELAYS)} attempts.")
+            print(f"âš ï¸ Webhook attempt {attempt} to {url} failed: {e}")
+    print(f"âŒ Webhook to {url} gave up after {len(WEBHOOK_RETRY_DELAYS)} attempts.")
 
 
 async def _notify_job_webhook(job_id):
@@ -1122,7 +1161,7 @@ async def _settle_reservation(job_id):
         else:
             await cloud.metering.release_reservation(reservation_id)
     except Exception as e:
-        print(f"⚠️  Reservation settle error for {job_id}: {e}")
+        print(f"âš ï¸  Reservation settle error for {job_id}: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1145,7 +1184,7 @@ app = FastAPI(lifespan=lifespan)
 if BILLING_ENABLED:
     cloud.setup_sync(app)
 
-# MCP server (/mcp): the pipeline as agent-callable tools. Works in both modes —
+# MCP server (/mcp): the pipeline as agent-callable tools. Works in both modes â€”
 # cloud requires an osk_ API key, self-host keeps BYOK (see mcp_server.py).
 import mcp_server as _mcp_server
 app.include_router(_mcp_server.router)
@@ -1215,11 +1254,11 @@ def _visible_logs(logs):
 
     Self-host (BILLING off) shows the full pipeline output so people running
     their own instance can debug. Cloud shows a curated whitelist view
-    (log_view.friendly_logs): plain progress for normal users — transcription
-    percentage, clip counters — with no file paths, model names or pipeline
+    (log_view.friendly_logs): plain progress for normal users â€” transcription
+    percentage, clip counters â€” with no file paths, model names or pipeline
     internals.
 
-    DEBUG_LOGS=true forces the full output even under billing — for local dev
+    DEBUG_LOGS=true forces the full output even under billing â€” for local dev
     where you run in paid mode but still want the raw logs.
     """
     if not BILLING_ENABLED or DEBUG_LOGS:
@@ -1242,9 +1281,16 @@ def enqueue_output(out, job_id):
                     except ValueError:
                         pass
                     continue
-                print(f"📝 [Job Output] {decoded_line}")
+                print(f"ðŸ“ [Job Output] {decoded_line}")
                 if job_id in jobs:
-                    jobs[job_id]['logs'].append(decoded_line)
+                    # Use timezone-aware local time so logs match host clock (Europe/Rome vs UTC).
+                    # Container may be UTC; astimezone() respects TZ env if set, else falls back to local.
+                    try:
+                        from datetime import datetime, timezone
+                        ts = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+                    except Exception:
+                        ts = __import__("time").strftime("%H:%M:%S")
+                    jobs[job_id]['logs'].append(f"{ts} {decoded_line}")
     except Exception as e:
         print(f"Error reading output for job {job_id}: {e}")
     finally:
@@ -1252,15 +1298,15 @@ def enqueue_output(out, job_id):
 
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
-    
+
     cmd = job_data['cmd']
     env = job_data['env']
     output_dir = job_data['output_dir']
-    
+
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
-    print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
-    
+    print(f"ðŸŽ¬ [run_job] Executing command for {job_id}: {' '.join(cmd)}")
+
     try:
         process = subprocess.Popen(
             cmd,
@@ -1269,17 +1315,17 @@ async def run_job(job_id, job_data):
             env=env,
             cwd=os.getcwd()
         )
-        
+
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
         t_log.daemon = True
         t_log.start()
-        
+
         # Async wait for process with incremental updates
         start_wait = time.time()
         while process.poll() is None:
             await asyncio.sleep(2)
-            
+
             # Check for partial results every 2 seconds
             # Look for metadata file
             try:
@@ -1292,11 +1338,11 @@ async def run_job(job_id, job_data):
                     if os.path.getsize(target_json) > 0:
                         with open(target_json, 'r') as f:
                             data = json.load(f)
-                            
+
                         base_name = os.path.basename(target_json).replace('_metadata.json', '')
                         clips = data.get('shorts', [])
                         cost_analysis = data.get('cost_analysis')
-                        
+
                         # Check which clips actually exist on disk
                         ready_clips = []
                         for i, clip in enumerate(clips):
@@ -1307,25 +1353,25 @@ async def run_job(job_id, job_data):
                                  # main.py writes to temp_... then moves to final name. So presence means ready!
                                  clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
                                  ready_clips.append(clip)
-                        
+
                         if ready_clips:
-                             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
+                             jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis, 'vod_title': data.get('vod_title'), 'vod_description': data.get('vod_description')}
             except Exception as e:
                 # Ignore read errors during processing
                 pass
 
         returncode = process.returncode
-        
+
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
-            
+
             # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
             # (see _archive_managed_job), so skip the redundant/paid AWS upload.
             if not BILLING_ENABLED:
                 loop = asyncio.get_event_loop()
                 loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
+
             # Find result JSON
             json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if not json_files:
@@ -1333,10 +1379,10 @@ async def run_job(job_id, job_data):
                 if _relocate_root_job_artifacts(job_id, output_dir):
                     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if json_files:
-                target_json = json_files[0] 
+                target_json = json_files[0]
                 with open(target_json, 'r') as f:
                     data = json.load(f)
-                
+
                 # Enhance result with video URLs
                 base_name = os.path.basename(target_json).replace('_metadata.json', '')
                 clips = data.get('shorts', [])
@@ -1345,19 +1391,19 @@ async def run_job(job_id, job_data):
                 for i, clip in enumerate(clips):
                      clip_filename = _canonical_clip_file(output_dir, base_name, i)
                      clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                
-                jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+
+                jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis, 'vod_title': data.get('vod_title'), 'vod_description': data.get('vod_description')}
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
-            
+
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
         # Exception text can embed URLs with credentials (e.g. the proxy URL
-        # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
+        # inside a yt-dlp/httpx error) â€” scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
 
 @app.get("/health")
@@ -1383,7 +1429,7 @@ async def _probe_youtube_quality(url: str) -> dict:
             )
             return json.loads(proc.stdout.decode(errors="replace").strip() or "{}")
         except Exception as e:
-            print(f"⚠️ Quality probe failed ({e}); starting job without gate.")
+            print(f"âš ï¸ Quality probe failed ({e}); starting job without gate.")
             return {}
 
     loop = asyncio.get_event_loop()
@@ -1400,7 +1446,7 @@ async def _probe_youtube_quality(url: str) -> dict:
 # 13 clips and spoiled 13 others (talking heads and corner tickers demoted to a
 # layout they do not need). Asking the person who knows what they uploaded costs
 # them one click and removes that whole class of error. It is also what OpusClip
-# does — its "applicable auto layout" panel lets the user pick which layouts the
+# does â€” its "applicable auto layout" panel lets the user pick which layouts the
 # AI may apply.
 LAYOUT_ENV = {
     "split": "SPLIT_LAYOUT",          # two speakers stacked
@@ -1452,17 +1498,30 @@ async def process_endpoint(
     webhook_secret: Optional[str] = Form(None),
     target_clips: Optional[str] = Form(None),
     clip_min_seconds: Optional[str] = Form(None),
-    clip_max_seconds: Optional[str] = Form(None)
+    clip_max_seconds: Optional[str] = Form(None),
+    game_profile_id: Optional[str] = Form(None),
+    ai_provider: Optional[str] = Form(None),
+    enable_scene: Optional[str] = Form(None),
+    enable_audio: Optional[str] = Form(None),
+    enable_visual: Optional[str] = Form(None),
+    enable_vision: Optional[str] = Form(None),
+    enable_deep: Optional[str] = Form(None),
+    enable_enhance: Optional[str] = Form(None),
+    enable_emoji: Optional[str] = Form(None),
+    deep_provider: Optional[str] = Form(None),
+    deep_gemini_model: Optional[str] = Form(None),
+    deep_openai_model: Optional[str] = Form(None),
 ):
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
-
+    # Resolve Game Profile: header X-Game-Profile-Id wins, else form, else body
+    hdr_profile = request.headers.get("X-Game-Profile-Id")
+    if hdr_profile and not game_profile_id:
+        game_profile_id = hdr_profile.strip()
+    # Resolve JSON body BEFORE provider-specific validation.
+    content_type = request.headers.get("content-type", "")
+    body = None
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
     force_low = str(force_low_quality).lower() in ("1", "true", "yes")
 
-    # Handle JSON body manually for URL payload
-    content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
@@ -1475,6 +1534,59 @@ async def process_endpoint(
         target_clips = body.get("target_clips")
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
+        if body.get("enable_vision") is not None and not enable_vision:
+            enable_vision = str(body.get("enable_vision"))
+        if body.get("game_profile_id") and not game_profile_id:
+            game_profile_id = str(body.get("game_profile_id"))
+        if body.get("enable_scene") is not None:
+            enable_scene = str(body.get("enable_scene"))
+        if body.get("enable_enhance") is not None:
+            enable_enhance = str(body.get("enable_enhance"))
+        if body.get("enable_emoji") is not None:
+            enable_emoji = str(body.get("enable_emoji"))
+        if body.get("enable_audio") is not None:
+            enable_audio = str(body.get("enable_audio"))
+        if body.get("enable_visual") is not None:
+            enable_visual = str(body.get("enable_visual"))
+        if body.get("target_clips") is not None:
+            target_clips = str(body.get("target_clips"))
+        if body.get("deep_provider") is not None:
+            deep_provider = str(body.get("deep_provider"))
+        if body.get("deep_gemini_model") is not None:
+            deep_gemini_model = str(body.get("deep_gemini_model"))
+        if body.get("deep_openai_model") is not None:
+            deep_openai_model = str(body.get("deep_openai_model"))
+
+    header_provider = (request.headers.get("X-AI-Provider") or "").lower().strip()
+    form_provider = (ai_provider or "").lower().strip()
+    json_provider = ((body.get("provider") or body.get("ai_provider") or "").lower().strip()
+                     if isinstance(body, dict) else "")
+    env_provider = (os.environ.get("AI_PROVIDER") or "gemini").lower().strip()
+    if header_provider in ("gemini", "openai"):
+        provider = header_provider
+    elif form_provider in ("gemini", "openai"):
+        provider = form_provider
+    elif json_provider in ("gemini", "openai"):
+        provider = json_provider
+    elif env_provider in ("gemini", "openai"):
+        provider = env_provider
+    else:
+        provider = "gemini"
+
+    gemini_key, gemini_model = await resolve_gemini(request)
+    openai_key, openai_model, openai_base = resolve_openai(request)
+
+    if isinstance(body, dict) and provider == "openai":
+        if request.headers.get("X-OpenAI-Key") is None and body.get("openai_key") is not None:
+            openai_key = str(body.get("openai_key") or "").strip()
+        if request.headers.get("X-OpenAI-Model") is None and body.get("openai_model"):
+            openai_model = str(body["openai_model"]).strip()
+        if (request.headers.get("X-OpenAI-Base-Url") is None and
+            request.headers.get("X-OpenAI-Base-URL") is None and body.get("openai_base_url")):
+            openai_base = str(body["openai_base_url"]).strip()
+
+    if provider == "gemini" and not gemini_key:
+        raise gemini_missing_error()
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -1489,7 +1601,7 @@ async def process_endpoint(
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
-    # Completion callback: reject unsafe targets NOW (clear 400) — delivery
+    # Completion callback: reject unsafe targets NOW (clear 400) â€” delivery
     # re-validates anyway, but failing at submit is the debuggable behavior.
     if webhook_url:
         from security_utils import assert_public_url, UnsafeURLError
@@ -1512,7 +1624,7 @@ async def process_endpoint(
         probe = await _probe_youtube_quality(url)
         max_height = int(probe.get("max_height") or 0)
         if 0 < max_height < QUALITY_GATE_MIN_HEIGHT:
-            print(f"⚠️ Quality gate: only {max_height}p available for {url} — asking user first.")
+            print(f"âš ï¸ Quality gate: only {max_height}p available for {url} â€” asking user first.")
             return JSONResponse({
                 "needs_confirmation": True,
                 "quality_check": {
@@ -1543,10 +1655,27 @@ async def process_endpoint(
     # Prepare Command
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
+    # Forward a complete, self-contained AI configuration for this job.
+    if provider == "openai":
+        env["AI_PROVIDER"] = "openai"
+        env["OPENAI_API_KEY"] = openai_key or ""
+        env["OPENAI_MODEL"] = openai_model or "gpt-4o-mini"
+        env["OPENAI_BASE_URL"] = openai_base or "https://api.openai.com/v1"
+        env["GEMINI_MODEL"] = gemini_model or "gemini-3.1-flash-lite"
+        if gemini_key:
+            env["GEMINI_API_KEY"] = gemini_key
+        print(f"[provider] job={job_id} provider=openai model={env['OPENAI_MODEL']} base={env['OPENAI_BASE_URL']}")
+    else:
+        env["AI_PROVIDER"] = "gemini"
+        env["GEMINI_API_KEY"] = gemini_key or ""
+        env["GEMINI_MODEL"] = gemini_model or "gemini-3.1-flash-lite"
+        env["OPENAI_API_KEY"] = openai_key or ""
+        env["OPENAI_MODEL"] = openai_model or "gpt-4o-mini"
+        env["OPENAI_BASE_URL"] = openai_base or "https://api.openai.com/v1"
+        print(f"[provider] job={job_id} provider=gemini model={env['GEMINI_MODEL']}")
 
     # Optional layouts are per job. The renderer reads these at import time in
-    # the subprocess, so they must be set before Popen — same path WATERMARK
+    # the subprocess, so they must be set before Popen â€” same path WATERMARK
     # already takes.
     chosen = layout_env(layouts)
     env.update(chosen)
@@ -1556,7 +1685,7 @@ async def process_endpoint(
     # Manual generation controls (discussion #65): optional clip-count target
     # and duration band, forwarded to the selection prompts via the same env
     # overrides the A/B harness already reads (clip_selection.py). All three
-    # are honest TARGETS, not guarantees — the model may return fewer clips
+    # are honest TARGETS, not guarantees â€” the model may return fewer clips
     # when the material doesn't hold them. Bad values 400 instead of silently
     # producing something the user didn't ask for.
     def _gen_control(raw, name, lo, hi, integer=False):
@@ -1587,6 +1716,73 @@ async def process_endpoint(
         env["CLIP_MAX_SECONDS"] = str(max_secs)
     if n_clips is not None or min_secs is not None or max_secs is not None:
         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
+
+    # Phase 4: Cheap multimodal toggles — each enhancement beyond default Whisper is toggleable
+    def _to_bool(v, default=True):
+        if v is None or v == "":
+            return default
+        return str(v).lower() not in ("0", "false", "no", "off")
+    # Allow header overrides too (X-Enable-Scene etc)
+    hdr_scene = request.headers.get("X-Enable-Scene")
+    hdr_audio = request.headers.get("X-Enable-Audio")
+    hdr_visual = request.headers.get("X-Enable-Visual")
+    hdr_vision = request.headers.get("X-Enable-Vision")
+    hdr_deep = request.headers.get("X-Enable-Deep")
+    hdr_enhance = request.headers.get("X-Enable-Enhance")
+    hdr_emoji = request.headers.get("X-Enable-Emoji")
+    # form field enable_deep from dashboard (enable_deep param)
+    _form_deep = enable_deep if 'enable_deep' in locals() and enable_deep is not None else None
+    _form_enhance = enable_enhance if 'enable_enhance' in locals() and enable_enhance is not None else None
+    _form_emoji = enable_emoji if 'enable_emoji' in locals() and enable_emoji is not None else None
+    eff_scene = _to_bool(hdr_scene if hdr_scene is not None else enable_scene, True)
+    eff_audio = _to_bool(hdr_audio if hdr_audio is not None else enable_audio, True)
+    eff_visual = _to_bool(hdr_visual if hdr_visual is not None else enable_visual, True)
+    eff_vision = _to_bool(hdr_vision if hdr_vision is not None else enable_vision, True)
+    eff_deep = _to_bool(hdr_deep if hdr_deep is not None else (_form_deep if _form_deep is not None else os.environ.get("ENABLE_DEEP_ANALYSIS", "0")), False)
+    # Deep full-VOD scan subsumes per-window vision: deep picks fill the target
+    # slots first, so the ~10-25 extra multimodal vision calls add little and
+    # cost a lot. Auto-off UNLESS the client explicitly asked for vision
+    # (header wins -> power users can still force both).
+    if eff_deep and hdr_vision is None:
+        eff_vision = False
+    eff_enhance = _to_bool(hdr_enhance if hdr_enhance is not None else (_form_enhance if _form_enhance is not None else os.environ.get("ENABLE_SUBTITLE_ENHANCEMENT", "0")), False)
+    eff_emoji = _to_bool(hdr_emoji if hdr_emoji is not None else (_form_emoji if _form_emoji is not None else os.environ.get("ENABLE_CAPTION_EMOJIS", "0")), False)
+    # emoji only if enhance enabled
+    if eff_emoji and not eff_enhance:
+        eff_emoji = False
+    env["ENABLE_SCENE_DETECTION"] = "1" if eff_scene else "0"
+    env["ENABLE_AUDIO_EVENTS"] = "1" if eff_audio else "0"
+    env["ENABLE_CHEAP_VISUAL"] = "1" if eff_visual else "0"
+    env["ENABLE_VISION_ANALYSIS"] = "1" if eff_vision else "0"
+    env["ENABLE_DEEP_ANALYSIS"] = "1" if eff_deep else "0"
+    env["ENABLE_SUBTITLE_ENHANCEMENT"] = "1" if eff_enhance else "0"
+    env["ENABLE_CAPTION_EMOJIS"] = "1" if eff_emoji else "0"
+    # Target clips + deep provider (main window)
+    hdr_target = request.headers.get("X-Target-Clips")
+    eff_target = hdr_target if hdr_target is not None else (target_clips if target_clips is not None else os.environ.get("TARGET_CLIPS", ""))
+    if eff_target and str(eff_target).strip().isdigit():
+        env["TARGET_CLIPS"] = str(int(eff_target))
+    hdr_deep_prov = request.headers.get("X-Deep-Provider")
+    requested_deep_provider = (hdr_deep_prov.strip().lower() if hdr_deep_prov is not None
+                               else str(deep_provider or "same").strip().lower())
+    if requested_deep_provider in ("", "same", "same_as_job", "same-as-job"):
+        deep_effective_provider = provider
+    elif requested_deep_provider in ("gemini", "openai"):
+        deep_effective_provider = requested_deep_provider
+    else:
+        deep_effective_provider = provider
+    env["DEEP_AI_PROVIDER"] = deep_effective_provider
+    env["DEEP_GEMINI_MODEL"] = (str(deep_gemini_model).strip() if deep_gemini_model
+                                 else env.get("GEMINI_MODEL", "gemini-3.1-flash-lite"))
+    env["DEEP_OPENAI_MODEL"] = (str(deep_openai_model).strip() if deep_openai_model
+                                 else env.get("OPENAI_MODEL", "gpt-4o-mini"))
+    env["DEEP_GEMINI_API_KEY"] = env.get("GEMINI_API_KEY", "")
+    env["DEEP_OPENAI_API_KEY"] = env.get("OPENAI_API_KEY", "")
+    env["DEEP_OPENAI_BASE_URL"] = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    print(f"[toggles] job={job_id} scene={eff_scene} audio={eff_audio} visual={eff_visual} vision={eff_vision} deep={eff_deep} candidates={'15' if eff_vision else '10'}")
+    print(f"[deep-env] job={job_id} DEEP_AI_PROVIDER={env.get('DEEP_AI_PROVIDER','')} DEEP_GEMINI_MODEL={env.get('DEEP_GEMINI_MODEL','')} DEEP_OPENAI_MODEL={env.get('DEEP_OPENAI_MODEL','')} ENABLE_DEEP={env.get('ENABLE_DEEP_ANALYSIS','')} TARGET_CLIPS={env.get('TARGET_CLIPS','')}")
+    print(f"[cheap] job={job_id} scene={eff_scene} audio={eff_audio} visual={eff_visual}")
 
     input_path = None
     if url:
@@ -1629,6 +1825,15 @@ async def process_endpoint(
         # subprocess after each clip renders).
         env["WATERMARK"] = "1"
 
+    # Pass GameProfile to main.py (both arg + env, for scoring context)
+    if game_profile_id:
+        cmd += ["--game-profile-id", str(game_profile_id)]
+        env["GAME_PROFILE_ID"] = str(game_profile_id)
+        print(f"[game_profile] job={job_id} profile={game_profile_id}")
+    # Pass user_id to main.py via environment variable for GameProfile validation
+    if user_id:
+        env["USER_ID"] = str(user_id)
+
     # Absolute-URL base for the webhook payload: explicit env wins (the API may
     # sit behind a proxy whose forwarded headers we can't trust), else what the
     # caller connected to.
@@ -1648,6 +1853,7 @@ async def process_endpoint(
         'webhook_url': webhook_url,
         'webhook_secret': webhook_secret,
         'base_url': api_base,
+        'game_profile_id': game_profile_id,
     }
 
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
@@ -1658,10 +1864,10 @@ async def process_endpoint(
             with open(os.path.join(job_output_dir, ".owner"), "w") as f:
                 f.write(str(user_id))
         except Exception as e:
-            print(f"⚠️ Could not persist job owner for {job_id}: {e}")
+            print(f"âš ï¸ Could not persist job owner for {job_id}: {e}")
 
     # Resume manifest: enough to re-run this job if the container dies mid-flight
-    # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
+    # (a redeploy). No secrets â€” the env is rebuilt from os.environ on resume.
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
                            watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
@@ -1719,7 +1925,7 @@ async def get_source_video(job_id: str):
 
     Uploaded sources are blob URLs in the browser and don't survive a reload,
     so the recovered session points the preview here instead. Unauthenticated
-    like the /videos mount — the UUID job_id is the capability.
+    like the /videos mount â€” the UUID job_id is the capability.
     """
     source_path = _locate_source(job_id)
     if not source_path:
@@ -1742,7 +1948,7 @@ async def download_all_clips(job_id: str, request: Request):
     with open(json_files[0], 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # The metadata file on disk never carries video_url — the pipeline doesn't
+    # The metadata file on disk never carries video_url â€” the pipeline doesn't
     # write it, it's injected into the in-memory job record. So prefer the live
     # record (it also tracks edits like subtitled_/hook_ renames) and fall back
     # to the canonical name a job/restore rebuilds, instead of finding nothing.
@@ -1792,8 +1998,61 @@ _restore_locks: Dict[str, asyncio.Lock] = {}
 
 @app.post("/api/projects/{job_id}/restore")
 async def restore_project(job_id: str, request: Request):
+    """Reopen a completed project from History.
+
+    Cloud mode re-downloads the project from R2. Self-host keeps every
+    completed job in OUTPUT_DIR, so restore just re-registers it in memory
+    (idempotent with _recover_jobs_from_disk).
+
+    VoiceOver jobs are tagged ``voiceover: True`` and shaped for the VoiceOver
+    page — the Clip Generator can't edit them (no source video, no transcript).
+    """
     if not BILLING_ENABLED:
-        raise HTTPException(status_code=404, detail="Not found")
+        if not await _ensure_job_files(job_id, request):
+            raise HTTPException(status_code=404, detail="Project not found")
+        job = jobs.get(job_id)
+        if job is None or job.get('status') != 'completed':
+            raise HTTPException(status_code=404, detail="Project not found")
+        job_dir = os.path.join(OUTPUT_DIR, job_id)
+        result = job.get('result') or {}
+        payload = {
+            "job_id": job_id,
+            "status": "completed",
+            "result": result,
+            "project_state": None,
+            "title": result.get('vod_title') or job_id,
+            "voiceover": False,
+        }
+        # VoiceOver job → hand back VoiceOver-page-shaped state.
+        vo_mp4s = glob.glob(os.path.join(job_dir, "*_voiceover.mp4"))
+        vo_mp4s = [v for v in vo_mp4s
+                   if not v.endswith("_voiceover_captioned.mp4")]
+        if vo_mp4s:
+            vo_mp4 = max(vo_mp4s, key=os.path.getmtime)
+            captioned = vo_mp4.replace("_voiceover.mp4",
+                                       "_voiceover_captioned.mp4")
+            # Recover the caption suggestions the user selected/edited
+            vo_captions = None
+            meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+            if meta_files:
+                try:
+                    with open(meta_files[0], 'r') as f:
+                        vo_captions = json.load(f).get('voiceover_captions')
+                except Exception:
+                    vo_captions = None
+            payload["voiceover"] = True
+            payload["result"] = {
+                "job_id": job_id,
+                "voiceover_url": f"/videos/{job_id}/{os.path.basename(vo_mp4)}",
+                "captioned_url": (f"/videos/{job_id}/{os.path.basename(captioned)}"
+                                  if os.path.exists(captioned) else None),
+                "duration": _voiceover.probe_duration(vo_mp4),
+            }
+            if vo_captions:
+                payload["result"]["captions"] = vo_captions
+            payload["title"] = os.path.basename(vo_mp4)[:-len("_voiceover.mp4")]
+        return payload
+
     from sqlalchemy import select
     from cloud.auth import get_current_user_required
     from cloud.models import Project
@@ -1859,7 +2118,7 @@ async def restore_project(job_id: str, request: Request):
             else:
                 os.rename(tmp_dir, job_dir)
 
-        # Register (or refresh) the in-memory job — same shape as
+        # Register (or refresh) the in-memory job â€” same shape as
         # _recover_jobs_from_disk, so every edit endpoint works unchanged.
         json_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
         if not json_files:
@@ -1875,10 +2134,10 @@ async def restore_project(job_id: str, request: Request):
                     f"{_canonical_clip_file(job_dir, base_name, i)}")
         jobs[job_id] = {
             'status': 'completed',
-            'logs': ["♻️ Project restored from your library."],
+            'logs': ["â™»ï¸ Project restored from your library."],
             'output_dir': job_dir,
             'user_id': str(user.id),
-            'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
+            'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis'), 'vod_title': data.get('vod_title'), 'vod_description': data.get('vod_description')},
         }
 
     return {
@@ -1893,7 +2152,7 @@ async def restore_project(job_id: str, request: Request):
 async def _ensure_job_files(job_id: str, request: Request) -> bool:
     """Make a completed job usable again after its working files vanished.
 
-    OUTPUT_DIR is not durable — a container restart or redeploy wipes it — so
+    OUTPUT_DIR is not durable â€” a container restart or redeploy wipes it â€” so
     endpoints that read a job's files would 404 on a project the user can still
     see in their library. Pull it back from R2 on demand (same path as the
     explicit /restore), so editing keeps working instead of dead-ending.
@@ -1908,17 +2167,204 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
         return False
     try:
         await restore_project(job_id, request)
-        print(f"♻️  Auto-restored {job_id} from the library (working files were gone).")
+        print(f"â™»ï¸  Auto-restored {job_id} from the library (working files were gone).")
         return True
     except HTTPException:
         return False
     except Exception as e:
-        print(f"⚠️  Auto-restore failed for {job_id}: {e}")
+        print(f"âš ï¸  Auto-restore failed for {job_id}: {e}")
         return False
 
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
+from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, generate_srt_from_captions
+
+# VoiceOver feature (TTS + presets, adapted from the AutoShorts reference)
+import voiceover as _voiceover
+from voice_presets import voice_presets_repo, style_presets_repo
+
+# --- Android-style colored emoji via Remotion (Chrome) when captions contain emoji ---
+# FFmpeg/libass with Symbola is monochrome outline; Noto Color Emoji is CBDT bitmap and
+# libass can't find glyphs (Glyph 0x1F525 not found). Remotion uses Chromium which
+# renders Noto Color Emoji in full Android color. Detect emoji and route to renderer.
+_EMOJI_RE_PY = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B50\u2764\U0001F900-\U0001F9FF]", flags=re.UNICODE)
+def _caps_has_emoji(caps):
+    if not caps:
+        return False
+    for c in caps:
+        txt = c.get('text') if isinstance(c, dict) else str(c)
+        if txt and _EMOJI_RE_PY.search(str(txt)):
+            return True
+    return False
+
+def _effect_to_animation(effect):
+    m = {'pop': 'pop', 'glow': 'word-highlight', 'box': 'karaoke', 'none': 'none', 'karaoke': 'karaoke', 'word-highlight': 'word-highlight'}
+    return m.get(str(effect).lower(), 'none')
+
+async def _burn_via_remotion(input_path, output_path, job_id, clip_index, req, caps):
+    """Burn captions via Remotion renderer for colored emoji (Android/Noto)."""
+    import asyncio, httpx, glob, json as _json, os as _os, subprocess as _sp
+    # Get video info via ffprobe
+    try:
+        probe = _sp.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                         '-show_entries', 'stream=width,height,avg_frame_rate,duration',
+                         '-show_entries', 'format=duration', '-of', 'json', input_path],
+                        capture_output=True, text=True, timeout=10)
+        info = _json.loads(probe.stdout or '{}')
+        stream = (info.get('streams') or [{}])[0]
+        width = int(stream.get('width') or 1080)
+        height = int(stream.get('height') or 1920)
+        # fps from avg_frame_rate like "30/1"
+        afr = stream.get('avg_frame_rate') or '30/1'
+        try:
+            num, den = afr.split('/')
+            fps = float(num) / float(den) if float(den) else 30.0
+        except Exception:
+            fps = 30.0
+        # duration from format or stream
+        dur = float(info.get('format', {}).get('duration') or stream.get('duration') or 0)
+        if not dur:
+            # fallback via cv2 if needed
+            import cv2
+            cap = cv2.VideoCapture(input_path)
+            fps_cap = cap.get(cv2.CAP_PROP_FPS) or fps
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            cap.release()
+            dur = frames / fps_cap if fps_cap and frames else 5.0
+            fps = fps_cap or fps
+    except Exception as e:
+        print(f"⚠️ ffprobe failed for remotion burn: {e}")
+        width, height, fps, dur = 1080, 1920, 30.0, 5.0
+
+    # Build Remotion subtitle config — cap fps to 30 for faster encode (60fps doubles frames with no visible gain for captions)
+    # Use NVENC when available (h264_nvenc) via remotion's codec, fallback to libx264
+    render_fps = min(fps, 30.0)
+    # Resolve marginV / spacing with backwards compat (snake or camel)
+    def _resolve_margin_v():
+        for k in ('margin_v', 'marginV'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return int(max(0, min(200, int(v))))
+                except Exception:
+                    pass
+        return 43
+    def _resolve_word_gap():
+        for k in ('word_gap', 'wordGap'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return int(max(0, min(100, int(v))))
+                except Exception:
+                    pass
+        return 8
+    def _resolve_letter_spacing():
+        """Resolve letter spacing as a float; the UI supports 0.5px steps."""
+        for k in ('letter_spacing', 'letterSpacing'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return max(-2.0, min(20.0, float(v)))
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+    def _resolve_line_height():
+        for k in ('line_height', 'lineHeight'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return max(0.5, min(3.0, float(v)))
+                except Exception:
+                    pass
+        return 1.0
+    style = {
+        'fontFamily': req.font_name or 'Anton',
+        'fontSize': int(req.font_size or 44),
+        'fontColor': req.font_color or '#FFFFFF',
+        'highlightColor': req.highlight_color or '#FFE500',
+        'borderColor': req.border_color or '#000000',
+        'borderWidth': int(req.border_width or 4),
+        'bgColor': req.bg_color or '#000000',
+        'bgOpacity': float(req.bg_opacity or 0.0),
+        'animation': _effect_to_animation(req.effect),
+        'baseOpacity': float(req.base_opacity or 1.0),
+        'uppercase': bool(req.uppercase),
+        'marginV': _resolve_margin_v(),
+        'wordGap': _resolve_word_gap(),
+        'lineHeight': _resolve_line_height(),
+        'letterSpacing': _resolve_letter_spacing(),
+    }
+    # Uppercase if requested
+    remo_caps = []
+    for c in caps:
+        txt = str(c.get('text', '')).strip()
+        if not txt:
+            continue
+        if req.uppercase:
+            txt = txt.upper()
+        remo_caps.append({'text': txt, 'startMs': int(c.get('startMs', 0)), 'endMs': int(c.get('endMs', 0))})
+
+    # Remotion's SubtitleConfig expects maxDuration in milliseconds, not seconds.
+    # Keep the same bounds used by the ASS path, while preserving the exact UI value.
+    remotion_max_chars = max(8, min(40, int(req.max_chars))) if getattr(req, 'max_chars', None) is not None else 20
+    remotion_max_duration = max(600, min(4000, int(req.max_duration))) if getattr(req, 'max_duration', None) is not None else 2000
+
+    props = {
+        'videoUrl': f"/videos/{job_id}/{_os.path.basename(input_path)}",
+        'durationInFrames': max(1, int(round(dur * render_fps))),
+        'fps': render_fps,
+        'width': width,
+        'height': height,
+        'subtitles': {
+            'captions': remo_caps,
+            'position': req.position or 'bottom',
+            'maxChars': remotion_max_chars,
+            'maxDuration': remotion_max_duration,
+            'style': style,
+        },
+        'hook': None,
+        'effects': None,
+        'useNvenc': True,
+    }
+    render_url = _os.getenv('RENDER_SERVICE_URL', 'http://renderer:3100')
+    print(f"🎨 Emoji detected — burning via Remotion for Android color (fps={render_fps:.1f} {width}x{height} {dur:.1f}s)")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{render_url}/render", json={'jobId': job_id, 'clipIndex': clip_index, 'props': props})
+        resp.raise_for_status()
+        data = resp.json()
+        render_id = data.get('renderId')
+        if not render_id:
+            raise RuntimeError(f"Renderer didn't return renderId: {data}")
+        # Poll for completion (up to 120s)
+        for _ in range(60):
+            await asyncio.sleep(2)
+            st = await client.get(f"{render_url}/render/{render_id}")
+            st.raise_for_status()
+            sj = st.json()
+            status = sj.get('status')
+            if status == 'done':
+                out_url = sj.get('outputUrl')
+                # Renderer writes to /output/... (host ./output), backend sees it at OUTPUT_DIR (/app/output)
+                # Translate /output/<job>/... -> /app/output/<job>/...
+                backend_out = out_url
+                if out_url and out_url.startswith('/output/'):
+                    backend_out = _os.path.join(_os.getenv('OUTPUT_DIR', '/app/output'), out_url[len('/output/'):].lstrip('/'))
+                # Also handle /app/output prefix if renderer ever returns that
+                candidates = [c for c in [out_url, backend_out] if c]
+                found = next((c for c in candidates if c and _os.path.exists(c)), None)
+                if not found:
+                    raise RuntimeError(f"Render done but output missing (checked {candidates}): {sj}")
+                # Move to expected output_path (subtitled_... naming)
+                import shutil
+                shutil.move(found, output_path)
+                print(f"✅ Remotion burn done → {output_path} (colored emoji)")
+                return True
+            if status == 'error':
+                raise RuntimeError(f"Remotion render failed: {sj.get('error')}")
+        raise RuntimeError("Remotion render timed out after 120s")
+
+
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
@@ -1936,7 +2382,7 @@ async def edit_clip(
 ):
     # Cloud (paid) mode disables BYOK: ignore any body api_key so it can't skip
     # the entitlement gate or metering (mirrors resolve_gemini ignoring the
-    # header). Self-host keeps BYOK — the body key wins there.
+    # header). Self-host keeps BYOK â€” the body key wins there.
     body_key = None if BILLING_ENABLED else req.api_key
     final_api_key = body_key or await resolve_gemini(request)
 
@@ -1953,7 +2399,7 @@ async def edit_clip(
         raise HTTPException(status_code=400, detail="Job result not available")
 
     # Meter the managed Gemini call so it can't be looped for free. Skip only for
-    # genuine BYOK (self-host body key) — in cloud, body_key is always None.
+    # genuine BYOK (self-host body key) â€” in cloud, body_key is always None.
     edit_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
     reservation_id = None if body_key else await reserve_managed_action(
         request, edit_minutes, req.job_id, "edit")
@@ -1970,11 +2416,11 @@ async def edit_clip(
             clip = job['result']['clips'][req.clip_index]
             filename = clip['video_url'].split('/')[-1]
             input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
+
         if not os.path.exists(input_path):
              raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
-        # Edit the clip WITHOUT its burned captions, then put them back on top —
+        # Edit the clip WITHOUT its burned captions, then put them back on top â€”
         # otherwise the captions are baked into the edit and the next subtitle
         # pass stacks a second layer over them (see _reapply_captions).
         clean_name = _strip_burned_captions(os.path.join(OUTPUT_DIR, req.job_id), filename)
@@ -1986,25 +2432,25 @@ async def edit_clip(
         # Define output path for edited video
         edited_filename = f"edited_{filename}"
         output_path = os.path.join(OUTPUT_DIR, req.job_id, edited_filename)
-        
+
         # Run editing in a thread to avoid blocking main loop
         # Since VideoEditor uses blocking calls (subprocess, API wait)
         def run_edit():
             editor = VideoEditor(api_key=final_api_key)
-            
+
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
             # Create a safe ASCII filename in the same directory
             safe_filename = f"temp_input_{req.job_id}.mp4"
             safe_input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_filename)
-            
+
             # Copy original file to safe path
             # (Copy is safer than rename if something crashes, we keep original)
             shutil.copy(input_path, safe_input_path)
-            
+
             try:
                 # 1. Upload (using safe path)
                 vid_file = editor.upload_video(safe_input_path)
-                
+
                 # 2. Get duration
                 import cv2
                 cap = cv2.VideoCapture(safe_input_path)
@@ -2014,7 +2460,7 @@ async def edit_clip(
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 duration = frame_count / fps if fps else 0
                 cap.release()
-                
+
                 # Load transcript from metadata
                 transcript = None
                 try:
@@ -2024,7 +2470,7 @@ async def edit_clip(
                             data = json.load(f)
                             transcript = data.get('transcript')
                 except Exception as e:
-                    print(f"⚠️ Could not load transcript for editing context: {e}")
+                    print(f"âš ï¸ Could not load transcript for editing context: {e}")
 
                 # 3. Get Plan (Filter String)
                 # Zooms would crop burned-in captions/hooks off screen, so tell
@@ -2032,20 +2478,20 @@ async def edit_clip(
                 # the original clip name (safe_input_path is an ASCII temp copy).
                 has_captions = ("subtitled_" in filename) or ("hook_" in filename)
                 filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
-                
+
                 # 4. Apply
                 # Use safe output name first
                 safe_output_path = os.path.join(OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}.mp4")
                 editor.apply_edits(safe_input_path, safe_output_path, filter_data)
-                
-                # Move result to final destination (rename works even if dest name has unicode if filesystem supports it, 
+
+                # Move result to final destination (rename works even if dest name has unicode if filesystem supports it,
                 # but python might still struggle if locale is broken? No, os.rename usually handles it better than subprocess args)
                 # Actually, output_path is defined above: f"edited_{filename}"
                 # If filename has unicode, output_path has unicode.
                 # Let's hope shutil.move / os.rename works.
                 if os.path.exists(safe_output_path):
                     shutil.move(safe_output_path, output_path)
-                
+
                 return filter_data
             finally:
                 # Cleanup temp safe input
@@ -2082,7 +2528,7 @@ async def edit_clip(
                     with open(meta_files[0], 'w') as f:
                         json.dump(meta, f, indent=4)
         except Exception as e:
-            print(f"⚠️ Failed to update metadata.json: {e}")
+            print(f"âš ï¸ Failed to update metadata.json: {e}")
 
         _archive_clip_edit_bg(req.job_id, req.clip_index, edited_filename)
 
@@ -2097,7 +2543,7 @@ async def edit_clip(
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
-        print(f"❌ Edit Error: {e}")
+        print(f"âŒ Edit Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 class SubtitleRequest(BaseModel):
@@ -2117,6 +2563,22 @@ class SubtitleRequest(BaseModel):
     base_opacity: float = 1.0  # opacity of non-active words (dimmed modern look)
     uppercase: bool = False
     input_filename: Optional[str] = None
+    max_chars: Optional[int] = None
+    max_duration: Optional[int] = None
+    # Layout / spacing — forwarded to both Remotion and ASS paths (Task 4 & 9)
+    margin_v: Optional[int] = None
+    word_gap: Optional[int] = None
+    line_height: Optional[float] = None
+    letter_spacing: Optional[float] = None
+    # CamelCase aliases from frontend subtitleConfig.styleOptions
+    marginV: Optional[int] = None
+    wordGap: Optional[int] = None
+    lineHeight: Optional[float] = None
+    letterSpacing: Optional[float] = None
+    # Edited captions from Remotion editor (word-level, clip-relative ms)
+    captions: Optional[List[Dict[str, Any]]] = None
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
 
 @app.get("/api/clip/{job_id}/{clip_index}/transcript")
@@ -2156,10 +2618,95 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
         clip_start = clip_data.get('start', 0)
         clip_end = clip_data.get('end', 0)
 
+    # If clip has persisted edited captions (from subtitle modal), return those
+    edited = clip_data.get('edited_captions')
+    if edited and isinstance(edited, list) and len(edited) > 0:
+        # Validate shape
+        caps = []
+        for c in edited:
+            txt = str(c.get('text', '')).strip()
+            if not txt:
+                continue
+            try:
+                s = int(c.get('startMs', 0)); e = int(c.get('endMs', 0))
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            caps.append({"text": txt, "startMs": s, "endMs": e})
+        if caps:
+            # Return edited directly — already clip-relative
+            duration_sec = clip_end - clip_start
+            # If edited duration differs (added words), use last endMs
+            if caps:
+                duration_sec = max(duration_sec, caps[-1]["endMs"] / 1000.0)
+            return {"captions": caps, "durationSec": duration_sec, "language": transcript.get('language', 'en')}
+
     # Extract words within clip range and convert to CaptionWord format
+    # Fallback: synthesize missing emoji words from seg.text for old jobs
+    # (new jobs have enhanced seg.words already, so this is a no-op for them)
+    import re as _re_emo_fallback
+    _emo_re_fallback = _re_emo_fallback.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B50\u2764\U0001F900-\U0001F9FF]")
     captions = []
     for segment in transcript.get('segments', []):
-        for word_info in segment.get('words', []):
+        seg_words = list(segment.get('words', []) or [])
+        # Guard: whisper large can stamp frequent function words (mi/no/e) seconds
+        # outside their segment — would land in wrong clip if kept
+        try:
+            seg_s_g = float(segment.get('start', 0))
+            seg_e_g = float(segment.get('end', seg_s_g + 0.2))
+            if seg_e_g > seg_s_g and seg_words:
+                seg_dur_g = seg_e_g - seg_s_g
+                for idx_g, w_g in enumerate(seg_words):
+                    ws_g = float(w_g.get('start', seg_s_g))
+                    if ws_g < seg_s_g - 0.8 or ws_g > seg_e_g + 0.8:
+                        ratio_g = idx_g / max(1, len(seg_words)-1) if len(seg_words)>1 else 0.5
+                        new_s_g = seg_s_g + ratio_g * max(0.0, seg_dur_g - 0.2)
+                        w_g['start'] = round(new_s_g, 3)
+                        w_g['end'] = round(min(seg_e_g, new_s_g + 0.28), 3)
+                    else:
+                        we_g = float(w_g.get('end', ws_g+0.2))
+                        if we_g < seg_s_g -0.8 or we_g > seg_e_g +0.8 or we_g <= ws_g:
+                            w_g['end'] = round(min(seg_e_g, float(w_g['start'])+0.28),3)
+        except Exception:
+            pass
+        seg_text = str(segment.get('text') or '')
+        # synthesize missing emoji words (old jobs where enhancement only touched seg.text)
+        try:
+            existing = ''.join(w.get('word','') for w in seg_words)
+            missing = []
+            for m in _emo_re_fallback.finditer(seg_text):
+                e = m.group(0)
+                if e not in existing and e not in missing:
+                    missing.append(e)
+            if missing:
+                seg_s = float(segment.get('start', seg_words[0].get('start', clip_start) if seg_words else clip_start))
+                seg_e = float(segment.get('end', seg_words[-1].get('end', seg_s+0.2) if seg_words else seg_s+0.2))
+                cursor = max(seg_s, min(seg_e-0.05, seg_words[-1].get('end', seg_s) if seg_words else seg_s))
+                for e in missing:
+                    es = max(seg_s, min(cursor, seg_e-0.05))
+                    avail = seg_e - es - 0.01
+                    if avail >= 1.0:
+                        dur = 1.0
+                    elif avail >= 0.30:
+                        dur = avail
+                    else:
+                        if seg_words:
+                            prev = seg_words[-1]
+                            prev_s = float(prev.get('start', seg_s))
+                            prev_e = float(prev.get('end', prev_s+0.2))
+                            steal = min(0.30 - max(0, avail), max(0, (prev_e - prev_s) - 0.08))
+                            prev['end'] = round(prev_e - steal, 3)
+                            es = max(seg_s, min(float(prev['end']) + 0.02, seg_e-0.05))
+                            dur = 0.30
+                        else:
+                            dur = max(0.12, avail) if avail>0 else 0.30
+                    ee = min(seg_e, es+dur)
+                    seg_words = seg_words + [{'word':' '+e,'start':es,'end':ee}]
+                    cursor = ee+0.01
+        except Exception:
+            pass
+        for word_info in seg_words:
             if word_info['end'] > clip_start and word_info['start'] < clip_end:
                 captions.append({
                     "text": word_info.get('word', '').strip(),
@@ -2167,6 +2714,11 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
                     "endMs": int((max(0, word_info['end'] - clip_start)) * 1000),
                 })
 
+    # Ensure chronological order for preview/timeline (whisper drift can reorder)
+    try:
+        captions.sort(key=lambda c: c.get('startMs', 0))
+    except Exception:
+        pass
     duration_sec = clip_end - clip_start
 
     return {
@@ -2178,7 +2730,7 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
 
 # --- Clip editor: EDL + re-render ---
 
-# How much transcript to send around the clip's segments — enough for the
+# How much transcript to send around the clip's segments â€” enough for the
 # editor's word-level trimming without shipping a whole podcast's words.
 EDL_WORD_CONTEXT_SECONDS = 45.0
 
@@ -2191,7 +2743,7 @@ def _source_duration_seconds(path):
         fps = cap.get(cv2.CAP_PROP_FPS)
         frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         cap.release()
-        # OpenCV reports -1/-1 for files it can't read — a naive truthiness
+        # OpenCV reports -1/-1 for files it can't read â€” a naive truthiness
         # check would turn that into a phantom 1.0s duration.
         if fps > 0 and frames > 0:
             return round(frames / fps, 3)
@@ -2201,7 +2753,7 @@ def _source_duration_seconds(path):
 
 
 def _clip_recipe_parts(clip):
-    """(segments, canonical_range) for a clip — synthesized from the flat
+    """(segments, canonical_range) for a clip â€” synthesized from the flat
     start/end for clips that were never recut."""
     recipe = clip.get('recipe') or {}
     fallback = {"start": float(clip.get('start', 0) or 0),
@@ -2272,6 +2824,7 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         "current_file": current_file,
         "has_captions": bool(re.match(r'^subtitled_\d+_', current_file)),
         "words": words_out,
+        "edited_captions": clip.get('edited_captions') or None,
         "source": {
             "available": bool(source_path),
             "url": f"/api/source/{job_id}" if source_path else None,
@@ -2312,9 +2865,9 @@ async def rerender_clip(req: RerenderRequest, request: Request):
 
     Two paths, chosen automatically:
     - FAST: every segment stays inside the range the canonical clip was cut
-      from → recut straight from the already-reframed canonical file. No ML,
+      from â†’ recut straight from the already-reframed canonical file. No ML,
       no source needed.
-    - SOURCE: a segment reaches outside → recut from the retained source and
+    - SOURCE: a segment reaches outside â†’ recut from the retained source and
       re-reframe with the same engine the pipeline used. 409 when the source
       already aged out.
     """
@@ -2394,8 +2947,93 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     reservation_id = await reserve_managed_action(
         request, rerender_minutes, req.job_id, "rerender")
 
-    v_transcript = (recut.virtual_transcript(transcript, segments)
-                    if req.reapply_captions else None)
+    # If the clip has edited captions (from subtitle modal), remap them from the
+    # OLD clip's virtual timeline (0..old_total) -> source time -> NEW clip's
+    # virtual timeline (0..new_total). Caps outside the new segments are dropped;
+    # survivors keep their text/emoji but get new startMs/endMs in sync with the
+    # trimmed clip. This prevents the previous bug where edited caps (e.g. 5s in a
+    # 60s clip) were reused verbatim for a 10s clip and appeared bunched at 5s
+    # without spacing, or fell outside and were lost.
+    old_segments, _ = _clip_recipe_parts(clip)
+    edited_caps = clip.get('edited_captions')
+    # Option A: splice edited caps into the full transcript (like LLM enhancement).
+    # The edited interval in source time replaces the original Whisper words there;
+    # the rest of the transcript stays. This makes expand keep edits and new
+    # material get Whisper captions, with one source of truth.
+    if req.reapply_captions and edited_caps and old_segments:
+        def _clip_to_source(ms: float, segs):
+            rem = ms / 1000.0
+            acc = 0.0
+            for seg in segs:
+                dur = seg['end'] - seg['start']
+                if rem < acc + dur - 1e-6:
+                    return seg['start'] + (rem - acc)
+                acc += dur
+            return segs[-1]['end'] if segs else 0.0
+        src_intervals = []
+        for c in edited_caps:
+            try:
+                txt = str(c.get('text', '')).strip()
+                if not txt:
+                    continue
+                s_ms = int(c.get('startMs', 0))
+                e_ms = int(c.get('endMs', 0))
+                if e_ms <= s_ms:
+                    continue
+                src_s = _clip_to_source(float(s_ms), old_segments)
+                src_e = _clip_to_source(float(e_ms), old_segments)
+                if src_e <= src_s:
+                    continue
+                src_intervals.append((src_s, src_e, txt))
+            except Exception:
+                continue
+        if src_intervals:
+            orig_words = recut.transcript_words(transcript)
+            # Drop original words overlapping any edited src interval
+            def _overlaps(w, intervals):
+                for a, b, _ in intervals:
+                    if w["e"] > a - 0.05 and w["s"] < b + 0.05:
+                        return True
+                return False
+            kept = [w for w in orig_words if not _overlaps(w, src_intervals)]
+            synthetic = []
+            for src_s, src_e, txt in src_intervals:
+                parts = txt.split()
+                if not parts:
+                    continue
+                dur = src_e - src_s
+                n = len(parts)
+                for i, p in enumerate(parts):
+                    w_s = src_s + i * dur / n
+                    w_e = src_s + (i + 1) * dur / n
+                    synthetic.append({"w": p, "s": w_s, "e": w_e})
+            merged_words = sorted(kept + synthetic, key=lambda x: x["s"])
+            if merged_words:
+                merged_transcript = {
+                    "language": (transcript or {}).get("language", "en"),
+                    "segments": [{
+                        "start": merged_words[0]["s"],
+                        "end": merged_words[-1]["e"],
+                        "text": " ".join(w["w"] for w in merged_words),
+                        "words": [{"word": w["w"], "start": w["s"], "end": w["e"]} for w in merged_words],
+                    }],
+                    "text": " ".join(w["w"] for w in merged_words),
+                }
+                # Persist merged transcript (old Whisper part replaced) and clear edited caps
+                data['transcript'] = merged_transcript
+                transcript = merged_transcript
+                clip.pop('edited_captions', None)
+                print(f"   ✏️ Spliced {len(src_intervals)} edited intervals into transcript ({len(synthetic)} words) — old Whisper part replaced")
+            else:
+                clip.pop('edited_captions', None)
+        else:
+            clip.pop('edited_captions', None)
+        v_transcript = recut.virtual_transcript(transcript, segments)
+    else:
+        v_transcript = (recut.virtual_transcript(transcript, segments)
+                        if req.reapply_captions else None)
+        if edited_caps and req.reapply_captions:
+            clip.pop('edited_captions', None)
 
     def run_recut():
         if fast:
@@ -2434,6 +3072,11 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         mem_clips = (job.get('result') or {}).get('clips') or []
         if req.clip_index < len(mem_clips):
             mem_clips[req.clip_index].update(updates)
+            # Keep in-memory edited_captions in sync with the file (remapped or cleared)
+            if 'edited_captions' in clip:
+                mem_clips[req.clip_index]['edited_captions'] = clip['edited_captions']
+            else:
+                mem_clips[req.clip_index].pop('edited_captions', None)
 
         _archive_clip_edit_bg(req.job_id, req.clip_index, served_name)
         if reservation_id:
@@ -2450,7 +3093,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
-        print(f"❌ Rerender Error: {e}")
+        print(f"âŒ Rerender Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2579,7 +3222,7 @@ async def generate_effects_config(
                             data = json.load(f)
                             transcript = data.get('transcript')
                 except Exception as e:
-                    print(f"⚠️ Could not load transcript for effects config: {e}")
+                    print(f"âš ï¸ Could not load transcript for effects config: {e}")
 
                 # Generate effects config
                 effects_config = editor.get_effects_config(
@@ -2608,7 +3251,7 @@ async def generate_effects_config(
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
-        print(f"❌ Effects Generation Error: {e}")
+        print(f"âŒ Effects Generation Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2618,7 +3261,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     # Reload job data from disk just in case metadata was updated
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
@@ -2626,25 +3269,25 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # We need to access metadata.json to get the transcript
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-    
+
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-        
+
     with open(json_files[0], 'r') as f:
         data = json.load(f)
-        
+
     transcript = data.get('transcript')
     if not transcript:
         raise HTTPException(status_code=400, detail="Transcript not found in metadata. Please process a new video.")
-        
+
     clips = data.get('shorts', [])
     if req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
-        
+
     clip_data = clips[req.clip_index]
 
     # Recut clips concatenate several source segments, so their caption window
-    # is not the flat start..end range — restyle against the clip-relative
+    # is not the flat start..end range â€” restyle against the clip-relative
     # remapped transcript instead.
     recipe_segments = (clip_data.get('recipe') or {}).get('segments')
     if recipe_segments:
@@ -2682,25 +3325,65 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     srt_path = os.path.join(output_dir, srt_filename)
 
     # Style options shared by the karaoke ASS generator paths.
+    # Scale FFmpeg fontsize to match Remotion 5.66x (FFmpeg via libass PlayRes 384x288 scales ~2.39, Remotion 5.66, ratio ~2.37)
+    _ff_scale = 2.37 if req.captions and not _caps_has_emoji(req.captions) else 1.0
+    # For non-emoji burns via FFmpeg, bump fontsize to match Remotion correct size; for emoji burns via Remotion, keep 1x
+    ff_fontsize = int(round(int(req.font_size or 44) * _ff_scale)) if _ff_scale != 1.0 else int(req.font_size or 44)
+    # Resolve marginV / spacing for ASS path (backwards compat)
+    def _opt_margin_v():
+        for k in ('margin_v', 'marginV'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return int(max(0, min(200, int(v))))
+                except Exception:
+                    pass
+        return 43
+    def _opt_word_gap():
+        for k in ('word_gap', 'wordGap'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return int(max(0, min(100, int(v))))
+                except Exception:
+                    pass
+        return 8
+    def _opt_letter_spacing():
+        """Resolve ASS letter spacing as a float, preserving fractional px."""
+        for k in ('letter_spacing', 'letterSpacing'):
+            v = getattr(req, k, None)
+            if v is not None:
+                try:
+                    return max(-2.0, min(20.0, float(v)))
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
     karaoke_opts = dict(
-        alignment=req.position, fontsize=req.font_size, font_name=req.font_name,
+        alignment=req.position, fontsize=ff_fontsize, font_name=req.font_name,
         font_color=req.font_color, border_color=req.border_color,
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
+        margin_v=_opt_margin_v(), word_gap=_opt_word_gap(), letter_spacing=_opt_letter_spacing(),
+        marginV=_opt_margin_v(), wordGap=_opt_word_gap(), letterSpacing=_opt_letter_spacing(),
     )
+    # Word grouping so Auto (16/1.4) matches initial burn word count and others fill 3/3
+    cap_max_chars = int(req.max_chars) if getattr(req, 'max_chars', None) else 20
+    cap_max_duration = (int(req.max_duration)/1000.0) if getattr(req, 'max_duration', None) else 2.0
+    cap_max_chars = max(8, min(40, cap_max_chars))
+    cap_max_duration = max(0.6, min(4.0, cap_max_duration))
 
     # Output video
     # We create a new file "subtitled_..."
     output_filename = f"subtitled_{generation_id}_{filename}"
     output_path = os.path.join(output_dir, output_filename)
 
-    # Burning captions is FREE. They're table stakes for short-form — a clip
-    # without them barely works on any platform — and the cost is nil: the SRT
+    # Burning captions is FREE. They're table stakes for short-form â€” a clip
+    # without them barely works on any platform â€” and the cost is nil: the SRT
     # comes from the transcript already sitting in metadata.json, and the burn is
     # a single short FFmpeg pass (4s on CPU for a 12s clip, 1-2s on the GPU).
     # Charging 2 minutes for that meant 10% of the whole free monthly quota per
-    # captioned clip, roughly what generating the clip cost in the first place —
+    # captioned clip, roughly what generating the clip cost in the first place â€”
     # so people skipped it: only 9% of delivered clips had captions (prod audit,
     # 25-jul-2026). The endpoint is already gated by require_managed_entitlement
     # above, so this is not an open door.
@@ -2714,10 +3397,10 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         request, subtitle_minutes, req.job_id, "subtitle")
 
     try:
-        # 1. Generate SRT — from the existing transcript, or a fresh
+        # 1. Generate SRT â€” from the existing transcript, or a fresh
         # transcription when the audio was dubbed (see the metering note above).
         if is_dubbed:
-            print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
+            print(f"ðŸŽ™ï¸ Dubbed video detected, transcribing audio for subtitles...")
             def run_transcribe_srt():
                 if is_karaoke:
                     return generate_srt_from_video(input_path, srt_path, style="karaoke", **karaoke_opts)
@@ -2725,6 +3408,13 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
 
             loop = asyncio.get_event_loop()
             success = await loop.run_in_executor(None, run_transcribe_srt)
+        elif req.captions and len(req.captions) > 0:
+            from subtitles import generate_srt_from_captions, generate_ass_from_captions
+            print(f"📝 Using edited captions from modal ({len(req.captions)} words)")
+            if is_karaoke:
+                success = generate_ass_from_captions(req.captions, srt_path, max_chars=cap_max_chars, max_duration=cap_max_duration, **karaoke_opts)
+            else:
+                success = generate_srt_from_captions(req.captions, srt_path, max_chars=cap_max_chars, max_duration=cap_max_duration)
         elif is_karaoke:
             success = generate_ass(sub_transcript, sub_start, sub_end, srt_path, **karaoke_opts)
         else:
@@ -2733,20 +3423,57 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
-        # 2. Burn Subtitles
-        # Run in thread pool
-        def run_burn():
-             burn_subtitles(input_path, srt_path, output_path,
-                           alignment=req.position, fontsize=req.font_size,
-                           font_name=req.font_name, font_color=req.font_color,
-                           border_color=req.border_color, border_width=req.border_width,
-                           bg_color=req.bg_color, bg_opacity=req.bg_opacity)
-        
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, run_burn)
-        
+        # 2. Burn Subtitles — unified Remotion path so emoji and non-emoji look identical; fallback to FFmpeg only on failure
+        if req.captions and len(req.captions) > 0:
+            try:
+                await _burn_via_remotion(input_path, output_path, req.job_id, req.clip_index, req, req.captions)
+            except Exception as e:
+                print(f"⚠️ Remotion burn failed, falling back to FFmpeg: {e}")
+                def run_burn():
+                     burn_subtitles(input_path, srt_path, output_path,
+                                   alignment=req.position, fontsize=req.font_size,
+                                   font_name=req.font_name, font_color=req.font_color,
+                                   border_color=req.border_color, border_width=req.border_width,
+                                   bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, run_burn)
+        elif is_karaoke:
+            # No edited caps but karaoke style requested — burn from transcript via Remotion for uniform look
+            try:
+                # Build caps from transcript for this clip window and burn via Remotion
+                from subtitles import _collect_word_blocks
+                _style_tmp = {'fontFamily': req.font_name or 'Verdana', 'fontSize': int(req.font_size or 44), 'fontColor': req.font_color or '#FFFFFF', 'highlightColor': req.highlight_color or '#FFE500', 'borderColor': req.border_color or '#000000', 'borderWidth': int(req.border_width or 4), 'bgColor': req.bg_color or '#000000', 'bgOpacity': float(req.bg_opacity or 0.0), 'animation': 'pop' if req.effect=='pop' else ('word-highlight' if req.effect=='glow' else 'karaoke'), 'baseOpacity': float(req.base_opacity or 1.0), 'uppercase': bool(req.uppercase)}
+                _blocks_tmp = _collect_word_blocks(sub_transcript, sub_start, sub_end, max_chars=cap_max_chars, max_duration=cap_max_duration)
+                _caps_tmp = []
+                for _blk in _blocks_tmp:
+                    for _wd in _blk:
+                        _caps_tmp.append({"text": _wd['word'].strip(), "startMs": int(round(_wd['start']*1000)), "endMs": int(round(_wd['end']*1000))})
+                if _caps_tmp:
+                    await _burn_via_remotion(input_path, output_path, req.job_id, req.clip_index, req, _caps_tmp)
+                else:
+                    raise ValueError("No caps from transcript")
+            except Exception as e:
+                print(f"⚠️ Remotion transcript burn failed, falling back to FFmpeg: {e}")
+                def run_burn():
+                     burn_subtitles(input_path, srt_path, output_path,
+                                   alignment=req.position, fontsize=req.font_size,
+                                   font_name=req.font_name, font_color=req.font_color,
+                                   border_color=req.border_color, border_width=req.border_width,
+                                   bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, run_burn)
+        else:
+            def run_burn():
+                 burn_subtitles(input_path, srt_path, output_path,
+                               alignment=req.position, fontsize=req.font_size,
+                               font_name=req.font_name, font_color=req.font_color,
+                               border_color=req.border_color, border_width=req.border_width,
+                               bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, run_burn)
+
     except Exception as e:
-        print(f"❌ Subtitle Error: {e}")
+        print(f"âŒ Subtitle Error: {e}")
         if reservation_id:
             await _metering.release_reservation(reservation_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2755,23 +3482,47 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         await _metering.commit_reservation(reservation_id)
 
     # 3. Update Result and Metadata
+    # Persist edited captions when provided (so reopen shows new text)
+    if req.captions and len(req.captions) > 0:
+        # Normalize and store clip-relative
+        norm = []
+        for c in req.captions:
+            txt = str(c.get('text', '')).strip()
+            if not txt:
+                continue
+            try:
+                s = int(c.get('startMs', 0)); e = int(c.get('endMs', 0))
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            norm.append({"text": txt, "startMs": s, "endMs": e})
+        if norm:
+            # Save to in-memory and disk copy
+            if req.clip_index < len(job['result']['clips']):
+                job['result']['clips'][req.clip_index]['edited_captions'] = norm
+            if req.clip_index < len(clips):
+                clips[req.clip_index]['edited_captions'] = norm
+                print(f"📝 Persisted edited captions for clip {req.clip_index} ({len(norm)} words)")
+
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
+
     # Update Metadata on Disk (Persistence)
     try:
         if req.clip_index < len(clips):
             clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            # Keep edited_captions already set above
             # Update the main data structure
             data['shorts'] = clips
-            
+
             # Write back
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with subtitled video for clip {req.clip_index}")
+                print(f"âœ… Metadata updated with subtitled video for clip {req.clip_index}")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"âš ï¸ Failed to update metadata.json: {e}")
         # Non-critical, but good for persistence
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
@@ -2791,7 +3542,7 @@ class RemoveSubtitlesRequest(BaseModel):
 async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     """Point a clip back at its un-captioned original.
 
-    Clips ship captioned by default now, so there has to be a way out — without
+    Clips ship captioned by default now, so there has to be a way out â€” without
     this, a user who doesn't want captions is stuck with them. No re-encode and
     no quota: the pipeline always keeps the clean file next to the derived
     ``subtitled_<ts>_`` one, so removing is just choosing the other file.
@@ -2839,7 +3590,7 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
         with open(json_files[0], 'w') as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"âš ï¸ Failed to update metadata.json: {e}")
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, filename)
     return {"success": True, "new_video_url": new_url}
@@ -2866,19 +3617,19 @@ async def add_hook(req: HookRequest, request: Request):
     await _assert_job_owner(request, job)
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-    
+
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-        
+
     with open(json_files[0], 'r') as f:
         data = json.load(f)
-        
+
     clips = data.get('shorts', [])
     if req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
-        
+
     clip_data = clips[req.clip_index]
-    
+
     # Video Path
     if req.input_filename:
         filename = os.path.basename(req.input_filename)
@@ -2887,7 +3638,7 @@ async def add_hook(req: HookRequest, request: Request):
         if not filename:
              base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
              filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-         
+
     input_path = os.path.join(output_dir, filename)
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
@@ -2904,7 +3655,7 @@ async def add_hook(req: HookRequest, request: Request):
     # Output video
     output_filename = f"hook_{filename}"
     output_path = os.path.join(output_dir, output_filename)
-    
+
     # Map Size to Scale
     size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
     font_scale = size_map.get(req.size, 1.0)
@@ -2923,7 +3674,7 @@ async def add_hook(req: HookRequest, request: Request):
         await loop.run_in_executor(None, run_hook)
 
     except Exception as e:
-        print(f"❌ Hook Error: {e}")
+        print(f"âŒ Hook Error: {e}")
         if reservation_id:
             await _metering.release_reservation(reservation_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2942,7 +3693,7 @@ async def add_hook(req: HookRequest, request: Request):
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
+
     # Update Metadata on Disk
     try:
         if req.clip_index < len(clips):
@@ -2950,9 +3701,9 @@ async def add_hook(req: HookRequest, request: Request):
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with hook video for clip {req.clip_index}")
+                print(f"âœ… Metadata updated with hook video for clip {req.clip_index}")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"âš ï¸ Failed to update metadata.json: {e}")
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
 
@@ -3037,7 +3788,7 @@ async def translate_clip(
         await loop.run_in_executor(None, run_translate)
 
     except Exception as e:
-        print(f"❌ Translation Error: {e}")
+        print(f"âŒ Translation Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     # Update InMemory Jobs
@@ -3051,9 +3802,9 @@ async def translate_clip(
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with translated video for clip {req.clip_index}")
+                print(f"âœ… Metadata updated with translated video for clip {req.clip_index}")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"âš ï¸ Failed to update metadata.json: {e}")
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
 
@@ -3102,10 +3853,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         # clip['video_url'] is like "/videos/{job_id}/{filename}"
         # We constructed it as: f"/videos/{job_id}/{clip_filename}"
         # And file is at f"{OUTPUT_DIR}/{job_id}/{clip_filename}"
-        
+
         filename = clip['video_url'].split('/')[-1]
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
+
         if not os.path.exists(file_path):
              raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
 
@@ -3113,7 +3864,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         # Fallbacks
         final_title = req.title or clip.get('title', 'Viral Short')
         final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
-        
+
         # Prepare form data
         url = "https://api.upload-post.com/api/upload"
         headers = {
@@ -3133,12 +3884,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             data_payload["scheduled_date"] = req.scheduled_date
             if req.timezone:
                 data_payload["timezone"] = req.timezone
-        
+
         # Add Platform specifics
         if "tiktok" in req.platforms:
              data_payload["tiktok_title"] = final_description
              data_payload["post_mode"] = TIKTOK_POST_MODE
-             
+
         if "instagram" in req.platforms:
              data_payload["instagram_title"] = final_description
              data_payload["media_type"] = "REELS"
@@ -3150,28 +3901,28 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
              data_payload["privacyStatus"] = "public"
 
         # Send File
-        # httpx AsyncClient requires async file reading or bytes. 
+        # httpx AsyncClient requires async file reading or bytes.
         # Since we have MAX_FILE_SIZE_MB, reading into memory is safe-ish.
         with open(file_path, "rb") as f:
             file_content = f.read()
-            
+
         files = {
             "video": (filename, file_content, "video/mp4")
         }
 
         # Switch to synchronous Client to avoid "sync request with AsyncClient" error with multipart/files
         with httpx.Client(timeout=120.0) as client:
-            print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
+            print(f"ðŸ“¡ Sending to Upload-Post for platforms: {req.platforms}")
             response = client.post(url, headers=headers, data=data_payload, files=files)
-            
+
         if response.status_code not in [200, 201, 202]: # Added 201
-             print(f"❌ Upload-Post Error: {response.text}")
+             print(f"âŒ Upload-Post Error: {response.text}")
              raise HTTPException(status_code=response.status_code, detail=f"Vendor API Error: {response.text}")
 
         return response.json()
 
     except Exception as e:
-        print(f"❌ Social Post Exception: {e}")
+        print(f"âŒ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/social/user")
@@ -3186,19 +3937,19 @@ async def get_social_user(request: Request):
          raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
 
     url = "https://api.upload-post.com/api/uploadposts/users"
-    print(f"🔍 Fetching User ID from: {url}")
+    print(f"ðŸ” Fetching User ID from: {url}")
     headers = {"Authorization": f"Apikey {api_key}"}
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
-                print(f"❌ Upload-Post User Fetch Error: {resp.text}")
+                print(f"âŒ Upload-Post User Fetch Error: {resp.text}")
                 raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch user: {resp.text}")
-            
+
             data = resp.json()
-            print(f"🔍 Upload-Post User Response: {data}")
-            
+            print(f"ðŸ” Upload-Post User Response: {data}")
+
             user_id = None
             # The structure is {'success': True, 'profiles': [{'username': '...'}, ...]}
             profiles_list = []
@@ -3217,12 +3968,12 @@ async def get_social_user(request: Request):
                                  # If it's a dict and typically has data, or just not empty string
                                  if isinstance(account_info, dict):
                                      connected.append(platform)
-                             
+
                              profiles_list.append({
                                  "username": username,
                                  "connected": connected
                              })
-            
+
             # Managed users must only ever see their own profile.
             if forced_profile is not None:
                 profiles_list = [p for p in profiles_list if p.get("username") == forced_profile]
@@ -3232,9 +3983,12 @@ async def get_social_user(request: Request):
                 return {"profiles": [], "error": "No profiles found"}
 
             return {"profiles": profiles_list}
-            
-            
+
+
+        except HTTPException:
+            raise
         except Exception as e:
+             print(f"Social User unexpected error: {e}")
              raise HTTPException(status_code=500, detail=str(e))
 
 # --- Thumbnail Studio Endpoints ---
@@ -3314,11 +4068,11 @@ async def thumbnail_upload(
                 "video_duration": duration,
                 "language": transcript.get("language", "en"),
             })
-            print(f"✅ [Thumbnail] Background Whisper complete for session {session_id}")
+            print(f"âœ… [Thumbnail] Background Whisper complete for session {session_id}")
             if reservation_id:
                 await _metering.commit_reservation(reservation_id)
         except Exception as e:
-            print(f"❌ [Thumbnail] Background Whisper failed: {e}")
+            print(f"âŒ [Thumbnail] Background Whisper failed: {e}")
             thumbnail_sessions[session_id]["transcript_error"] = str(e)
             if reservation_id:
                 await _metering.release_reservation(reservation_id)
@@ -3340,7 +4094,7 @@ async def thumbnail_analyze(
 ):
     """Analyze a video and suggest viral YouTube titles."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    if provider == "gemini" and not api_key:
         raise gemini_missing_error()
 
     pre_transcript = None
@@ -3353,7 +4107,7 @@ async def thumbnail_analyze(
         # Wait for background Whisper to complete
         transcript_event = session.get("transcript_event")
         if transcript_event:
-            print(f"⏳ [Thumbnail] Waiting for background Whisper to finish...")
+            print(f"â³ [Thumbnail] Waiting for background Whisper to finish...")
             await transcript_event.wait()
 
         if session.get("transcript_error"):
@@ -3366,7 +4120,7 @@ async def thumbnail_analyze(
         if session.get("transcript_ready"):
             pre_transcript = session["transcript"]
     else:
-        # No pre-existing session — need file or URL
+        # No pre-existing session â€” need file or URL
         if not url and not file:
             raise HTTPException(status_code=400, detail="Must provide URL, File, or session_id")
 
@@ -3424,7 +4178,7 @@ async def thumbnail_analyze(
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
-        print(f"❌ Thumbnail Analyze Error: {e}")
+        print(f"âŒ Thumbnail Analyze Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3440,7 +4194,7 @@ async def thumbnail_titles(
 ):
     """Refine title suggestions or accept a manual title."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    if provider == "gemini" and not api_key:
         raise gemini_missing_error()
 
     # Manual title mode - just create a session with the user's title
@@ -3489,7 +4243,7 @@ async def thumbnail_titles(
         return {"titles": new_titles}
 
     except Exception as e:
-        print(f"❌ Thumbnail Titles Error: {e}")
+        print(f"âŒ Thumbnail Titles Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3505,10 +4259,10 @@ async def thumbnail_generate(
 ):
     """Generate YouTube thumbnails with Gemini image generation."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    if provider == "gemini" and not api_key:
         raise gemini_missing_error()
 
-    # Image generation is the one expensive managed Gemini call — paid plans only.
+    # Image generation is the one expensive managed Gemini call â€” paid plans only.
     if BILLING_ENABLED:
         user = await _user_from_request(request)
         if user is not None and user.plan == "free":
@@ -3520,8 +4274,8 @@ async def thumbnail_generate(
     # Clamp count
     count = min(max(1, count), 6)
 
-    # Gemini image generation is the expensive managed call — meter it against the
-    # plan quota (a batch ≈ THUMBNAIL_MINUTES). No-op for BYOK / self-host.
+    # Gemini image generation is the expensive managed call â€” meter it against the
+    # plan quota (a batch â‰ˆ THUMBNAIL_MINUTES). No-op for BYOK / self-host.
     thumb_minutes = _cloud_config.THUMBNAIL_MINUTES if BILLING_ENABLED else 0
     reservation_id = await reserve_managed_action(request, thumb_minutes, session_id, "thumbnail")
 
@@ -3569,7 +4323,7 @@ async def thumbnail_generate(
         if not thumbnails:
             raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your Gemini API key has access to image generation (gemini-3.1-flash-image-preview model).")
 
-        # Success — charge the reserved minutes.
+        # Success â€” charge the reserved minutes.
         if reservation_id:
             await _metering.commit_reservation(reservation_id)
         return {"thumbnails": thumbnails}
@@ -3581,7 +4335,7 @@ async def thumbnail_generate(
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
-        print(f"❌ Thumbnail Generate Error: {e}")
+        print(f"âŒ Thumbnail Generate Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3596,7 +4350,7 @@ async def thumbnail_describe(
 ):
     """Generate a YouTube description with chapters from the transcript."""
     api_key = await resolve_gemini(request)
-    if not api_key:
+    if provider == "gemini" and not api_key:
         raise gemini_missing_error()
 
     if req.session_id not in thumbnail_sessions:
@@ -3622,7 +4376,7 @@ async def thumbnail_describe(
         return {"description": result.get("description", "")}
 
     except Exception as e:
-        print(f"❌ Thumbnail Describe Error: {e}")
+        print(f"âŒ Thumbnail Describe Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3655,7 +4409,7 @@ async def thumbnail_publish(
     if not video_path or not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Original video file not found")
 
-    # Resolve thumbnail path from URL — sanitize against path traversal so a
+    # Resolve thumbnail path from URL â€” sanitize against path traversal so a
     # crafted thumbnail_url (e.g. "thumbnails/../../.env") can't read server
     # files and exfiltrate them via the Upload-Post multipart body.
     thumb_relative = thumbnail_url.lstrip("/")
@@ -3674,7 +4428,7 @@ async def thumbnail_publish(
     publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None}
 
     def do_upload():
-        """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
+        """Runs in a thread via BackgroundTasks â€” does the actual multipart upload."""
         try:
             upload_url = "https://api.upload-post.com/api/upload"
             headers = {"Authorization": f"Apikey {upload_key}"}
@@ -3690,30 +4444,30 @@ async def thumbnail_publish(
             video_filename = os.path.basename(video_path)
             thumb_filename = os.path.basename(thumb_path)
 
-            print(f"📡 [Thumbnail] Publishing to YouTube via Upload-Post... (publish_id={publish_id})")
+            print(f"ðŸ“¡ [Thumbnail] Publishing to YouTube via Upload-Post... (publish_id={publish_id})")
             with open(video_path, "rb") as vf, open(thumb_path, "rb") as tf:
                 files = {
                     "video": (video_filename, vf.read(), "video/mp4"),
                     "thumbnail": (thumb_filename, tf.read(), "image/jpeg"),
                 }
 
-            # Use a long timeout — video uploads can take several minutes
+            # Use a long timeout â€” video uploads can take several minutes
             with httpx.Client(timeout=600.0) as client:
                 response = client.post(upload_url, headers=headers, data=data_payload, files=files)
 
             if response.status_code not in [200, 201, 202]:
                 err = f"Upload-Post API Error ({response.status_code}): {response.text}"
-                print(f"❌ {err}")
+                print(f"âŒ {err}")
                 publish_jobs[publish_id]["status"] = "failed"
                 publish_jobs[publish_id]["error"] = err
             else:
-                print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
+                print(f"âœ… [Thumbnail] Published successfully (publish_id={publish_id})")
                 publish_jobs[publish_id]["status"] = "done"
                 publish_jobs[publish_id]["result"] = response.json()
 
         except Exception as e:
             err = str(e)
-            print(f"❌ Thumbnail Publish Background Error: {err}")
+            print(f"âŒ Thumbnail Publish Background Error: {err}")
             publish_jobs[publish_id]["status"] = "failed"
             publish_jobs[publish_id]["error"] = err
 
@@ -3727,6 +4481,86 @@ async def thumbnail_publish_status(publish_id: str):
     if publish_id not in publish_jobs:
         raise HTTPException(status_code=404, detail="Publish job not found")
     return publish_jobs[publish_id]
+
+
+# --- Self-host History (library) --------------------------------------------
+# The paid deployment backs History with R2 + a projects table. Self-host has
+# neither, but OUTPUT_DIR already holds every completed job (metadata JSON +
+# clips) thanks to _recover_jobs_from_disk — so the same library experience
+# works straight off disk. Jobs beyond the server's retention window simply
+# don't appear; output/ is the durability boundary in self-host.
+
+@app.get("/api/history")
+async def selfhost_history():
+    """All clips from completed jobs on disk, newest job first (History tab)."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    videos = []
+    entries = []
+    try:
+        entries = [(name, os.path.getmtime(os.path.join(OUTPUT_DIR, name)))
+                   for name in os.listdir(OUTPUT_DIR)
+                   if os.path.isdir(os.path.join(OUTPUT_DIR, name))]
+    except FileNotFoundError:
+        return {"videos": []}
+    for job_id, mtime in sorted(entries, key=lambda e: e[1], reverse=True):
+        if job_id == "thumbnails":
+            continue
+        json_files = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
+        if not json_files:
+            continue
+        try:
+            with open(json_files[0], 'r') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        clips = data.get('shorts', [])
+        created = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        for i, clip in enumerate(clips):
+            url = clip.get('video_url') or f"/videos/{job_id}/{_canonical_clip_file(os.path.join(OUTPUT_DIR, job_id), base_name, i)}"
+            fname = url.split('/')[-1]
+            if not os.path.exists(os.path.join(OUTPUT_DIR, job_id, fname)):
+                continue
+            videos.append({
+                "id": f"{job_id}:{i}",
+                "job_id": job_id,
+                "title": clip.get('video_title_for_youtube_short') or f"{base_name} clip {i + 1}",
+                "view_url": url,
+                "download_url": url,
+                "created_at": created,
+            })
+    return {"videos": videos}
+
+
+@app.get("/api/projects")
+async def selfhost_projects():
+    """Reopenable projects: completed jobs with metadata on disk."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    projects = []
+    try:
+        entries = [(name, os.path.getmtime(os.path.join(OUTPUT_DIR, name)))
+                   for name in os.listdir(OUTPUT_DIR)
+                   if os.path.isdir(os.path.join(OUTPUT_DIR, name))]
+    except FileNotFoundError:
+        return {"projects": []}
+    for job_id, mtime in sorted(entries, key=lambda e: e[1], reverse=True):
+        json_files = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
+        if not json_files:
+            continue
+        try:
+            with open(json_files[0], 'r') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        projects.append({
+            "job_id": job_id,
+            "title": data.get('vod_title') or data.get('video_title') or job_id,
+            "created_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+            "voiceover": bool(data.get('voiceover')),
+        })
+    return {"projects": projects}
 
 
 # @app.get("/api/gallery/clips")
@@ -3757,13 +4591,13 @@ async def thumbnail_publish_status(publish_id: str):
 #             "has_more": len(all_clips) > offset + limit
 #         }
 #     except Exception as e:
-#         print(f"❌ Gallery Error: {e}")
+#         print(f"âŒ Gallery Error: {e}")
 #         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # SaaSShorts: AI UGC Video Generator for SaaS Products
-# ═══════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 from saasshorts import (
     scrape_website,
@@ -3856,7 +4690,7 @@ class SaaSActorRequest(BaseModel):
 @app.post("/api/saasshorts/actor-upload")
 async def saasshorts_actor_upload(request: Request, file: UploadFile = File(...)):
     """Upload a custom actor image (stored locally only, not S3)."""
-    # SaaSShorts is part of the paid product — require entitlement in cloud mode
+    # SaaSShorts is part of the paid product â€” require entitlement in cloud mode
     # (no-op for self-host) so anonymous callers can't drive server work.
     await require_managed_entitlement(request)
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -3936,6 +4770,953 @@ async def saasshorts_actor_options(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Game Profile endpoints --------------------------------------------
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# VoiceOver: TTS voiceover + caption workflow.
+# AutoShorts TTS functionality adapted to OpenShorts (VOICEOVER.md) —
+# sources are regular OpenShorts clips (raw/uncaptioned) or manual uploads.
+# ═══════════════════════════════════════════════════════════════════════
+
+voiceover_jobs: Dict[str, Dict] = {}
+VO_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "voiceover")
+
+
+def _vo_resolve_source(source: Dict[str, Any]) -> str:
+    """Resolve {job_id, clip_index} or {upload_id} to a clean source MP4.
+
+    For generated clips the raw/uncaptioned file is always used — burned
+    caption layers (and only those) are stripped via _strip_burned_captions,
+    so a recut keeps its content edits but never its captions.
+    """
+    if not isinstance(source, dict):
+        raise HTTPException(status_code=400, detail="Invalid source")
+    if source.get("upload_id"):
+        upload_dir = os.path.join(VO_UPLOAD_DIR, str(source["upload_id"]))
+        if not os.path.isdir(upload_dir):
+            raise HTTPException(status_code=404, detail="Upload not found - upload the file again")
+        files = sorted(f for f in os.listdir(upload_dir) if f.lower().endswith(".mp4"))
+        if not files:
+            raise HTTPException(status_code=404, detail="Uploaded file not found")
+        return os.path.join(upload_dir, files[0])
+
+    job_id = str(source.get("job_id") or "")
+    if job_id:
+        output_dir = os.path.join(OUTPUT_DIR, job_id)
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            raise HTTPException(status_code=404, detail="Source job not found")
+        try:
+            with open(json_files[0], 'r') as f:
+                data = json.load(f)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not read source job metadata")
+        clips = data.get('shorts', [])
+        try:
+            idx = int(source.get("clip_index", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        if idx >= len(clips):
+            raise HTTPException(status_code=404, detail="Clip not found")
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        filename = clips[idx].get('video_url', '').split('/')[-1] \
+            or f"{base_name}_clip_{idx + 1}.mp4"
+        filename = _strip_burned_captions(output_dir, filename)
+        path = os.path.join(output_dir, filename)
+        if not os.path.exists(path):
+            filename = _canonical_clip_file(output_dir, base_name, idx)
+            path = os.path.join(output_dir, filename)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail=f"Source video not found: {filename}")
+        return path
+
+    raise HTTPException(status_code=400, detail="Provide job_id+clip_index or upload_id")
+
+
+def _vo_clip_language(source: Dict[str, Any]) -> Optional[str]:
+    """Detected language of a generated clip's transcript, or None."""
+    job_id = str((source or {}).get("job_id") or "")
+    if not job_id:
+        return None
+    json_files = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
+    if not json_files:
+        return None
+    try:
+        with open(json_files[0], 'r') as f:
+            data = json.load(f)
+        lang = (data.get('transcript') or {}).get('language')
+        return str(lang).strip()[:8] if lang else None
+    except Exception:
+        return None
+
+
+def _vo_resolve_language(requested: str, source: Dict[str, Any]) -> str:
+    """'auto' resolves from the clip's transcript language (the same detection
+    the Clip Generator already ran); uploads fall back to English."""
+    if (requested or "auto").lower() != "auto":
+        return requested.lower()[:8]
+    detected = _vo_clip_language(source)
+    if detected and detected.lower() not in ("auto", "unknown"):
+        return detected.lower()
+    return "en"
+
+
+def _vo_preview_url(source: Dict[str, Any], src_path: str) -> str:
+    """URL the dashboard can use to preview the (raw) source video."""
+    if source.get("upload_id"):
+        return f"/api/voiceover/upload/{source['upload_id']}"
+    return f"/videos/{source['job_id']}/{os.path.basename(src_path)}"
+
+
+def _vo_log(job: Dict, msg: str) -> None:
+    """Append a timestamped line to a voiceover job's log (same format as the
+    Clip Generator logs so the terminal UI renders both identically)."""
+    job.setdefault("logs", []).append(f"{datetime.now().strftime('%H:%M:%S')} {msg}")
+
+
+@app.get("/api/voiceover/tts/status")
+async def voiceover_tts_status():
+    """Whether local Qwen TTS is usable on this server (optional dependency)."""
+    return _voiceover.qwen_status()
+
+
+@app.get("/api/voiceover/upload/{upload_id}")
+async def voiceover_upload_file(upload_id: str):
+    """Stream a manual VoiceOver upload for preview (uploads dir isn't static)."""
+    upload_dir = os.path.join(VO_UPLOAD_DIR, re.sub(r'[^A-Za-z0-9._-]', '', upload_id))
+    if not os.path.isdir(upload_dir):
+        raise HTTPException(status_code=404, detail="Upload not found")
+    files = sorted(f for f in os.listdir(upload_dir) if f.lower().endswith(".mp4"))
+    if not files:
+        raise HTTPException(status_code=404, detail="Uploaded file not found")
+    return FileResponse(os.path.join(upload_dir, files[0]), media_type="video/mp4")
+
+
+@app.post("/api/voiceover/upload")
+async def voiceover_upload(file: UploadFile = File(...)):
+    """Manual VoiceOver source upload; returns {upload_id} for later steps."""
+    upload_id = str(uuid.uuid4())
+    dest_dir = os.path.join(VO_UPLOAD_DIR, upload_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(file.filename or "upload.mp4"))[:120]
+    if not safe.lower().endswith(".mp4"):
+        safe += ".mp4"
+    dest = os.path.join(dest_dir, safe)
+    size = 0
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            out.write(chunk)
+    if size < 1024:
+        raise HTTPException(status_code=400, detail="Empty file")
+    return {"upload_id": upload_id, "filename": safe,
+            "duration": _voiceover.probe_duration(dest)}
+
+
+class VoiceOverCaptionRequest(BaseModel):
+    source: Dict[str, Any]
+    provider: str = "gemini"           # gemini | openai
+    style_prompt: str = ""
+    game_title: str = ""
+    game_description: str = ""
+    language: str = "en"
+
+
+@app.post("/api/voiceover/captions")
+async def voiceover_captions(req: VoiceOverCaptionRequest, request: Request):
+    """Generate 4 caption script options for the source video."""
+    src = _vo_resolve_source(req.source)
+    duration = _voiceover.probe_duration(src)
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="Could not read source video duration")
+
+    provider, gemini_key, openai_key, openai_model, openai_base, gemini_model = \
+        await resolve_ai_provider(request)
+    if req.provider in ("gemini", "openai"):
+        provider = req.provider
+
+    max_caps = _voiceover.compute_max_captions(duration, req.style_prompt)
+    language = _vo_resolve_language(req.language, req.source)
+    prompt = _voiceover.build_caption_prompt(
+        req.style_prompt, duration, max_caps,
+        req.game_title, req.game_description, language)
+
+    loop = asyncio.get_event_loop()
+    try:
+        if provider == "openai":
+            options = await loop.run_in_executor(None, lambda: _voiceover.generate_caption_options_openai(
+                src, prompt, openai_key, openai_model, openai_base))
+        else:
+            if not gemini_key:
+                raise gemini_missing_error()
+            options = await loop.run_in_executor(None, lambda: _voiceover.generate_caption_options_gemini(
+                src, prompt, gemini_key, gemini_model))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Caption generation failed: {e}")
+
+    return {"options": options, "duration": duration, "provider": provider,
+            "language": language, "preview_url": _vo_preview_url(req.source, src)}
+
+
+class VoiceOverGenerateRequest(BaseModel):
+    source: Dict[str, Any]
+    captions: List[Dict[str, Any]] = []   # selected (possibly edited) option
+    voice_provider: str = "qwen"          # qwen | elevenlabs
+    voice_prompt: str = ""                # possibly edited preset prompt
+    voice_preset_id: Optional[str] = None
+    elevenlabs_voice_id: str = ""
+    language: str = "en"
+    style: Dict[str, Any] = {}            # subtitle style overrides
+
+
+@app.post("/api/voiceover/generate")
+async def voiceover_generate(req: VoiceOverGenerateRequest, request: Request):
+    """Full pipeline: TTS -> duck/mix -> <name>_voiceover.mp4 -> caption burn
+    -> <name>_voiceover_captioned.mp4. Runs as a background task; poll
+    /api/voiceover/jobs/{vo_id}. The result is registered as a regular job so
+    the existing Subtitle editor works on it (always re-rendering from
+    <name>_voiceover.mp4 via _strip_burned_captions)."""
+    src = _vo_resolve_source(req.source)
+    el_key = (request.headers.get("X-ElevenLabs-Key") or "").strip()
+    if req.voice_provider == "elevenlabs" and not el_key:
+        raise HTTPException(status_code=400, detail="Missing X-ElevenLabs-Key header (Settings - ElevenLabs)")
+    if req.voice_provider == "qwen" and not _voiceover.QwenLocalTTS.available():
+        raise HTTPException(status_code=400, detail=(
+            "Local TTS is unavailable: the optional qwen-tts package is not installed "
+            "on this server. Use ElevenLabs or install qwen-tts."))
+    if not req.captions:
+        raise HTTPException(status_code=400, detail="No captions selected")
+
+    language = _vo_resolve_language(req.language, req.source)
+
+    vo_id = str(uuid.uuid4())
+    vo_dir = os.path.join(OUTPUT_DIR, vo_id)
+    os.makedirs(vo_dir, exist_ok=True)
+    voiceover_jobs[vo_id] = {
+        "status": "processing", "stage": "preparing", "progress": 0,
+        "error": None, "created_at": time.time(), "logs": [],
+    }
+
+    async def _run():
+        job = voiceover_jobs[vo_id]
+        _debug = DEBUG_LOGS
+
+        def _dbg(msg: str) -> None:
+            """Verbose detail — only shown in the log terminal when DEBUG_LOGS is on."""
+            if _debug:
+                _vo_log(job, msg)
+
+        try:
+            loop = asyncio.get_event_loop()
+            base = os.path.splitext(os.path.basename(src))[0]
+            clean_base = re.sub(r'[^A-Za-z0-9._-]', '_', base).strip('._-') or "video"
+            local_src = os.path.join(vo_dir, f"{clean_base}.mp4")
+            if os.path.abspath(src) != os.path.abspath(local_src):
+                _vo_log(job, "Preparing the source video…")
+                _dbg(f"Copying {os.path.getsize(src) // (1024 * 1024)} MB to the job folder")
+                await loop.run_in_executor(None, lambda: shutil.copy2(src, local_src))
+
+            voice_label = ("Local Qwen TTS" if req.voice_provider == "qwen" else "ElevenLabs")
+            lang_label = (f", {len(req.captions)} captions" if req.captions else "")
+            _vo_log(job, f"Recording the narration with {voice_label} ({language}{lang_label})…")
+            _dbg(f"voice_provider={req.voice_provider} language={language} "
+                 f"captions={len(req.captions)} persona={len(req.voice_prompt)} chars "
+                 f"el_voice={req.elevenlabs_voice_id or '-'}")
+            job.update(stage="tts", progress=5)
+
+            def _progress(done, total):
+                job["stage"] = f"voice {done}/{total}"
+                job["progress"] = 5 + int(40 * done / max(1, total))
+
+            track = await loop.run_in_executor(None, lambda: _voiceover.build_voiceover_track(
+                req.captions, req.voice_provider, req.voice_prompt, vo_dir,
+                elevenlabs_key=el_key, elevenlabs_voice_id=req.elevenlabs_voice_id,
+                language=language, progress_cb=_progress))
+            spoken = track["total_duration"]
+            _vo_log(job, f"Narration recorded — {spoken:.0f} seconds of speech.")
+            _dbg(f"TTS: {len(track['segments'])} segments, {len(track['word_captions'])} timed words, "
+                 f"track={os.path.basename(track['audio_path'])}")
+
+            job.update(stage="mixing", progress=50)
+            _vo_log(job, "Lowering the game audio under the narration and mixing…")
+            vo_mp4 = os.path.join(vo_dir, f"{clean_base}_voiceover.mp4")
+            await loop.run_in_executor(None, lambda: _voiceover.duck_and_mix(
+                local_src, track["audio_path"], vo_mp4))
+            _vo_log(job, f"Voiceover video ready ({_voiceover.probe_duration(vo_mp4):.0f}s) — game audio returns to full volume between lines.")
+
+            job.update(stage="captions", progress=65)
+            _vo_log(job, "Adding animated captions to the video…")
+            word_caps = track["word_captions"]
+            duration = _voiceover.probe_duration(vo_mp4)
+
+            # Caption burn style - defaults mirror SubtitleModal's 'auto' preset
+            s = dict(position="bottom", font_size=20, font_name="Anton",
+                     font_color="#FFFFFF", border_color="#000000", border_width=4,
+                     bg_color="#000000", bg_opacity=0.0, style="karaoke",
+                     highlight_color="#FFE500", effect="pop", base_opacity=1.0,
+                     uppercase=True, max_chars=16, max_duration=1400,
+                     margin_v=43, word_gap=8)
+            s.update({k: v for k, v in (req.style or {}).items() if v is not None})
+            captioned_name = f"{clean_base}_voiceover_captioned.mp4"
+            captioned_path = os.path.join(vo_dir, captioned_name)
+            _dbg(f"{len(word_caps)} word captions, burn style: {s['style']}/{s['effect']} "
+                 f"({s['font_name']} {s['font_size']}px) via Remotion")
+
+            sub_req = SubtitleRequest(job_id=vo_id, clip_index=0, **s)
+            try:
+                await _burn_via_remotion(vo_mp4, captioned_path, vo_id, 0, sub_req, word_caps)
+            except Exception as e:
+                _vo_log(job, "The fast caption renderer hiccuped — retrying with the backup renderer…")
+                _dbg(f"Remotion burn failed: {e}")
+                print(f"VoiceOver remotion burn failed, falling back to FFmpeg: {e}")
+                srt_path = os.path.join(vo_dir, f"vo_{int(time.time())}.srt")
+
+                def _ff_burn():
+                    generate_srt_from_captions(
+                        word_caps, srt_path, max_chars=int(s["max_chars"]),
+                        max_duration=int(s["max_duration"]) / 1000.0)
+                    burn_subtitles(vo_mp4, srt_path, captioned_path,
+                                   alignment=s["position"], fontsize=s["font_size"],
+                                   font_name=s["font_name"], font_color=s["font_color"],
+                                   border_color=s["border_color"], border_width=s["border_width"],
+                                   bg_color=s["bg_color"], bg_opacity=s["bg_opacity"])
+                await loop.run_in_executor(None, _ff_burn)
+
+            job.update(stage="saving", progress=95)
+            _vo_log(job, "Finishing up — saving your videos…")
+            clip = {"video_url": f"/videos/{vo_id}/{captioned_name}",
+                    "start": 0.0, "end": duration,
+                    "edited_captions": word_caps,
+                    "video_title_for_youtube_short": f"{clean_base} voiceover"}
+            metadata = {"video_title": clean_base, "voiceover": True,
+                        "transcript": {"language": language, "segments": []},
+                        "shorts": [clip],
+                        # The user's selected/edited caption script — restored
+                        # by /api/projects/{id}/restore so reopen shows the
+                        # original suggestions, not just the timed words.
+                        "voiceover_captions": req.captions}
+            with open(os.path.join(vo_dir, f"{clean_base}_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
+            jobs[vo_id] = {"status": "completed",
+                           "logs": list(job.get("logs", [])),
+                           "output_dir": vo_dir, "user_id": None,
+                           "result": {"clips": [dict(clip)], "cost_analysis": None,
+                                      "vod_title": clean_base}}
+            _vo_log(job, "All done! Both videos are ready below.")
+            job.update(status="completed", stage="done", progress=100,
+                       result={"job_id": vo_id,
+                               "voiceover_url": f"/videos/{vo_id}/{os.path.basename(vo_mp4)}",
+                               "captioned_url": f"/videos/{vo_id}/{captioned_name}",
+                               "duration": duration})
+        except Exception as e:
+            print(f"VoiceOver job {vo_id} failed: {e}")
+            _vo_log(job, f"Something went wrong: {e}")
+            job.update(status="error", error=str(e))
+
+    asyncio.create_task(_run())
+    return {"vo_id": vo_id}
+
+
+@app.get("/api/voiceover/jobs/{vo_id}")
+async def voiceover_job_status(vo_id: str):
+    job = voiceover_jobs.get(vo_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="VoiceOver job not found")
+    return job
+
+
+# --- Voice/Style preset CRUD (Game-Profiles-style endpoints) --------------
+
+@app.get("/api/voice-presets")
+async def list_voice_presets():
+    return voice_presets_repo.list_presets()
+
+
+@app.post("/api/voice-presets")
+async def create_voice_preset(body: dict):
+    try:
+        return voice_presets_repo.create_preset(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/voice-presets/export")
+async def export_voice_presets():
+    return voice_presets_repo.export_all()
+
+
+@app.post("/api/voice-presets/import")
+async def import_voice_presets(body: dict):
+    try:
+        return voice_presets_repo.import_presets(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/voice-presets/{preset_id}")
+async def get_voice_preset(preset_id: str):
+    preset = voice_presets_repo.get_preset(preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.put("/api/voice-presets/{preset_id}")
+async def update_voice_preset(preset_id: str, body: dict):
+    try:
+        preset = voice_presets_repo.update_preset(preset_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.delete("/api/voice-presets/{preset_id}")
+async def delete_voice_preset(preset_id: str):
+    try:
+        if not voice_presets_repo.delete_preset(preset_id):
+            raise HTTPException(status_code=404, detail="Preset not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"success": True}
+
+
+@app.post("/api/voice-presets/{preset_id}/duplicate")
+async def duplicate_voice_preset(preset_id: str):
+    preset = voice_presets_repo.duplicate_preset(preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.get("/api/style-presets")
+async def list_style_presets():
+    return style_presets_repo.list_presets()
+
+
+@app.post("/api/style-presets")
+async def create_style_preset(body: dict):
+    try:
+        return style_presets_repo.create_preset(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/style-presets/export")
+async def export_style_presets():
+    return style_presets_repo.export_all()
+
+
+@app.post("/api/style-presets/import")
+async def import_style_presets(body: dict):
+    try:
+        return style_presets_repo.import_presets(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/style-presets/{preset_id}")
+async def get_style_preset(preset_id: str):
+    preset = style_presets_repo.get_preset(preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.put("/api/style-presets/{preset_id}")
+async def update_style_preset(preset_id: str, body: dict):
+    try:
+        preset = style_presets_repo.update_preset(preset_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.delete("/api/style-presets/{preset_id}")
+async def delete_style_preset(preset_id: str):
+    try:
+        if not style_presets_repo.delete_preset(preset_id):
+            raise HTTPException(status_code=404, detail="Preset not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"success": True}
+
+
+@app.post("/api/style-presets/{preset_id}/duplicate")
+async def duplicate_style_preset(preset_id: str):
+    preset = style_presets_repo.duplicate_preset(preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return preset
+
+
+@app.post("/api/game-profiles")
+async def create_game_profile(request: Request, profile_data: dict):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        user_id = "local"
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        # Validate required fields
+        if not profile_data.get("name"):
+            raise HTTPException(status_code=400, detail="Profile name is required")
+        if not profile_data.get("game_title"):
+            raise HTTPException(status_code=400, detail="Game title is required")
+
+        try:
+            profile_id = repo.create_profile(profile_data)
+            # Get the created profile to return it
+            profile_data = repo.get_profile(profile_id)
+            if not profile_data:
+                raise HTTPException(status_code=500, detail="Failed to retrieve created profile")
+
+            return {
+                "id": str(profile_data["id"]),
+                "name": profile_data["name"],
+                "game_title": profile_data["game_title"],
+                "steam_app_id": profile_data.get("steam_app_id"),
+                "steam_description": profile_data.get("steam_description"),
+                "steam_genres": profile_data.get("steam_genres"),
+                "steam_tags": profile_data.get("steam_tags"),
+                "custom_description": profile_data.get("custom_description"),
+                "ai_analysis": profile_data.get("ai_analysis"),
+                "recommended_weights": profile_data.get("recommended_weights"),
+                "active_weights": profile_data.get("active_weights"),
+                "created_at": profile_data.get("created_at"),
+                "updated_at": profile_data.get("updated_at")
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create game profile: {str(e)}")
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import create_game_profile
+
+        # Validate required fields
+        if not profile_data.get("name"):
+            raise HTTPException(status_code=400, detail="Profile name is required")
+        if not profile_data.get("game_title"):
+            raise HTTPException(status_code=400, detail="Game title is required")
+
+        try:
+            profile = await create_game_profile(str(user.id), profile_data)
+            return {
+                "id": str(profile.id),
+                "name": profile.name,
+                "game_title": profile.game_title,
+                "steam_app_id": profile.steam_app_id,
+                "steam_description": profile.steam_description,
+                "steam_genres": profile.steam_genres,
+                "steam_tags": profile.steam_tags,
+                "custom_description": profile.custom_description,
+                "ai_analysis": profile.ai_analysis,
+                "recommended_weights": profile.recommended_weights,
+                "active_weights": profile.active_weights,
+                "created_at": profile.created_at.isoformat() if profile.created_at else None,
+                "updated_at": profile.updated_at.isoformat() if profile.updated_at else None
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create game profile: {str(e)}")
+
+
+@app.get("/api/game-profiles")
+async def list_game_profiles(request: Request):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        profiles_data = repo.list_profiles()
+        return [
+            {
+                "id": str(p["id"]),
+                "name": p["name"],
+                "game_title": p["game_title"],
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at")
+            }
+            for p in profiles_data
+        ]
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import list_game_profiles
+
+        profiles = await list_game_profiles(str(user.id))
+        return [
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "game_title": p.game_title,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+                "updated_at": p.updated_at.isoformat() if p.updated_at else None
+            }
+            for p in profiles
+        ]
+
+
+@app.get("/api/game-profiles/export")
+async def export_game_profiles(request: Request):
+    """Export all game profiles as JSON.
+
+    Returns {version, exported_at, count, profiles: [...]}.
+    Works for both local (LOCAL_GAMEPROFILES=1) and cloud mode.
+    """
+    import os
+    from datetime import datetime, timezone
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+        profiles = repo.list_profiles()
+    else:
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import list_game_profiles
+        raw = await list_game_profiles(str(user.id))
+        profiles = []
+        for p in raw:
+            # Handle both ORM objects and dict-like fallback
+            if isinstance(p, dict):
+                profiles.append(p)
+            else:
+                profiles.append({
+                    "id": str(getattr(p, "id", "")),
+                    "name": getattr(p, "name", ""),
+                    "game_title": getattr(p, "game_title", ""),
+                    "steam_app_id": getattr(p, "steam_app_id", None),
+                    "steam_description": getattr(p, "steam_description", None),
+                    "steam_genres": getattr(p, "steam_genres", None),
+                    "steam_tags": getattr(p, "steam_tags", None),
+                    "custom_description": getattr(p, "custom_description", None),
+                    "ai_analysis": getattr(p, "ai_analysis", None),
+                    "recommended_weights": getattr(p, "recommended_weights", None),
+                    "active_weights": getattr(p, "active_weights", None),
+                    "created_at": getattr(p, "created_at", None).isoformat() if hasattr(getattr(p, "created_at", None), "isoformat") else getattr(p, "created_at", None),
+                    "updated_at": getattr(p, "updated_at", None).isoformat() if hasattr(getattr(p, "updated_at", None), "isoformat") else getattr(p, "updated_at", None),
+                })
+    return {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(profiles),
+        "profiles": profiles,
+    }
+
+
+@app.post("/api/game-profiles/import")
+async def import_game_profiles(request: Request):
+    """Import game profiles from JSON.
+
+    Accepts {profiles: [...]} or [...] or {profile: {...}}.
+    Each profile requires name and game_title; other fields are optional.
+    IDs and timestamps are regenerated; user_id is set to the caller.
+    Returns {imported, skipped, errors, ids}.
+    """
+    import os
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Normalize input to list of profile dicts
+    if isinstance(body, list):
+        incoming = body
+    elif isinstance(body, dict) and isinstance(body.get("profiles"), list):
+        incoming = body["profiles"]
+    elif isinstance(body, dict) and isinstance(body.get("profile"), dict):
+        incoming = [body["profile"]]
+    elif isinstance(body, dict) and "name" in body and "game_title" in body:
+        incoming = [body]
+    else:
+        raise HTTPException(status_code=400, detail="Expected {profiles: [...]} or [...] or {name, game_title, ...}")
+
+    if not isinstance(incoming, list) or len(incoming) == 0:
+        raise HTTPException(status_code=400, detail="No profiles to import")
+    if len(incoming) > 100:
+        raise HTTPException(status_code=400, detail="Too many profiles (max 100 per import)")
+
+    is_local = os.environ.get("LOCAL_GAMEPROFILES") == "1"
+    if not is_local:
+        user = await get_current_user_required(request)
+        user_id = str(user.id)
+    else:
+        user_id = "local"
+
+    imported = 0
+    skipped = []
+    errors = []
+    ids = []
+
+    for idx, raw in enumerate(incoming):
+        if not isinstance(raw, dict):
+            errors.append({"index": idx, "error": "not an object"})
+            continue
+        name = (raw.get("name") or "").strip()
+        game_title = (raw.get("game_title") or "").strip()
+        if not name or not game_title:
+            skipped.append({"index": idx, "reason": "missing name or game_title", "name": name or None})
+            continue
+
+        # Sanitize: only allow known fields, regenerate ids/timestamps
+        profile_data = {
+            "name": name[:120],
+            "game_title": game_title[:200],
+            "steam_app_id": str(raw.get("steam_app_id") or "")[:20] if raw.get("steam_app_id") is not None else None,
+            "steam_description": (raw.get("steam_description") or "")[:4000] if raw.get("steam_description") else None,
+            "steam_genres": raw.get("steam_genres") if isinstance(raw.get("steam_genres"), list) else [],
+            "steam_tags": raw.get("steam_tags") if isinstance(raw.get("steam_tags"), list) else [],
+            "custom_description": (raw.get("custom_description") or "")[:4000] if raw.get("custom_description") else None,
+            "ai_analysis": raw.get("ai_analysis") if isinstance(raw.get("ai_analysis"), dict) else None,
+            "recommended_weights": raw.get("recommended_weights") if isinstance(raw.get("recommended_weights"), dict) else None,
+            "active_weights": raw.get("active_weights") if isinstance(raw.get("active_weights"), dict) else None,
+        }
+        # Ensure genres/tags are list of strings (strip empty)
+        for k in ("steam_genres", "steam_tags"):
+            v = profile_data[k]
+            if isinstance(v, list):
+                profile_data[k] = [str(x)[:60] for x in v if str(x).strip()][:30]
+            else:
+                profile_data[k] = []
+
+        try:
+            if is_local:
+                from cloud.local_game_profiles import LocalGameProfileRepository
+                repo = LocalGameProfileRepository()
+                # Inject user_id is ignored in local mode but keep for compatibility
+                new_id = repo.create_profile({**profile_data, "user_id": user_id})
+                ids.append(new_id)
+            else:
+                from cloud.game_profiles import create_game_profile
+                prof = await create_game_profile(user_id, profile_data)
+                # Local fallback returns object with .id, cloud returns ORM
+                nid = str(getattr(prof, "id", ""))
+                ids.append(nid)
+            imported += 1
+        except Exception as e:
+            errors.append({"index": idx, "name": name, "error": str(e)[:300]})
+
+    return {"imported": imported, "skipped": skipped, "errors": errors, "ids": ids, "total": len(incoming)}
+
+
+@app.get("/api/game-profiles/{profile_id}")
+async def get_game_profile(request: Request, profile_id: str):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        profile_data = repo.get_profile(profile_id)
+        if not profile_data:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {
+            "id": str(profile_data["id"]),
+            "name": profile_data["name"],
+            "game_title": profile_data["game_title"],
+            "steam_app_id": profile_data.get("steam_app_id"),
+            "steam_description": profile_data.get("steam_description"),
+            "steam_genres": profile_data.get("steam_genres"),
+            "steam_tags": profile_data.get("steam_tags"),
+            "custom_description": profile_data.get("custom_description"),
+            "ai_analysis": profile_data.get("ai_analysis"),
+            "recommended_weights": profile_data.get("recommended_weights"),
+            "active_weights": profile_data.get("active_weights"),
+            "created_at": profile_data.get("created_at"),
+            "updated_at": profile_data.get("updated_at")
+        }
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import get_game_profile
+
+        profile = await get_game_profile(str(user.id), profile_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {
+            "id": str(profile.id),
+            "name": profile.name,
+            "game_title": profile.game_title,
+            "steam_app_id": profile.steam_app_id,
+            "steam_description": profile.steam_description,
+            "steam_genres": profile.steam_genres,
+            "steam_tags": profile.steam_tags,
+            "ai_analysis": profile.ai_analysis,
+            "recommended_weights": profile.recommended_weights,
+            "active_weights": profile.active_weights,
+            "created_at": profile.created_at.isoformat() if profile.created_at else None,
+            "updated_at": profile.updated_at.isoformat() if profile.updated_at else None
+        }
+
+
+@app.put("/api/game-profiles/{profile_id}")
+async def update_game_profile(request: Request, profile_id: str, profile_data: dict):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        # Validate required fields
+        if not profile_data.get("name"):
+            raise HTTPException(status_code=400, detail="Profile name is required")
+        if not profile_data.get("game_title"):
+            raise HTTPException(status_code=400, detail="Game title is required")
+
+        success = repo.update_profile(profile_id, profile_data)
+        if not success:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        # Get the updated profile to return it
+        profile_data = repo.get_profile(profile_id)
+        if not profile_data:
+            raise HTTPException(status_code=500, detail="Failed to retrieve updated profile")
+
+        return {
+            "id": str(profile_data["id"]),
+            "name": profile_data["name"],
+            "game_title": profile_data["game_title"],
+            "steam_app_id": profile_data.get("steam_app_id"),
+            "steam_description": profile_data.get("steam_description"),
+            "steam_genres": profile_data.get("steam_genres"),
+            "steam_tags": profile_data.get("steam_tags"),
+            "custom_description": profile_data.get("custom_description"),
+            "ai_analysis": profile_data.get("ai_analysis"),
+            "recommended_weights": profile_data.get("recommended_weights"),
+            "active_weights": profile_data.get("active_weights"),
+            "created_at": profile_data.get("created_at"),
+            "updated_at": profile_data.get("updated_at")
+        }
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import update_game_profile
+
+        # Validate required fields
+        if not profile_data.get("name"):
+            raise HTTPException(status_code=400, detail="Profile name is required")
+        if not profile_data.get("game_title"):
+            raise HTTPException(status_code=400, detail="Game title is required")
+
+        updated_profile = await update_game_profile(str(user.id), profile_id, profile_data)
+        if not updated_profile:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {
+            "id": str(updated_profile.id),
+            "name": updated_profile.name,
+            "game_title": updated_profile.game_title,
+            "steam_app_id": updated_profile.steam_app_id,
+            "steam_description": updated_profile.steam_description,
+            "steam_genres": updated_profile.steam_genres,
+            "steam_tags": updated_profile.steam_tags,
+            "ai_analysis": updated_profile.ai_analysis,
+            "recommended_weights": updated_profile.recommended_weights,
+            "active_weights": updated_profile.active_weights,
+            "created_at": updated_profile.created_at.isoformat() if updated_profile.created_at else None,
+            "updated_at": updated_profile.updated_at.isoformat() if updated_profile.updated_at else None
+        }
+
+
+@app.delete("/api/game-profiles/{profile_id}")
+async def delete_game_profile(request: Request, profile_id: str):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        success = repo.delete_profile(profile_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {"message": "Game profile deleted successfully"}
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import delete_game_profile
+
+        success = await delete_game_profile(str(user.id), profile_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {"message": "Game profile deleted successfully"}
+
+
+@app.post("/api/game-profiles/{profile_id}/duplicate")
+async def duplicate_game_profile(request: Request, profile_id: str):
+    # Check if local mode is enabled
+    import os
+    if os.environ.get("LOCAL_GAMEPROFILES") == "1":
+        # In local mode, use 'local' as the user ID
+        from cloud.local_game_profiles import LocalGameProfileRepository
+        repo = LocalGameProfileRepository()
+
+        new_id = repo.duplicate_profile(profile_id)
+        if not new_id:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        # Get the duplicated profile to return it
+        profile_data = repo.get_profile(new_id)
+        if not profile_data:
+            raise HTTPException(status_code=500, detail="Failed to retrieve duplicated profile")
+
+        return {
+            "id": str(profile_data["id"]),
+            "name": profile_data["name"],
+            "game_title": profile_data["game_title"],
+            "steam_app_id": profile_data.get("steam_app_id"),
+            "steam_description": profile_data.get("steam_description"),
+            "steam_genres": profile_data.get("steam_genres"),
+            "steam_tags": profile_data.get("steam_tags"),
+            "custom_description": profile_data.get("custom_description"),
+            "ai_analysis": profile_data.get("ai_analysis"),
+            "recommended_weights": profile_data.get("recommended_weights"),
+            "active_weights": profile_data.get("active_weights"),
+            "created_at": profile_data.get("created_at"),
+            "updated_at": profile_data.get("updated_at")
+        }
+    else:
+        # Cloud mode - use existing authentication
+        user = await get_current_user_required(request)
+        from cloud.game_profiles import duplicate_game_profile
+
+        duplicated_profile = await duplicate_game_profile(str(user.id), profile_id)
+        if not duplicated_profile:
+            raise HTTPException(status_code=404, detail="Game profile not found")
+
+        return {
+            "id": str(duplicated_profile.id),
+            "name": duplicated_profile.name,
+            "game_title": duplicated_profile.game_title,
+            "steam_app_id": duplicated_profile.steam_app_id,
+            "steam_description": duplicated_profile.steam_description,
+            "steam_genres": duplicated_profile.steam_genres,
+            "steam_tags": duplicated_profile.steam_tags,
+            "ai_analysis": duplicated_profile.ai_analysis,
+            "recommended_weights": duplicated_profile.recommended_weights,
+            "active_weights": duplicated_profile.active_weights,
+            "created_at": duplicated_profile.created_at.isoformat() if duplicated_profile.created_at else None,
+            "updated_at": duplicated_profile.updated_at.isoformat() if duplicated_profile.updated_at else None
+        }
 
 
 @app.get("/api/saasshorts/gallery")
@@ -4027,7 +5808,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
         files = {"video": (filename, file_content, "video/mp4")}
 
         with httpx.Client(timeout=120.0) as client:
-            print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
+            print(f"ðŸ“¡ [AI Shorts] Sending to Upload-Post: {req.platforms}")
             response = client.post(url, headers=headers, data=data_payload, files=files)
 
         if response.status_code not in [200, 201, 202]:
@@ -4038,7 +5819,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [AI Shorts] Post Exception: {e}")
+        print(f"âŒ [AI Shorts] Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -4074,7 +5855,7 @@ async def gallery_html_page():
             </div>
             <div style="padding:12px">
               <h2 style="font-size:14px;font-weight:600;margin:0 0 4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{title}</h2>
-              <p style="font-size:11px;color:#71717a;margin:0">{duration:.0f}s · {product}</p>
+              <p style="font-size:11px;color:#71717a;margin:0">{duration:.0f}s Â· {product}</p>
             </div>
           </div>
         </a>'''
@@ -4107,7 +5888,7 @@ h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
 <body>
 <nav><strong style="font-size:18px">OpenShorts</strong><a href="/" class="cta">Create Your Video</a></nav>
 <h1>AI-Generated UGC Videos</h1>
-<p class="subtitle">{len(videos)} videos generated · Low Cost & Premium modes</p>
+<p class="subtitle">{len(videos)} videos generated Â· Low Cost & Premium modes</p>
 <div class="grid">{cards_html}</div>
 <div style="text-align:center;padding:40px"><a href="/" class="cta">Create Your Own UGC Video</a></div>
 </body></html>'''
@@ -4178,17 +5959,17 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 </style>
 </head>
 <body>
-<nav><strong>OpenShorts</strong><a href="/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
+<nav><strong>OpenShorts</strong><a href="/gallery">Gallery</a><span style="color:#3f3f46">â€º</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
 <div class="container">
 <div><video src="{video_url}" poster="{actor_url}" controls autoplay playsinline style="aspect-ratio:9/16;object-fit:cover"></video></div>
 <div>
 <h1>{title}</h1>
-<p class="meta">{duration:.0f}s · {mode_label} · ${cost:.2f} · {product}</p>
+<p class="meta">{duration:.0f}s Â· {mode_label} Â· ${cost:.2f} Â· {product}</p>
 <div class="section"><h2>Caption</h2><p>{caption}</p><p style="color:#8b5cf6;margin-top:4px">{hashtags}</p></div>
 <div class="section"><h2>Script</h2><p>{narration}</p></div>
 <div class="section"><h2>Actor</h2><p>{actor_desc}</p></div>
 {f'<div class="section"><h2>Product</h2><p><a href="{product_url}" style="color:#8b5cf6" target="_blank">{product}</a></p></div>' if product_url else ''}
-<a href="/gallery">← Back to Gallery</a>
+<a href="/gallery">â† Back to Gallery</a>
 <br><a href="/" class="cta">Create Your Own</a>
 </div>
 </div>
@@ -4297,7 +6078,7 @@ async def saasshorts_generate(
             except Exception:
                 pass
         else:
-            # Sanitize against traversal — the client controls selected_actor_url.
+            # Sanitize against traversal â€” the client controls selected_actor_url.
             src = _safe_under(OUTPUT_DIR, req.selected_actor_url.replace("/videos/", "").lstrip("/"))
             if src and os.path.exists(src):
                 selected_actor_path = src
@@ -4338,7 +6119,7 @@ async def saasshorts_generate(
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
 
-                # Upload to public gallery — opt-in only: the metadata carries
+                # Upload to public gallery â€” opt-in only: the metadata carries
                 # the user's product name, URL and full script.
                 if req.share_to_gallery:
                     try:
@@ -4366,12 +6147,12 @@ async def saasshorts_generate(
                         )
                         if gallery_result:
                             saas_jobs[job_id]["result"]["gallery_video_id"] = gallery_result["video_id"]
-                            log_msg("📤 Uploaded to public gallery.")
+                            log_msg("ðŸ“¤ Uploaded to public gallery.")
                     except Exception as gallery_err:
-                        log_msg(f"⚠️ Gallery upload skipped: {gallery_err}")
+                        log_msg(f"âš ï¸ Gallery upload skipped: {gallery_err}")
 
         except Exception as e:
-            print(f"[SaaSShorts] ❌ Job {job_id} failed: {e}")
+            print(f"[SaaSShorts] âŒ Job {job_id} failed: {e}")
             if job_id in saas_jobs:
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
@@ -4422,3 +6203,110 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+@app.get("/api/steam/search")
+async def steam_search(request: Request, q: str):
+    from cloud.steam import search_games
+
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
+
+    try:
+        results = await search_games(q.strip())
+        return {"results": [result.dict() for result in results]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Steam search failed: {str(e)}")
+
+
+@app.get("/api/steam/games/{app_id}")
+async def steam_game_details(request: Request, app_id: int):
+    from cloud.steam import get_game_metadata
+
+    if app_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid Steam App ID")
+
+    try:
+        metadata = await get_game_metadata(app_id)
+        return metadata.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve Steam game details: {str(e)}")
+
+@app.get("/api/openai/models")
+async def list_openai_models(request: Request, base_url: str = ""):
+    """Proxy to list models from an OpenAI-compatible base_url (e.g. LM Studio). Query ?base_url=... ; forwards Authorization if X-OpenAI-Key present."""
+    import httpx
+    base = (base_url or request.query_params.get("base_url") or "").strip()
+    if not base:
+        base = request.headers.get("X-OpenAI-Base-Url") or request.headers.get("X-OpenAI-Base-URL") or __import__("os").environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    base = base.rstrip("/")
+    # Build headers
+    headers = {}
+    # Prefer X-OpenAI-Key header, then Authorization, then env
+    key = request.headers.get("X-OpenAI-Key") or request.headers.get("Authorization", "").replace("Bearer ", "") or __import__("os").environ.get("OPENAI_API_KEY") or ""
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    url = f"{base}/models"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, headers=headers)
+            # Forward JSON even on non-200 for debugging, but raise on 404 etc.
+            text = r.text
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": text}
+            return JSONResponse(content=data, status_code=r.status_code)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch {url}: {str(e)[:300]}")
+
+
+@app.post("/api/game-profiles/analyze")
+async def analyze_game_profile(request: Request):
+    """AI-analyze Steam metadata into game_type, characteristics, key moments and recommended weights.
+
+    Body: {game_title, steam_description?, steam_genres?, steam_tags?, provider?}
+    Header X-AI-Provider (gemini|openai) wins over body/provider/env. For OpenAI, headers
+    X-OpenAI-Key / X-OpenAI-Model / X-OpenAI-Base-Url override env; key may be empty for local servers.
+    Returns {ai_analysis, recommended_weights, source}.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    game_title = (body.get("game_title") or "").strip()
+    if not game_title:
+        raise HTTPException(status_code=400, detail="game_title is required")
+    steam_description = body.get("steam_description") or ""
+    steam_genres = body.get("steam_genres") or []
+    steam_tags = body.get("steam_tags") or []
+    if isinstance(steam_genres, str):
+        steam_genres = [steam_genres]
+    if isinstance(steam_tags, str):
+        steam_tags = [steam_tags]
+    # Resolve provider: header X-AI-Provider wins over body.provider over env AI_PROVIDER
+    header_provider = (request.headers.get("X-AI-Provider") or "").lower().strip()
+    body_provider = (body.get("provider") or "").lower().strip()
+    from cloud.game_analyzer import analyze_game
+    loop = asyncio.get_event_loop()
+    # Determine provider first to decide which key to require
+    env_provider = (__import__("os").environ.get("AI_PROVIDER") or "gemini").lower().strip()
+    provider = header_provider if header_provider in ("gemini", "openai") else (body_provider if body_provider in ("gemini", "openai") else env_provider)
+    if provider not in ("gemini", "openai"):
+        provider = "gemini"
+    if provider == "openai":
+        openai_key, openai_model, openai_base = resolve_openai(request)
+        # Body may also carry openai overrides (settings UI); headers already did, but allow body as fallback
+        openai_model = body.get("openai_model") or openai_model
+        openai_base = body.get("openai_base_url") or openai_base
+        openai_key = body.get("openai_key") if body.get("openai_key") is not None else openai_key
+        # api_key param for backward compat: pass gemini key as first arg but analyzer will use openai_* when provider=openai
+        _gr = await resolve_gemini(request)
+        gemini_key = _gr[0] if isinstance(_gr, tuple) else _gr
+        result = await loop.run_in_executor(None, lambda: analyze_game(gemini_key, game_title, steam_description, steam_genres, steam_tags, provider="openai", openai_key=openai_key, openai_model=openai_model, openai_base_url=openai_base))
+        return result
+    else:
+        _gr2 = await resolve_gemini(request)
+        api_key = _gr2[0] if isinstance(_gr2, tuple) else _gr2
+        result = await loop.run_in_executor(None, analyze_game, api_key, game_title, steam_description, steam_genres, steam_tags)
+        return result

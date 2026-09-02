@@ -39,11 +39,34 @@ class DetailClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    # Phase 5 — narrative structure (optional, preserved for payoff optimization)
+    hook_timestamp: Optional[float] = None
+    setup_start: Optional[float] = None
+    escalation_start: Optional[float] = None
+    peak_timestamp: Optional[float] = None
+    payoff_timestamp: Optional[float] = None
+    story_coherence: Optional[str] = None
+    context_requirement: Optional[str] = None
+    emotional_tags: Optional[List[str]] = None
 
 
 class DetailResponse(BaseModel):
     shorts: List[DetailClipModel]
 
+class DeepMomentModel(BaseModel):
+    start: float
+    end: float
+    category: str
+    score: int
+    reason: str | None = None
+    viral_title: str | None = None
+    viral_description: str | None = None
+    viral_hook: str | None = None
+
+class DeepResponse(BaseModel):
+    moments: List[DeepMomentModel]
+    vod_title: str | None = None
+    vod_description: str | None = None
 
 # Visual (no-transcript) clip selection: Gemini watches a silent video and
 # picks moments from the imagery. Same output shape as DetailClipModel minus
@@ -216,11 +239,24 @@ Rules:
   novelty, big numbers, or a clear payoff.
 - Ignore weak filler, housekeeping, outros, rambling transitions, and
   low-signal padding unless there is an obvious hook or payoff.
+- SCORE CALIBRATION: most clips do NOT go viral — the vast majority of
+  gameplay is average. Spread your scores across the full 0-100 scale
+  (routine filler belongs in the 10-40 range, solid moments 40-70) and
+  reserve 75+ for genuinely exceptional, stop-the-scroll moments.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
-WINDOWS_JSON:
+GAME_PROFILE_CONTEXT:
+{game_profile_json}
+CHEAP_EVENTS_TIMELINE (multimodal signals — silence → jumpscare → scream must still be scored even when transcript is empty):
+{cheap_timeline}
+WINDOWS_JSON (each window may contain [CHEAP EVENTS ...] pseudo-text):
 {windows_json}
+
+Scoring hints:
+- Cheap timeline shows non-speech peaks (scream, sudden_loudness, scene_change, visual_activity). Prefer windows where transcript + cheap evidence coincide.
+- Game profile context (8 weights + custom notes + steam description + game type + gameplay characteristics + key moments) shows what matters for this game. Use ALL fields: custom notes are your direct instructions, steam description gives lore, key moments list exact viral events to hunt for, characteristics explain loop. Example: horror → tension/fear + key_moments 'jump scare' → up-score scream windows; co-op → social_interaction + humor → up-score banter. Do not ignore custom notes.
+- Still apply THE 2-SECOND TEST: would the first 2 seconds force a cold viewer to keep watching?
 
 Return only:
 {{
@@ -239,6 +275,12 @@ Return only:
 DETAIL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor and viral copywriter.
 Choose the BEST short clips from these shortlisted candidate windows.
+
+GAME_PROFILE_FOR_CLIP_COPY (English context — DO NOT copy its language, output must follow TRANSCRIPT_LANGUAGE):
+{game_profile_json}
+— Contains: game_title, game_type, steam_description (official), custom_notes (your instructions), gameplay_characteristics, key_moments, and 8 weights. Use custom_notes + key_moments to tailor clip choice and copy to this specific game. Steam description is lore, not copy.
+
+OUTPUT LANGUAGE: {language} — ALL user-facing copy below MUST be in this language (see LANGUAGE OVERRIDE).
 
 CLIP RULES:
 - Return only valid JSON.
@@ -266,6 +308,12 @@ CLIP RULES:
   story, or land the same joke — even across different windows. Pick the
   stronger one and drop the other. Two clips on the same broad topic are fine
   as long as each lands its own moment.
+- SCENE-CUT ALIGNMENT: each candidate window lists its `scene_boundaries`
+  (timestamps of real visual cuts). When the timing allows, start or end a
+  clip ON or just after one of these cuts — clips that open on a fresh
+  camera angle feel professionally edited, mid-pan starts feel amateur.
+  Content need always wins over a nearby cut, but when two possible start
+  points are equally good, take the one on a cut.
 
 HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 10 words):
 - Open question: "Why does everyone get this wrong?"
@@ -275,10 +323,26 @@ HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 
 - POV / pattern interrupt: "POV: you finally understand it."
 (These are English PATTERNS — always write the actual hook in TRANSCRIPT_LANGUAGE.)
 
+LANGUAGE OVERRIDE — CRITICAL: TRANSCRIPT_LANGUAGE is the ONLY output language. Game Profile text is ENGLISH CONTEXT ONLY, do not copy its language.
+- If TRANSCRIPT_LANGUAGE is 'it', write EVERYTHING in Italian. If 'fr', French. If 'de', German. If 'es', Spanish. If 'en' or unknown, English.
+- You MUST produce video_description_for_tiktok, video_description_for_instagram, video_title_for_youtube_short and viral_hook_text in TRANSCRIPT_LANGUAGE. A VOD spoken in Italian must get Italian titles/descriptions, even when the Game Profile is English.
+- Hashtags: write them in TRANSCRIPT_LANGUAGE too (translate concepts, don't leave English hashtags on an Italian clip).
+
+NARRATIVE STRUCTURE — FOR EACH CLIP IDENTIFY (use timestamps in absolute seconds):
+- hook: what grabs attention in first 2s
+- setup: what context the viewer needs before the peak
+- escalation: where tension/humor/action builds
+- peak: the single most viral moment (laugh, scare, clutch, reveal)
+- payoff: where the reaction/resolution lands
+- story_coherence: does the clip make sense standalone? (standalone / needs_setup / needs_payoff)
+- context_requirement: what prior context would be lost if cut earlier
+- emotional_tags: pick 1-3 from [humor, surprise, fear, excitement, reaction, tension, relief, absurdity]
+Include these as hook_timestamp / setup_start / escalation_start / peak_timestamp / payoff_timestamp (float seconds inside the clip) and story_coherence / context_requirement / emotional_tags in the JSON. If unsure, estimate timestamps — never leave payoff after end.
+
 COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TRANSCRIPT_LANGUAGE ({language}):
-- Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
-  without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
-- `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
+- Descriptions (TikTok + Instagram): 3-5 punchy sentences that tease the payoff
+  without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam. Vary style between platforms.
+- `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims. Do NOT repeat the game title verbatim — focus on the moment/action instead (e.g. use "This escape was insane" not "GRAIN ROT crazy escape"). Use game title at most once, only if natural.
 - `predicted_score`: honest 0-100 estimate of viral potential.
 
 TRANSCRIPT_LANGUAGE: {language}
@@ -294,6 +358,14 @@ Return only:
       "end": <number>,
       "source_window_id": "<window id>",
       "predicted_score": <integer 0-100>,
+      "hook_timestamp": <number or null>,
+      "setup_start": <number or null>,
+      "escalation_start": <number or null>,
+      "peak_timestamp": <number or null>,
+      "payoff_timestamp": <number or null>,
+      "story_coherence": "<standalone|needs_setup|needs_payoff>",
+      "context_requirement": "<short note>",
+      "emotional_tags": ["<tag>"],
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
