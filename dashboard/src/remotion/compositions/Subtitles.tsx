@@ -9,7 +9,15 @@ import {
 } from "remotion";
 import type { SubtitleConfig } from "../lib/types";
 import { groupCaptionsIntoBlocks, getActiveWordIndex } from "../lib/captions";
-import { getFontStack } from "../lib/fonts";
+import { getFontStack, antonFontFace, notoSerifFontFace } from "../lib/fonts";
+
+function isEmojiWord(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  const stripped = t.replace(/\uFE0F|\u200D|[\u{1F3FB}-\u{1F3FF}]/gu, '');
+  const withoutEmoji = stripped.replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764]/gu, '').trim();
+  return withoutEmoji.length === 0 && /[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764]/u.test(stripped);
+}
 
 interface SubtitlesProps {
   config: SubtitleConfig;
@@ -21,12 +29,33 @@ const POSITION_MAP: Record<string, React.CSSProperties> = {
   bottom: { bottom: "10%", top: "auto" },
 };
 
+/** Dynamic vertical from style.marginV (0-100): 0→12% top, 50→45% top, 100→bottom 10%. Falls back to discrete POSITION_MAP for legacy. */
+function getPositionStyle(
+  style: SubtitleConfig["style"],
+  position: SubtitleConfig["position"]
+): React.CSSProperties {
+  const mv = (style as unknown as { marginV?: number }).marginV;
+  if (typeof mv === "number" && !Number.isNaN(mv)) {
+    const clamped = Math.max(0, Math.min(100, mv));
+    if (clamped >= 98) return { bottom: "10%", top: "auto" };
+    let topPct: number;
+    if (clamped <= 50) topPct = 12 + (clamped / 50) * 33;
+    else topPct = 45 + ((clamped - 50) / 50) * 45;
+    return { top: `${topPct}%`, bottom: "auto" };
+  }
+  return POSITION_MAP[position] ?? POSITION_MAP.bottom;
+}
+
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
   const { fps } = useVideoConfig();
-  const blocks = groupCaptionsIntoBlocks(config.captions);
+  const maxChars = (config as any).maxChars ?? 20;
+  const maxDuration = (config as any).maxDuration ?? 2000;
+  const blocks = groupCaptionsIntoBlocks(config.captions, maxChars, maxDuration);
 
   return (
     <AbsoluteFill>
+      <style>{antonFontFace}</style>
+      <style>{notoSerifFontFace}</style>
       {blocks.map((block, i) => {
         const startFrame = Math.round((block.startMs / 1000) * fps);
         const durationFrames = Math.max(
@@ -72,7 +101,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
   const currentTimeMs = blockStartMs + (frame / fps) * 1000;
   const activeIndex = getActiveWordIndex(block.words, currentTimeMs);
 
-  const positionStyle = POSITION_MAP[position] ?? POSITION_MAP.bottom;
+  const positionStyle = getPositionStyle(style, position);
   const fontStack = getFontStack(style.fontFamily);
 
   // Background box style
@@ -103,8 +132,10 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
           display: "flex",
           flexWrap: "wrap",
           justifyContent: "center",
-          gap: "6px 8px",
-          maxWidth: "85%",
+          alignItems: "center",
+          lineHeight: (style as unknown as { lineHeight?: number }).lineHeight ?? 1.0,
+          gap: `${(style as unknown as { wordGap?: number }).wordGap ?? 8}px`,
+          maxWidth: "95%",
           ...bgStyle,
         }}
       >
@@ -154,22 +185,11 @@ const WordSpan: React.FC<WordSpanProps> = ({
     ((wordStartMs - blockStartMs) / 1000) * fps
   );
 
+  const displayWord = (style as any).uppercase ? word.toUpperCase() : word;
+
   let transform = "";
   let color = style.fontColor;
   let extraStyle: React.CSSProperties = {};
-
-  // Dim inactive words toward the backend's opaque scaled color (matches the
-  // burned ASS look; not CSS opacity).
-  if (!isActive && style.baseOpacity != null && style.baseOpacity < 1) {
-    const m = /^#?([0-9a-fA-F]{6})$/.exec(style.fontColor || "#FFFFFF");
-    if (m) {
-      const scale = 0.35 + 0.65 * style.baseOpacity;
-      const [r, g, b] = [0, 2, 4].map((i) =>
-        Math.round(parseInt(m[1].slice(i, i + 2), 16) * scale)
-      );
-      color = `rgb(${r}, ${g}, ${b})`;
-    }
-  }
 
   if (isActive) {
     color = style.highlightColor;
@@ -217,11 +237,36 @@ const WordSpan: React.FC<WordSpanProps> = ({
         ].join(", ")
       : "none";
 
+  // Animated emoji: render via Remotion's AnimatedEmoji (Google animated, Android color) when the word is an emoji.
+  // Emoji are intentionally larger than text (1.8×) so they pop, and text keeps its exact fontSize
+  // — previously text appeared smaller when emoji were present because the flex wrap with
+  // emoji spans compressed the line. Now emoji are 1.8× and vertically centered.
+  if (isEmojiWord(word)) {
+    const baseSize = Math.round(style.fontSize * 0.6 * 1920 / 288);
+    const size = Math.round(baseSize * 1.5);
+    return (
+      <span
+        style={{
+          fontFamily: '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif',
+          fontSize: size,
+          lineHeight: (style as unknown as { lineHeight?: number }).lineHeight ?? 1.0,
+          display: "inline-block",
+          transform,
+          verticalAlign: "middle",
+          margin: "-2px 1px",
+          ...extraStyle,
+        }}
+      >
+        {displayWord}
+      </span>
+    );
+  }
+
   return (
     <span
       style={{
         fontFamily: fontStack,
-        fontSize: style.fontSize,
+        fontSize: Math.round(style.fontSize * 0.6 * 1920 / 288),
         fontWeight: 700,
         color: animation === "karaoke" && isActive ? undefined : color,
         textShadow:
@@ -231,11 +276,12 @@ const WordSpan: React.FC<WordSpanProps> = ({
         transform,
         display: "inline-block",
         transition: "none",
-        textTransform: style.uppercase ? "uppercase" : "none",
+        letterSpacing: `${(style as unknown as { letterSpacing?: number }).letterSpacing ?? 0}px`,
+        lineHeight: (style as unknown as { lineHeight?: number }).lineHeight ?? 1.0,
         ...extraStyle,
       }}
     >
-      {word}
+      {displayWord}
     </span>
   );
 };

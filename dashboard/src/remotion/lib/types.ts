@@ -24,10 +24,19 @@ export interface SubtitleStyle {
   // Karaoke look: dim inactive words (0-1) and force uppercase.
   baseOpacity?: number;
   uppercase?: boolean;
+  /** Vertical position 0-100: 0=top (~12% top), 50=middle (~45% top), 100=bottom (bottom 10%). Defaults to 43 for backwards-compat. */
+  marginV?: number;
+  /** Gap between words in px (4-16). Default 8. */
+  wordGap?: number;
+  /** Line height multiplier (0.9-1.4). Default 1.0. */
+  lineHeight?: number;
+  /** Letter spacing in px (-1 to 4). Default 0. */
+  letterSpacing?: number;
 }
 
 export interface SubtitleConfig {
   captions: CaptionWord[];
+  /** @deprecated use style.marginV (0-100) instead; kept for backwards-compat */
   position: SubtitlePosition;
   style: SubtitleStyle;
 }
@@ -90,6 +99,12 @@ export const subtitleStyleSchema = z.object({
   bgColor: z.string(),
   bgOpacity: z.number().min(0).max(1),
   animation: z.enum(["none", "word-highlight", "pop", "karaoke"]),
+  baseOpacity: z.number().min(0).max(1).optional(),
+  uppercase: z.boolean().optional(),
+  marginV: z.number().min(0).max(100).optional(),
+  wordGap: z.number().min(0).max(100).optional(),
+  lineHeight: z.number().min(0.5).max(3).optional(),
+  letterSpacing: z.number().min(-2).max(20).optional(),
 });
 
 export const subtitleConfigSchema = z.object({

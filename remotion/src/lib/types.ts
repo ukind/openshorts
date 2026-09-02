@@ -1,5 +1,3 @@
-import { z } from "zod";
-
 // --- Word-level caption ---
 export interface CaptionWord {
   text: string;
@@ -21,10 +19,22 @@ export interface SubtitleStyle {
   bgColor: string;
   bgOpacity: number;
   animation: SubtitleAnimation;
+  // Karaoke look (kept optional for compat with dashboard)
+  baseOpacity?: number;
+  uppercase?: boolean;
+  /** Vertical position 0-100: 0=top (~12% top), 50=middle (~45% top), 100=bottom (bottom 10%). */
+  marginV?: number;
+  /** Gap between words in px (4-16). Default 8. */
+  wordGap?: number;
+  /** Line height multiplier (0.9-1.4). Default 1.0. */
+  lineHeight?: number;
+  /** Letter spacing in px (-1 to 4). Default 0. */
+  letterSpacing?: number;
 }
 
 export interface SubtitleConfig {
   captions: CaptionWord[];
+  /** @deprecated use style.marginV (0-100) instead; kept for backwards-compat */
   position: SubtitlePosition;
   style: SubtitleStyle;
 }
@@ -78,62 +88,3 @@ export interface ShortVideoProps {
   hook: HookConfig | null;
   effects: EffectsConfig | null;
 }
-
-// --- Zod schemas for validation (used by render service) ---
-export const captionWordSchema = z.object({
-  text: z.string(),
-  startMs: z.number(),
-  endMs: z.number(),
-});
-
-export const subtitleStyleSchema = z.object({
-  fontFamily: z.string(),
-  fontSize: z.number(),
-  fontColor: z.string(),
-  highlightColor: z.string(),
-  borderColor: z.string(),
-  borderWidth: z.number(),
-  bgColor: z.string(),
-  bgOpacity: z.number().min(0).max(1),
-  animation: z.enum(["none", "word-highlight", "pop", "karaoke"]),
-});
-
-export const subtitleConfigSchema = z.object({
-  captions: z.array(captionWordSchema),
-  position: z.enum(["top", "middle", "bottom"]),
-  style: subtitleStyleSchema,
-});
-
-export const hookConfigSchema = z.object({
-  text: z.string(),
-  position: z.enum(["top", "center", "bottom"]),
-  size: z.enum(["S", "M", "L"]),
-  entranceAnimation: z.enum(["spring", "fade", "slide-up", "none"]),
-  displayDurationSec: z.number().positive(),
-});
-
-export const effectSegmentSchema = z.object({
-  startSec: z.number().min(0),
-  endSec: z.number().positive(),
-  zoom: z.number().min(0.5).max(3),
-  zoomCenterX: z.number().min(0).max(1),
-  zoomCenterY: z.number().min(0).max(1),
-  brightness: z.number().min(0).max(3),
-  contrast: z.number().min(0).max(3),
-  saturate: z.number().min(0).max(3),
-});
-
-export const effectsConfigSchema = z.object({
-  segments: z.array(effectSegmentSchema),
-});
-
-export const shortVideoPropsSchema = z.object({
-  videoUrl: z.string(),
-  durationInFrames: z.number().int().positive(),
-  fps: z.number().positive(),
-  width: z.number().int().positive(),
-  height: z.number().int().positive(),
-  subtitles: subtitleConfigSchema.nullable(),
-  hook: hookConfigSchema.nullable(),
-  effects: effectsConfigSchema.nullable(),
-});
