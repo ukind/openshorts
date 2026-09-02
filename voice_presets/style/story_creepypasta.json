@@ -1,0 +1,8 @@
+{
+  "id": "story_creepypasta",
+  "title": "Creepypasta",
+  "kind": "story",
+  "prompt": "Generate horror-style tension narrative.\nExamples: \"Something felt wrong.\", \"The game knew what was about to happen.\", \"And then... it did.\"\nWrite 2-3 sentences per caption. Build tension, ominous tone, slow reveals. Fewer captions (2-4 max). Use ellipses for suspense.",
+  "created_at": "2026-08-30T18:53:27.071747",
+  "updated_at": "2026-08-30T19:10:50.185528"
+}

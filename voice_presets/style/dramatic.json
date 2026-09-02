@@ -1,0 +1,8 @@
+{
+  "id": "dramatic",
+  "title": "Dramatic",
+  "kind": "generic",
+  "prompt": "Generate dramatic, cinematic captions.\nExamples: \"The final stand.\", \"Everything changed.\", \"No turning back now.\"\nKeep captions short and impactful. Use lowercase for tension, CAPS for climax.",
+  "created_at": "2026-08-30T18:53:27.067270",
+  "updated_at": "2026-08-30T18:53:27.067270"
+}

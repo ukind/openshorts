@@ -1,0 +1,8 @@
+{
+  "id": "funny",
+  "title": "Funny",
+  "kind": "generic",
+  "prompt": "Generate humorous, meme-style captions.\nExamples: \"skill issue tbh\", \"when the plan works (it never does)\", \"*chuckles* I'm in danger\"\nBe self-aware and slightly chaotic. Gen-Z humor welcome.",
+  "created_at": "2026-08-30T18:53:27.068006",
+  "updated_at": "2026-08-30T18:53:27.068006"
+}

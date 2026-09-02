@@ -1,0 +1,11 @@
+{
+  "id": "dramatic",
+  "title": "Dramatic Cinematic",
+  "prompt": "gender: Male.\npitch: Deep, resonant bass with powerful projection.\nspeed: Slow, deliberate pacing with strategic pauses for impact.\nvolume: Loud, commanding presence filling the space.\nage: Mature adult, 40s to 50s.\nclarity: Perfect diction, every word pronounced with gravitas.\nfluency: Flawless delivery with cinematic timing.\naccent: American English, neutral broadcast quality.\ntexture: Rich, velvety depth with cinematic warmth.\nemotion: Inspiring, epic, grandiose.\ntone: Heroic, momentous, like narrating legends.\npersonality: Authoritative, wise, larger-than-life presence.",
+  "kind": "generic",
+  "tags": [
+    "dramatic"
+  ],
+  "created_at": "2026-08-30T18:53:27.074730",
+  "updated_at": "2026-08-30T18:53:27.074730"
+}
