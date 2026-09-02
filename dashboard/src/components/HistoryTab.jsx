@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Loader2, Download, Film, FolderOpen } from 'lucide-react';
+import { Loader2, Download, Film, FolderOpen, Mic } from 'lucide-react';
 import { apiJson } from '../lib/api';
 
 // The signed-in user's saved video library (stored in R2). Private, signed links.
@@ -59,7 +59,7 @@ export default function HistoryTab({ onReopenProject }) {
       <p className="eyebrow mb-1.5">06 · HISTORY</p>
       <h1 className="font-display lowercase text-2xl text-ink mb-2">Your library</h1>
       <p className="text-muted text-sm mb-8 lowercase">
-        All the shorts you've generated, saved while your plan is active. Kept for 7 days after your plan ends. Reopen a project to keep editing its clips.
+        The shorts you've generated, grouped by project. Reopen a project to keep editing its clips.
       </p>
 
       {error && <p className="text-danger text-sm">{error}</p>}
@@ -82,8 +82,11 @@ export default function HistoryTab({ onReopenProject }) {
                   <p className="text-sm text-ink font-medium truncate" title={project?.title || vids[0]?.title}>
                     {project?.title || vids[0]?.title || 'Project'}
                   </p>
-                  <p className="readout mt-0.5">
+                  <p className="readout mt-0.5 flex items-center gap-2">
                     {fmtDate(vids[0]?.created_at)} · {vids.length} clip{vids.length === 1 ? '' : 's'}
+                    {project?.voiceover && (
+                      <span className="text-brass flex items-center gap-1"><Mic size={11} /> voiceover</span>
+                    )}
                   </p>
                 </div>
                 {project && onReopenProject && (
@@ -91,11 +94,13 @@ export default function HistoryTab({ onReopenProject }) {
                     onClick={() => handleReopen(jobId)}
                     disabled={!!reopening}
                     className="btn-ghost px-3 py-2 text-xs shrink-0"
-                    title="Restore this project in the Clip Generator to keep editing subtitles, hooks, effects and dubbing"
+                    title={project.voiceover
+                      ? 'Reopen this voiceover in the VoiceOver page to edit its subtitles'
+                      : 'Restore this project in the Clip Generator to keep editing subtitles, hooks, effects and dubbing'}
                   >
                     {reopening === jobId
                       ? <><Loader2 size={14} className="animate-spin" /> reopening…</>
-                      : <><FolderOpen size={14} /> reopen project</>}
+                      : <><FolderOpen size={14} /> {project.voiceover ? 'reopen voiceover' : 'reopen project'}</>}
                   </button>
                 )}
               </div>

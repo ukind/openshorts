@@ -19,7 +19,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
     const [showAdvanced, setShowAdvanced] = useState(false);
-    const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
     const infoRef = useRef(null);
@@ -65,7 +64,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
         e.preventDefault();
         if (!acknowledged) return;
         const advanced = {
-            targetClips: targetClips || null,
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
         };
@@ -230,22 +228,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds) && (
+                        {(clipMinSeconds || clipMaxSeconds) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
                     {showAdvanced && (
-                        <div className="mt-3 grid grid-cols-3 gap-2 animate-fade">
-                            <div>
-                                <p className="eyebrow mb-1.5">clips to aim for</p>
-                                <input
-                                    type="number" min="1" max="15" step="1"
-                                    value={targetClips}
-                                    onChange={(e) => setTargetClips(e.target.value)}
-                                    placeholder="auto"
-                                    className="input-field"
-                                />
-                            </div>
+                        <div className="mt-3 grid grid-cols-2 gap-2 animate-fade">
                             <div>
                                 <p className="eyebrow mb-1.5">min length (s)</p>
                                 <input
@@ -266,9 +254,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     className="input-field"
                                 />
                             </div>
-                            <p className="col-span-3 text-[11px] leading-relaxed text-muted">
+                            <p className="col-span-2 text-[11px] leading-relaxed text-muted">
                                 Targets, not guarantees: the AI returns fewer clips when the
-                                material doesn't hold them. Leave blank to let it decide.
+                                material doesn't hold them. Leave blank to let it decide. Clip
+                                count is set by the number-of-clips slider above.
                             </p>
                         </div>
                     )}
