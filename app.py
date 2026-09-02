@@ -2317,7 +2317,10 @@ async def process_endpoint(
             request.headers.get("X-OpenAI-Base-URL") is None and body.get("openai_base_url")):
             openai_base = str(body["openai_base_url"]).strip()
 
-    if provider == "gemini" and not gemini_key:
+    # Self-host with an OpenAI-compatible server configured (LLM_BASE_URL)
+    # needs no Google key for the core pipeline: the moment picker runs there
+    # (main.py llm_backend). Frame-based stages degrade on their own.
+    if provider == "gemini" and not gemini_key and not (llm_backend.active() and not BILLING_ENABLED):
         raise gemini_missing_error()
 
     # Normalize output format (auto = keep pipeline default).
