@@ -84,7 +84,7 @@ Turn any clip into a narrated short: AI caption suggestions → TTS voiceover �
 - **Caption suggestions with live preview**: the AI proposes caption sets (Gaming, Dramatic, GenZ, Creepypasta…), each one previewed in a real Remotion player beside the options — words highlight as the clip plays, exactly like the final burn
 - **Two TTS providers**: local **Qwen3-TTS VoiceDesign** (free, runs on your GPU, 12-dimension voice personas) or **ElevenLabs** — selectable per job
 - **Voice & Style Presets manager**: 10 seeded voice personas and 10 caption style prompts, fully editable. Voice presets are tagged with caption styles (a "Gaming Hype" voice carries the `gaming` tag); picking a style reorders matching voices to the top of the dropdown and auto-selects the first one
-- **Emoji-aware captions**: the LLM sprinkles emojis into captions, timed to hold 1–2 s on screen so their animation plays; display text keeps emojis while the spoken audio stays clean
+- **Emoji-aware captions**: the LLM sprinkles emojis into captions, timed to hold 1–2 s on screen; display text keeps emojis while the spoken audio stays clean. Emoji words burn through Remotion's **AnimatedEmoji** set (Google/Android animation), and every later re-style of the clip (subtitle editor, hook, recut) re-burns through the same path so the animation survives chaining
 - **Non-English TTS done right**: Italian (and any language) gets slang expansion (`nn` → *non*, `1v1` → *uno contro uno*), number-to-words conversion, and article-elision splitting so the voice says *"l' ho fatto"* correctly — while burned captions keep the natural written form
 - **Auto ducking**: background audio is sidechain-compressed under the narration and the mix is extended if the voiceover runs long
 - **Session persistence**: switch tabs or refresh mid-generation and the workflow keeps its state; projects reopen from History with captions restored
@@ -92,9 +92,10 @@ Turn any clip into a narrated short: AI caption suggestions → TTS voiceover �
 ### 5. Game Profiles — tune viral scoring per game
 ![Game Profiles](screenshots/game-profiles.png)
 
-- Pick a game; the AI researches it (Steam metadata, genre, typical moments) and builds a profile with **custom scoring weights**
-- Optional **custom notes** get prompt priority: *"prefer clutch saves"* or *"find the funny fails"* steer clip selection explicitly
-- The profile injects into every selection pass (cheap signals, scoring, deep scan), and a **semantic vision pass** cross-checks each candidate window's frames against the profile (screams, HUD damage numbers, kills) to adjust scores
+- **Steam auto-import**: type the game name, pick the match from live Steam search — the profile pulls the official description, genres and tags automatically (or fill everything by hand)
+- **AI analysis on demand**: one click runs an LLM analysis over the Steam data to produce game type, gameplay characteristics and the **key moments that matter for virality** (clutches, fails, jumpscares…), suggested weights are copied onto the profile with one click
+- **Custom prompt / notes**: your own instructions get prompt priority in every selection pass — *"prefer clutch saves"* or *"find the funny fails"* steer clip selection explicitly
+- **Where it applies**: cheap-signal seeding, transcript scoring, the deep full-VOD scan and the semantic vision pass all receive the profile context, so a horror game is judged on scares and a fighter on combos
 - Profiles are stored, editable, importable/exportable
 
 ### 6. Subtitle editor — style every word, preview live
@@ -122,11 +123,14 @@ Open on any generated clip for a full caption studio rather than a font picker:
 ### Clip Generator
 ![Candidate detection toggles](screenshots/clip-detection-toggles.png)
 
-- **Viral Moment Detection**: Google Gemini 3.1 Flash-Lite analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
+- **Per-job provider selector**: run the analysis with Gemini or OpenAI (any OpenAI-compatible endpoint) straight from the dashboard — keys and models come from Settings and ride on the job, no server env needed
+- **Independent deep-analysis selector**: the deep full-VOD scan can use a *different* provider/model than the main job (e.g. cheap flash for scoring, a stronger model for the deep watch), with a "same as job" default
+- **Viral Moment Detection**: the LLM analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
 - **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
 - **Multimodal candidate detection** (all toggleable per job): the transcript is always analyzed, plus optional cheap signals that catch moments nobody is narrating — PySceneDetect scene cuts, audio spikes/screams, visual motion — each seeding extra candidate windows so a silent jumpscare followed by a scream still becomes a clip
 - **Vision pass**: each shortlisted window gets 6 frames (3 uniform + 3 peak-biased around screams/loudness) analyzed against the Game Profile, adjusting scores on visual evidence
-- **Deep full-VOD scan**: for long videos, 12-16 frames across the *whole* VOD (or a low-res native-video proxy for Gemini) surface the best moments before cheap scoring ranks around them — the strongest clips always get a slot
+- **Deep full-VOD scan**: for long videos, 12-16 frames across the *whole* VOD (or a low-res native-video proxy for Gemini) surface the best moments before cheap scoring ranks around them — the strongest clips always get a slot. Game-profile aware when a profile is selected. Because deep candidates fill the target slots first, enabling deep **auto-disables the per-window vision pass** (explicit header override can force both)
+- **VOD title & description for Twitch**: after clip selection, a dedicated LLM pass writes a Twitch-ready VOD title plus a description with timestamped highlights (~10 moments ranked by viral potential, absolute seconds converted to `MM:SS`), surfaced in the dashboard with copy buttons — independent of whether deep ran
 - **Robust LLM output handling**: tolerant JSON parsing with repair, per-clip validation with duration swap-repair, snap-to-word-boundary cuts, and IoU-based overlap dedup so two windows finding the same moment never render twice
 - **Parallel transcript enhancement**: an optional LLM polish pass fixes Whisper mishears (homophones, game jargon) in concurrent chunks while preserving word timings; emojis are added conservatively and timed 1-2 s so their animation plays
 - **Smart 9:16 Cropping**: AI reframing per scene — TRACK mode (MediaPipe + YOLOv8 face tracking), GENERAL mode (blurred background), SPLIT mode (two speakers stacked, captions on the seam) and SCREENCAST mode (screen over presenter); the layout is picked per video by Gemini or forced from the dashboard
@@ -143,19 +147,20 @@ flowchart TD
     B --> C{Silent video?}
     C -- yes --> V[Gemini watches the full video\nvisual clip picking]
     C -- no --> E[Optional LLM polish pass\nfix mishears + emojis]
-    E --> D{Deep full-VOD scan?}
-    D -- on --> F[Gemini: 12-16 frames or native\nlow-res proxy over whole VOD\ntop moments as priority candidates]
+    E --> D{Deep full-VOD scan?\nprovider/model selectable independently}
+    D -- on --> F[Gemini: 12-16 frames or native\nlow-res proxy over whole VOD\ntop moments as priority candidates\n+ game profile context]
     D -- off --> G
     F --> G[Cheap signals\nscene cuts · audio spikes · visual motion]
     G --> H[Transcript windows\n+ cheap-seeded + deep candidates]
     H --> I[Pass 1 — score every window\nbatched LLM calls]
-    I --> J{Vision pass on?\n+ Game Profile}
+    I --> J{Vision pass on?\nskipped automatically when deep is on\n+ Game Profile}
     J -- yes --> K[6 frames per window\nsemantic score adjustment]
     J -- no --> L
     K --> L[Shortlist best windows]
     L --> M[Pass 2 — detail extraction\nsurrounding transcript + word timestamps\n+ scene-cut hints per window]
     M --> N[Validate · snap to words\ndedup overlapping picks]
     N --> O[Render clips\nreframe · captions · hooks]
+    N --> P[VOD title + description\nTwitch-ready with MM:SS timestamps]
     V --> O
 ```
 
@@ -399,13 +404,14 @@ know:
 
 ### Clip Generator
 1. **Ingest** — Local video upload (or self-hosted URL ingest via yt-dlp)
-2. **Transcribe** — faster-whisper with word-level timestamps
-3. **Detect** — PySceneDetect for scene boundaries
-4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each)
-5. **Extract** — FFmpeg precise clip cutting
-6. **Reframe** — AI vertical cropping with subject tracking
-7. **Effects** — Subtitles, hooks, AI video effects
-8. **Publish** — S3 backup + Upload-Post social distribution
+2. **Transcribe** — faster-whisper with word-level timestamps, optional LLM polish pass
+3. **Candidates** — transcript windows + cheap signals (scene cuts, audio events, visual motion) + optional deep full-VOD scan
+4. **Score & detail** — two LLM passes (provider selectable: Gemini or OpenAI): batch scoring, then detailed extraction on the shortlist with validation, word-snapping and overlap dedup
+5. **VOD metadata** — Twitch-ready title + description with MM:SS highlight timestamps
+6. **Extract** — FFmpeg precise clip cutting
+7. **Reframe** — AI vertical cropping with subject tracking
+8. **Effects** — Subtitles, hooks, AI video effects
+9. **Publish** — S3 backup + Upload-Post social distribution
 
 ### AI Shorts
 1. **Analyze** — Website scraping + Gemini web research (or manual description)
@@ -424,7 +430,7 @@ know:
 3. **Speak** — per-caption TTS (Qwen3-TTS VoiceDesign locally or ElevenLabs); Italian and other languages get slang/number/elision preprocessing on the speak side only
 4. **Time** — word-level captions are matched 1:1 to the spoken audio; emojis get guaranteed 1-2 s windows so their animation plays
 5. **Mix** — narration ducked over the original audio (sidechain compression, timeline extension if the voice runs long)
-6. **Burn** — captions burned via Remotion, result saved and openable from History
+6. **Burn** — captions burned via Remotion (animated emoji included), result saved and openable from History; later re-styles from the subtitle editor re-burn through the same path
 
 ```mermaid
 flowchart LR
@@ -549,6 +555,8 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
 | `LLM_API_KEY` | Bearer token for that server, if it checks one |
 | `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
+| `GEMINI_MODEL` / `OPENAI_MODEL` | Fallback models when the dashboard doesn't send one (the Settings/provider selectors win) |
+| `DEEP_AI_PROVIDER` | Fallback deep-analysis provider when the job doesn't specify one (`same` = follow the job's provider; the dashboard's deep selector always wins) |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |
