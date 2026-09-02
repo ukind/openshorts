@@ -188,6 +188,21 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 - **ElevenLabs API Key** ([Free tier](https://elevenlabs.io)) — required for voiceover/dubbing
 - **Upload-Post API Key** ([free tier](https://upload-post.com)) — required for direct social posting
 
+### Local TTS (optional)
+
+The **VoiceOver** workflow can narrate clips with a local Qwen3-TTS model instead of ElevenLabs.
+It's installed automatically in Docker GPU builds (`--build-arg GPU=1`, the default in
+`docker-compose.yml`). The model (~4 GB) downloads lazily on first use into a persistent
+`hf-cache` Docker volume — deliberately not baked into the image, which would bloat builds.
+For a local (non-Docker) dev setup:
+
+```bash
+pip install qwen-tts        # plus SoX on your PATH (apt install sox / brew install sox)
+```
+
+The first voiceover generation downloads the Qwen3-TTS VoiceDesign model (~4 GB) into the
+HuggingFace cache. Without the package, the VoiceOver page simply offers ElevenLabs only.
+
 ---
 
 ## Getting Started
