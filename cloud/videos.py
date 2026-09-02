@@ -4,6 +4,7 @@ purge after the subscription grace period.
 import asyncio
 import glob
 import os
+import re
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Request
@@ -72,6 +73,20 @@ async def archive_job(user_id, job_id, clips, output_dir):
                 except Exception as e:
                     print(f"⚠️  R2 upload failed for {clean_key}: {e}")
 
+        # A captioned hook is a chain (subtitled_<ts>_hooked_<ts>_<clean>):
+        # the hooked_ intermediate must come back too, or a restored project's
+        # caption restyle cannot walk back to the hook-only file and would
+        # silently drop or stack layers.
+        m = re.match(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$', filename)
+        if m:
+            mid_path = os.path.join(output_dir, m.group(1))
+            if os.path.exists(mid_path):
+                mid_key = storage.job_key(user_id, job_id, m.group(1))
+                try:
+                    await asyncio.to_thread(storage.upload_file, mid_path, mid_key)
+                except Exception as e:
+                    print(f"⚠️  R2 upload failed for {mid_key}: {e}")
+
     if not uploaded:
         return
     async with database.session() as s:
@@ -127,6 +142,19 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
         return
     new_key = storage.job_key(user_id, job_id, new_filename)
     await asyncio.to_thread(storage.upload_file, local_path, new_key)
+
+    # Same chain rule as archive_job: a captioned hook needs its hooked_
+    # intermediate archived too, or the restored project cannot re-style.
+    m = re.match(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$', new_filename)
+    if m:
+        mid_path = os.path.join(output_dir, m.group(1))
+        if os.path.exists(mid_path):
+            try:
+                await asyncio.to_thread(
+                    storage.upload_file, mid_path,
+                    storage.job_key(user_id, job_id, m.group(1)))
+            except Exception as e:
+                print(f"⚠️  R2 upload failed for hook intermediate of {job_id}: {e}")
 
     metadata_r2_key = None
     meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
@@ -257,6 +285,12 @@ async def history(request: Request):
             "title": v.title,
             "created_at": v.created_at.isoformat() if v.created_at else None,
             "size_bytes": v.size_bytes,
+            # The basename of the archived object. The preview player compares it
+            # against the clip's current server file: after an edit the local file
+            # is already the new one while the R2 re-archive is still in flight
+            # (_archive_clip_edit_bg is fire-and-forget), and playing the durable
+            # copy then would show the clip from BEFORE the edit.
+            "filename": (v.r2_key or "").rsplit("/", 1)[-1],
             "view_url": storage.presigned_get(v.r2_key, expires=3600),
             "download_url": storage.presigned_get(v.r2_key, expires=3600, download_name=safe_name),
         })
@@ -428,6 +462,8 @@ async def _sweeper_loop():
             await purge_free_expired()
             from .auth import purge_stale_magic_tokens
             await purge_stale_magic_tokens()
+            from .account import purge_stale_deletion_records
+            await purge_stale_deletion_records()
         except asyncio.CancelledError:
             break
         except Exception as e:

@@ -45,6 +45,7 @@ WORKDIR /app
 # fonts libass falls back to DejaVu for every UI option (issue #57).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
@@ -130,4 +131,22 @@ EXPOSE 8000
 # Run FastAPI app. --proxy-headers + --forwarded-allow-ips trust the reverse
 # proxy's X-Forwarded-Proto so generated URLs (e.g. the OAuth redirect_uri) use
 # https in production instead of the internal http scheme.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --timeout-graceful-shutdown bounds how long uvicorn waits for in-flight
+# connections once app.py's drain has handed it the SIGTERM. Without it the
+# default is "forever": an open range download of /api/source kept the old
+# container alive for the whole 900 s stop grace period on 2026-08-25, with
+# its listening socket already closed, so Traefik sent half of all requests
+# to a dead port (alternating 502/200) for 15 minutes.
+# Readiness for the reverse proxy: Traefik (docker provider) only routes to
+# containers whose health is "healthy", so a new instance gets no traffic until
+# it answers and an instance that received SIGTERM (503 from /health/ready)
+# is dropped within interval*retries, while its socket is still open. Coolify's
+# rolling update also waits on this before stopping the old container. The
+# app is up in ~3 s; start-period covers slow disks. curl is installed above
+# for this: when the Coolify health check is enabled it replaces this
+# HEALTHCHECK with its own curl/wget command, and an image without either
+# reports unhealthy forever and every deploy rolls back (2026-08-25).
+HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
+  CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "15"]

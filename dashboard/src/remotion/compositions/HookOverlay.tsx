@@ -20,10 +20,29 @@ const SIZE_SCALE: Record<string, number> = {
   L: 1.3,
 };
 
+// Percentages must match hooks.py's overlay_y math (top 20% / bottom 70%),
+// or the preview drifts from what the server path renders.
 const POSITION_STYLE: Record<string, React.CSSProperties> = {
-  top: { top: "18%", bottom: "auto" },
+  top: { top: "20%", bottom: "auto" },
   center: { top: "50%", bottom: "auto", transform: "translateY(-50%)" },
-  bottom: { top: "68%", bottom: "auto" },
+  bottom: { top: "70%", bottom: "auto" },
+};
+
+// Must mirror hooks.py HOOK_STYLES (the server-side FFmpeg fallback).
+interface HookLook {
+  box: string | null;
+  text: string;
+  outlinePx: number;
+  shadow: boolean;
+}
+
+const HOOK_LOOKS: Record<string, HookLook> = {
+  classic: { box: "rgba(255, 255, 255, 0.94)", text: "#000000", outlinePx: 0, shadow: true },
+  dark: { box: "rgba(18, 18, 20, 0.92)", text: "#FFFFFF", outlinePx: 0, shadow: true },
+  yellow: { box: "rgba(255, 214, 0, 0.96)", text: "#000000", outlinePx: 0, shadow: true },
+  red: { box: "rgba(220, 38, 38, 0.96)", text: "#FFFFFF", outlinePx: 0, shadow: true },
+  outline: { box: null, text: "#FFFFFF", outlinePx: 8, shadow: false },
+  outline_yellow: { box: null, text: "#FFD600", outlinePx: 8, shadow: false },
 };
 
 export const HookOverlay: React.FC<HookOverlayProps> = ({ config }) => {
@@ -98,10 +117,12 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
   }
 
   const positionStyle = POSITION_STYLE[config.position] ?? POSITION_STYLE.top;
+  const look = HOOK_LOOKS[config.style ?? "classic"] ?? HOOK_LOOKS.classic;
 
   // Base font size: 5% of 1080 width (matches hooks.py logic)
   const baseFontSize = 1080 * 0.05;
   const fontSize = Math.round(baseFontSize * scale);
+  const outlinePx = Math.round(look.outlinePx * scale);
 
   return (
     <div
@@ -119,10 +140,10 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
           opacity: animOpacity,
           transform: `scale(${animScale}) translateY(${animTranslateY}px)`,
           maxWidth: "90%",
-          backgroundColor: "rgba(255, 255, 255, 0.94)",
+          backgroundColor: look.box ?? "transparent",
           borderRadius: 20,
-          padding: `${25 * scale}px ${30 * scale}px`,
-          boxShadow: "5px 5px 15px rgba(0, 0, 0, 0.25)",
+          padding: look.box ? `${25 * scale}px ${30 * scale}px` : 0,
+          boxShadow: look.shadow ? "5px 5px 15px rgba(0, 0, 0, 0.25)" : "none",
           textAlign: "center",
         }}
       >
@@ -131,9 +152,15 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
             fontFamily: `'${NOTO_SERIF_FONT_FAMILY}', 'Noto Serif', Georgia, serif`,
             fontSize,
             fontWeight: 700,
-            color: "#000000",
+            color: look.text,
             lineHeight: 1.4,
             wordBreak: "break-word",
+            ...(outlinePx > 0
+              ? {
+                  WebkitTextStroke: `${outlinePx}px #000000`,
+                  paintOrder: "stroke fill",
+                }
+              : {}),
           }}
         >
           {config.text}

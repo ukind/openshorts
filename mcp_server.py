@@ -35,11 +35,17 @@ router = APIRouter()
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "openshorts", "title": "OpenShorts", "version": "1.0.0"}
 INSTRUCTIONS = (
-    "OpenShorts turns long videos (YouTube URLs) into viral-ready vertical "
-    "clips. Typical flow: process_video -> poll get_job_status until "
-    "'completed' (a job takes minutes; poll every 30-60s or pass webhook_url) "
-    "-> list_clips -> optionally add_subtitles / publish_clip. Check "
-    "get_quota before large jobs."
+    "OpenShorts turns long videos (YouTube URLs or direct video files) into "
+    "viral-ready vertical clips. When the user gives you a video URL, hand it "
+    "to process_video exactly as written: OpenShorts downloads, transcribes "
+    "and analyses the video on its own servers. Do NOT try to open, fetch, "
+    "search for, summarise or transcribe the URL yourself first; you cannot "
+    "reach the video and it is not needed. Typical flow: process_video -> "
+    "poll get_job_status until 'completed' (a job takes minutes; poll every "
+    "30-60s or pass webhook_url) -> list_clips -> optionally add_subtitles / "
+    "recut_clip / publish_clip. Check get_quota before large jobs. The user "
+    "must own the content or hold the rights: ask once, then pass "
+    "confirm_rights=true."
 )
 
 # Headers an MCP caller may use to authenticate / bring their own keys; they are
@@ -54,11 +60,16 @@ TOOLS = [
         "name": "process_video",
         "title": "Process a video into short clips",
         "description": (
-            "Start clipping a video: downloads the source, transcribes it, finds "
-            "the most viral moments with AI and renders vertical (9:16) clips "
-            "with captions. Returns a job_id immediately — the work takes "
-            "minutes; poll get_job_status or pass webhook_url to be called back. "
-            "The caller must own the content or hold the rights to process it "
+            "Start clipping a video from its URL. OpenShorts downloads the "
+            "source itself, transcribes it, finds the most viral moments with AI "
+            "and renders vertical (9:16) clips. Captions and the AI hook line are "
+            "burned by default; pass captions=false or auto_hook=false to skip either. "
+            "Call this directly "
+            "with the URL the user gave you; do not fetch, search or inspect the "
+            "URL yourself first (you cannot access the video, and it is not "
+            "needed). Returns a job_id immediately — the work takes minutes; "
+            "poll get_job_status or pass webhook_url to be called back. The "
+            "caller must own the content or hold the rights to process it "
             "(confirm_rights)."
         ),
         "inputSchema": {
@@ -66,7 +77,34 @@ TOOLS = [
             "properties": {
                 "source_url": {
                     "type": "string",
-                    "description": "Public video URL (YouTube or a direct video file URL).",
+                    "description": "Public video URL, passed through exactly as the user gave it "
+                                   "(YouTube watch/short/live URL, a direct video file URL, or a "
+                                   "tmpfiles.org link from the create_upload fallback). The server "
+                                   "does the downloading. Omit when using upload_id.",
+                },
+                "upload_id": {
+                    "type": "string",
+                    "description": "Instead of source_url: the id from create_upload after the "
+                                   "file was PUT to its upload_url. Use when the user gave you a "
+                                   "video file rather than a link.",
+                },
+                "auto_hook": {
+                    "type": "boolean",
+                    "description": "Burn the AI-written hook line (the clip's title) over the first "
+                                   "seconds of each clip, as the dashboard does. Default true; set "
+                                   "false for clean clips.",
+                },
+                "hook_style": {
+                    "type": "string",
+                    "enum": ["classic", "dark", "yellow", "red", "outline", "outline_yellow"],
+                    "description": "Look of the hook text (with auto_hook). Default classic.",
+                },
+                "captions": {
+                    "type": "boolean",
+                    "description": "Default true: burn word-level captions on every clip. Set false "
+                                   "when the source already has subtitles burned in (they would "
+                                   "stack) or the user wants clean clips; add_subtitles can still "
+                                   "caption a clip later.",
                 },
                 "confirm_rights": {
                     "type": "boolean",
@@ -110,7 +148,30 @@ TOOLS = [
                     "description": "Maximum clip length in seconds (default 60). Must be ≥ 5s above the minimum.",
                 },
             },
-            "required": ["source_url", "confirm_rights"],
+            "required": ["confirm_rights"],
+        },
+    },
+    {
+        "name": "create_upload",
+        "title": "Reserve an upload slot for a local video file",
+        "description": (
+            "Use when the user hands you a video FILE instead of a link. Returns "
+            "an upload_url: send the file's raw bytes to it with an HTTP PUT "
+            "(for example `curl -T video.mp4 <upload_url>`), then call "
+            "process_video with the returned upload_id. Unused slots are "
+            "deleted after expires_in seconds (6 h); max size is max_mb. "
+            "FALLBACK if your sandbox cannot reach upload_url: upload the file "
+            "to tmpfiles.org (`curl -F file=@video.mp4 https://tmpfiles.org/api/v1/upload`), "
+            "and pass the returned url to process_video as source_url right "
+            "away (their files expire after 60 minutes; the server refreshes "
+            "the signed download link itself). Otherwise ask the user to run "
+            "the curl command or to share a public link."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Original file name (optional, for the extension)."},
+            },
         },
     },
     {
@@ -217,6 +278,14 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Burn default captions back on after the recut (default true).",
                 },
+                "framing": {
+                    "type": "string", "enum": ["auto", "full", "track"],
+                    "description": "Layout override: 'full' shows the whole source frame "
+                                   "(no side-cropping), 'track' forces the subject-tracking "
+                                   "crop, 'auto' resets to the AI classifier. Omit to keep "
+                                   "the clip's current framing. Non-auto values re-run the "
+                                   "reframe engine and need the retained source video.",
+                },
             },
             "required": ["job_id", "clip_index", "segments"],
         },
@@ -275,8 +344,11 @@ async def _tool_process_video(client, args):
     if not args.get("confirm_rights"):
         return {"error": "confirm_rights must be true: the user must own the "
                          "content or hold the rights to process it."}, True
+    if not args.get("source_url") and not args.get("upload_id"):
+        return {"error": "Give source_url (a public video link) or upload_id (from create_upload)."}, True
     body = {
-        "url": args["source_url"],
+        "url": args.get("source_url"),
+        "upload_id": args.get("upload_id"),
         "acknowledged": True,
         "layouts": args.get("layouts") or [],
         "output_format": args.get("output_format"),
@@ -284,9 +356,16 @@ async def _tool_process_video(client, args):
         "webhook_url": args.get("webhook_url"),
         "webhook_secret": args.get("webhook_secret"),
     }
-    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds"):
+    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds", "captions"):
         if args.get(k) is not None:
             body[k] = args[k]
+    # Same default as the dashboard: hook on unless the caller opts out. The
+    # REST endpoint keeps "absent = off" for older integrations; the MCP
+    # tool is newer than the hook and its users expect the dashboard output.
+    if args.get("auto_hook", True):
+        body["auto_hook"] = True
+        if args.get("hook_style"):
+            body["auto_hook_style"] = args["hook_style"]
     resp = await client.post("/api/process", json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True
@@ -298,6 +377,13 @@ async def _tool_process_video(client, args):
     data["hint"] = ("Processing takes minutes. Poll get_job_status every 30-60s"
                     + ("" if body["webhook_url"] else " (or re-run with webhook_url for a callback)") + ".")
     return data, False
+
+
+async def _tool_create_upload(client, args):
+    resp = await client.post("/api/uploads", json={"filename": args.get("filename") or "video.mp4"})
+    if resp.status_code >= 400:
+        return _api_error(resp), True
+    return resp.json(), False
 
 
 async def _tool_get_job_status(client, args):
@@ -373,7 +459,7 @@ async def _tool_add_subtitles(client, args):
 async def _tool_recut_clip(client, args):
     body = {"job_id": args["job_id"], "clip_index": args["clip_index"],
             "segments": args["segments"]}
-    for k in ("snap_to_words", "reapply_captions"):
+    for k in ("snap_to_words", "reapply_captions", "framing"):
         if args.get(k) is not None:
             body[k] = args[k]
     resp = await client.post("/api/clip/rerender", json=body)
@@ -396,6 +482,7 @@ async def _tool_publish_clip(client, args):
 
 _TOOL_IMPLS = {
     "process_video": _tool_process_video,
+    "create_upload": _tool_create_upload,
     "get_job_status": _tool_get_job_status,
     "list_clips": _tool_list_clips,
     "get_quota": _tool_get_quota,
@@ -519,11 +606,17 @@ async def _authorized(request: Request) -> bool:
 @router.post("/mcp")
 async def mcp_endpoint(request: Request):
     if not await _authorized(request):
+        # OAuth-capable clients (claude.ai, ChatGPT) read resource_metadata off
+        # this header and run the login flow themselves; everyone else gets the
+        # API-key hint in the body.
+        from cloud import mcp_oauth
+        u = request.base_url
         return JSONResponse(
-            {"error": "Authentication required. Pass an OpenShorts API key: "
-                      "Authorization: Bearer osk_... (create one in the dashboard)."},
+            {"error": "Authentication required. Connect with OAuth (claude.ai, ChatGPT) "
+                      "or pass an OpenShorts API key: Authorization: Bearer osk_... "
+                      "(create one in the dashboard)."},
             status_code=401,
-            headers={"WWW-Authenticate": "Bearer"},
+            headers={"WWW-Authenticate": mcp_oauth.www_authenticate(f"{u.scheme}://{u.netloc}")},
         )
     try:
         msg = json.loads(await request.body())

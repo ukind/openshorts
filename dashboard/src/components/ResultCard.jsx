@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Mic } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Mic, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
@@ -8,10 +8,11 @@ import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
+import TikTokDraftNotice from './TikTokDraftNotice';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
-const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
+const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
 
 const PLATFORM_OPTIONS = [
     { value: 'tiktok', label: 'tiktok', icon: <Video size={16} /> },
@@ -35,7 +36,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onVoiceOver = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onVoiceOver = null, onReframeClip = null }) {
     const [showModal, setShowModal] = useState(false);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
@@ -48,17 +49,63 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     // subtitled file (double-subtitle bug).
     const stripBurns = (filename) => {
         let f = filename || '', prev;
-        do { prev = f; f = f.replace(/^subtitled_\d+_/, '').replace(/^hook_/, ''); } while (f !== prev);
+        do { prev = f; f = f.replace(/^subtitled_\d+_/, '').replace(/^hooked_\d+_/, '').replace(/^hook_/, ''); } while (f !== prev);
         return f;
     };
     const originalVideoUrl = getApiUrl((clip.video_url || '').replace(/[^/]+$/, stripBurns((clip.video_url || '').split('/').pop())));
     const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url));
+    // Where the <video> element pulls its bytes from. The clips are archived to
+    // R2 anyway, and R2 egress is free and edge-served, while /videos is served
+    // by the same single-worker API process that is running the renders. So play
+    // from R2 when possible.
+    //
+    // ONLY when R2 holds exactly the file the server considers current for this
+    // clip (durable.filename === serverVideoFile). Every server-side edit sends
+    // input_filename: serverVideoFile and rewrites clip.video_url, but the R2
+    // re-archive behind it is fire-and-forget, so for a few seconds the durable
+    // copy is the PRE-edit clip. Preferring it blindly would silently show the
+    // clip without the subtitles/hook the user just burned.
+    //
+    // This is display-only: currentVideoUrl remains the source of truth for the
+    // download button and for every server operation, so no edit can be routed
+    // to the wrong file by this.
+    const [durableSrc, setDurableSrc] = useState(null);
+    const [durableFailed, setDurableFailed] = useState(false);
+    // Switching src reloads the element and restarts playback, so the durable copy
+    // is only ever adopted before the user has touched this player. After an edit
+    // the chase in App.jsx can land while they are watching the result, and losing
+    // their position to save a few seconds of buffering is a bad trade.
+    const [hasPlayed, setHasPlayed] = useState(false);
+
+    // A delivered clip is tens of MB, and on a slow link the old silent
+    // fetch-then-save took minutes with nothing on screen, which reads as a dead
+    // button. Stream it instead and report progress.
+    const [downloadPct, setDownloadPct] = useState(null);
 
     const downloadClip = async () => {
         try {
+            setDownloadPct(0);
             const response = await fetch(currentVideoUrl);
             if (!response.ok) throw new Error('Download failed');
-            const blob = await response.blob();
+            const total = Number(response.headers.get('content-length')) || 0;
+            let blob;
+            // No body reader (old browser) or no length to measure against: fall
+            // back to the plain path rather than lose the download.
+            if (!response.body || !total) {
+                blob = await response.blob();
+            } else {
+                const reader = response.body.getReader();
+                const chunks = [];
+                let received = 0;
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    received += value.length;
+                    setDownloadPct(Math.min(99, Math.round((received / total) * 100)));
+                }
+                blob = new Blob(chunks, { type: 'video/mp4' });
+            }
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.style.display = 'none';
@@ -71,6 +118,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         } catch (err) {
             console.error('Download error:', err);
             window.open(currentVideoUrl, '_blank');
+        } finally {
+            setDownloadPct(null);
         }
     };
     // Latest file that exists ON THE SERVER (blob: previews don't count).
@@ -81,14 +130,28 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     const [videoErrored, setVideoErrored] = useState(false);
     const [resolution, setResolution] = useState(null);
 
+    // Adopt the durable copy only while it matches the current server file, and
+    // pin the first signed URL seen for that file: /api/history mints a fresh
+    // signature on every call, and swapping src mid-playback restarts the video.
+    useEffect(() => {
+        if (durable?.url && durable.filename && durable.filename === serverVideoFile && !hasPlayed) {
+            setDurableSrc((prev) => prev || durable.url);
+        } else {
+            setDurableSrc(null);
+        }
+    }, [durable?.url, durable?.filename, serverVideoFile, hasPlayed]);
+
     // If the local video failed and a durable R2 URL is (now) available, use it.
     // Handles the race where the video errors before the durable URL has loaded.
+    // Deliberately NOT version-gated: reaching here means the local file is gone
+    // (retention sweep after a reload), so an older durable copy still beats a
+    // broken player.
     useEffect(() => {
-        if (videoErrored && durableUrl && currentVideoUrl !== durableUrl) {
-            setCurrentVideoUrl(durableUrl);
+        if (videoErrored && durable?.url && currentVideoUrl !== durable.url) {
+            setCurrentVideoUrl(durable.url);
             setVideoErrored(false);
         }
-    }, [videoErrored, durableUrl, currentVideoUrl]);
+    }, [videoErrored, durable, currentVideoUrl]);
 
     // When an external refresh changes this clip's server file (e.g. bulk
     // subtitles applied from another card), adopt it so the card shows the
@@ -99,6 +162,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         if (serverName && serverName !== serverVideoFile) {
             setServerVideoFile(serverName);
             setCurrentVideoUrl(serverUrl);
+            setDurableFailed(false);
+            setHasPlayed(false);
             if (videoRef.current) videoRef.current.load();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -158,7 +223,12 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     // True when the current server file already carries burned-in content.
     // Browser (Remotion) renders compose over the ORIGINAL clip, so using them
     // here would silently drop those burns — chain via server FFmpeg instead.
-    const hasServerBurns = /(^|_)(subtitled|hook)_/.test(serverVideoFile || '');
+    const hasServerBurns = /(^|_)(subtitled|hook|hooked)_/.test(serverVideoFile || '');
+
+    // The hook currently burned into the server file (auto-hook or a manual
+    // one). /api/hook REPLACES it; tracked locally so the modal stays honest
+    // after edits without refetching the job.
+    const [burnedHook, setBurnedHook] = useState(clip.auto_hook?.text || null);
 
     // Fetch clip duration from transcript endpoint
     useEffect(() => {
@@ -202,6 +272,9 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                 });
             }
         }
+        // Reset only when the modal opens for a clip; connection changes while
+        // it is open must not wipe the user's selection.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [showModal, clip]);
 
     const handleAutoEdit = async () => {
@@ -471,6 +544,39 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 setServerVideoFile(data.new_video_url.split('/').pop());
+                setBurnedHook(data.burned_hook?.text ?? payload.text ?? null);
+                if (videoRef.current) videoRef.current.load();
+                setShowHookModal(false);
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setIsHooking(false);
+        }
+    };
+
+    // Strip the burned hook (auto-hook or manual) off the server file.
+    const handleRemoveHook = async () => {
+        setIsHooking(true);
+        setEditError(null);
+        try {
+            const res = await apiFetch('/api/hook', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    remove: true,
+                    input_filename: serverVideoFile,
+                }),
+            });
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setServerVideoFile(data.new_video_url.split('/').pop());
+                setBurnedHook(null);
                 if (videoRef.current) videoRef.current.load();
                 setShowHookModal(false);
             }
@@ -621,15 +727,25 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         }
     };
 
+    // Browser-rendered previews (Remotion) live in a blob: URL that exists only
+    // in this tab, so they always win over the durable copy.
+    const playbackUrl = (durableSrc && !durableFailed && !String(currentVideoUrl || '').startsWith('blob:'))
+        ? durableSrc
+        : currentVideoUrl;
+
     const durationReadout = formatDuration(clip);
 
     return (
         <div className="card overflow-hidden flex flex-col md:flex-row group hover:border-rule2 transition-colors animate-fade md:min-h-[420px]" style={{ animationDelay: `${index * 0.1}s` }}>
             {/* Left: Video Preview — 9:16 column matching the fixed card height */}
-            <div className="w-full md:w-[236px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto group/video">
+            {/* A full-width 9:16 preview on a phone is ~640px tall on its own,
+                which pushed the title, captions and every action off-screen.
+                Capping the height and centring keeps the whole card scannable
+                without letterboxing the clip. */}
+            <div className="w-full max-w-[calc(64vh*0.5625)] md:max-w-none mx-auto md:mx-0 md:w-[236px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto group/video">
                 <video
                     ref={videoRef}
-                    src={currentVideoUrl}
+                    src={playbackUrl}
                     controls
                     className="w-full h-full object-contain"
                     playsInline
@@ -637,13 +753,21 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                         if (e.target.videoWidth) setResolution(`${e.target.videoWidth}×${e.target.videoHeight}`);
                     }}
                     onError={() => {
+                        // The durable copy is unreachable (signature expired after an
+                        // hour on an idle tab, object purged) → serve from the API for
+                        // the rest of this card's life.
+                        if (playbackUrl === durableSrc) {
+                            setDurableFailed(true);
+                            return;
+                        }
                         // Local /videos/ file gone (e.g. cleaned up after a reload) →
                         // fall back to the durable R2 copy for managed users. If the
                         // durable URL hasn't loaded yet, the effect above retries.
-                        if (durableUrl && currentVideoUrl !== durableUrl) setCurrentVideoUrl(durableUrl);
+                        if (durable?.url && currentVideoUrl !== durable.url) setCurrentVideoUrl(durable.url);
                         else setVideoErrored(true);
                     }}
                     onPlay={() => {
+                        setHasPlayed(true);
                         const currentTime = videoRef.current ? videoRef.current.currentTime : 0;
                         onPlay && onPlay(clip.start + currentTime);
                     }}
@@ -656,9 +780,32 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                     }}
                 />
                 <div className="absolute top-3 left-3 flex gap-2">
+                    {/* Stays the clip's own number, not its rank: the cards are
+                        ordered by score, but this is what the downloaded file
+                        is called (clip-N.mp4) and what every api call indexes. */}
                     <span className="bg-black/70 text-ink font-mono text-micro uppercase px-2 py-1 rounded-full">
                         Clip {index + 1}
                     </span>
+                    {/* A bare number on a thumbnail reads as a duration, a
+                        position, anything — it has to name itself and carry
+                        its scale, or it is decoration. */}
+                    {Number.isFinite(clip.predicted_score) && (
+                        <span
+                            className="bg-black/70 font-mono text-micro uppercase px-2 py-1 rounded-full flex items-center gap-1"
+                            title="openshorts' prediction of how well this clip will perform, from 0 to 100"
+                        >
+                            <TrendingUp size={11} className="shrink-0 text-muted" />
+                            <span className="text-muted">viral</span>
+                            <b className={
+                                clip.predicted_score >= 80 ? 'text-ok'
+                                    : clip.predicted_score >= 65 ? 'text-brass'
+                                        : 'text-ink2'
+                            }>
+                                {clip.predicted_score}
+                            </b>
+                            <span className="text-muted">/100</span>
+                        </span>
+                    )}
                 </div>
 
                 {/* Auto Edit Overlay if Processing */}
@@ -743,6 +890,16 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                         </button>
                     )}
 
+                    {onReframeClip && (
+                        <button
+                            onClick={() => onReframeClip(index)}
+                            className={QUIET_BTN}
+                        >
+                            <Crosshair size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                            reframing
+                        </button>
+                    )}
+
                     <button
                         onClick={handleAutoEdit}
                         disabled={isEditing}
@@ -792,7 +949,7 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
 
                     <button
                         onClick={() => setShowModal(true)}
-                        className="btn-primary flex-col gap-1 py-2 px-1 text-[11px] rounded-input whitespace-nowrap"
+                        className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap"
                     >
                         <Share2 size={16} className="shrink-0" /> post
                     </button>
@@ -809,7 +966,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                         }}
                         className={`${QUIET_BTN}${onEditClip ? ' col-span-2' : ''}`}
                     >
-                        <Download size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" /> download
+                        <Download size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        {downloadPct === null ? 'download' : `downloading ${downloadPct}%`}
                     </button>
                 </div>
             </div>
@@ -894,21 +1052,10 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                     </div>
                 )}
 
-                {/* TikTok is sent as a draft, so say so before they press publish:
-                    someone expecting a live post and finding nothing on their
-                    profile will read it as a failure. Lead with the upside —
-                    posting from inside the app is what the algorithm rewards. */}
-                {platforms.tiktok && (
-                    <div className="mb-4 px-3 py-2 rounded-input text-xs text-ink2 bg-paper3 flex items-start gap-2">
-                        <AlertCircle size={14} className="mt-0.5 shrink-0 text-brass" />
-                        <div className="lowercase">
-                            tiktok arrives as a <b className="text-ink">draft</b>, not a live post — you'll
-                            get a notification in the app. finishing it there lets you add trending
-                            sounds, effects and hashtags, which reaches more people than posting
-                            straight from an api.
-                        </div>
-                    </div>
-                )}
+                {/* Both the title/description fields below and the schedule
+                    button are downstream of this: on a tiktok draft neither
+                    travels. See TikTokDraftNotice. */}
+                {platforms.tiktok && <TikTokDraftNotice />}
 
                 <div className="space-y-4">
                     {/* Title & Description */}
@@ -1013,6 +1160,10 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                 initialText={clip.viral_hook_text}
                 durationInSeconds={clip.end && clip.start ? clip.end - clip.start : 30}
                 existingSubtitles={activeLayers.subtitles}
+                hasCaptions={!!activeLayers.subtitles || /(^|_)subtitled_/.test(serverVideoFile || '')}
+                serverRender={hasServerBurns}
+                burnedHook={burnedHook}
+                onRemove={burnedHook ? handleRemoveHook : null}
             />
 
             <TranslateModal

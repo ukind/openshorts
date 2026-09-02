@@ -21,6 +21,20 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
+    // Auto-hook: burn the AI hook text into every clip. On by default; the
+    // choice persists so turning it off sticks across sessions.
+    const [autoHook, setAutoHook] = useState(() => {
+        try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
+    });
+    const [autoHookStyle, setAutoHookStyle] = useState(() => {
+        try { return localStorage.getItem('os_auto_hook_style') || 'classic'; } catch { return 'classic'; }
+    });
+    // Layout: 'auto' lets the AI pick per video (server default); the others
+    // force one on so a podcast host who knows what they uploaded doesn't
+    // depend on the detector, and 'none' keeps the plain single crop.
+    const [layout, setLayout] = useState(() => {
+        try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
+    });
     const infoRef = useRef(null);
 
     // Close the compatibility popover on any outside click.
@@ -66,7 +80,15 @@ export default function MediaInput({ onProcess, isProcessing }) {
         const advanced = {
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
+            autoHook,
+            autoHookStyle,
+            layout,
         };
+        try {
+            localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
+            localStorage.setItem('os_auto_hook_style', autoHookStyle);
+            localStorage.setItem('os_layout', layout);
+        } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
         } else if (mode === 'file' && file) {
@@ -84,7 +106,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
     return (
         <div className="card p-4 sm:p-6 animate-fade">
-            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule">
+            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule" data-tutorial="source-tabs">
                 <button
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'file'
@@ -111,7 +133,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
             <form onSubmit={handleSubmit}>
                 {mode === 'url' ? (
-                    <div className="space-y-4">
+                    <div className="space-y-4" data-tutorial="drop-zone">
                         <div className="relative">
                             <input
                                 type="url"
@@ -150,6 +172,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 ) : (
                     <div
+                        data-tutorial="drop-zone"
                         className={`border-2 border-dashed rounded-card p-6 sm:p-8 text-center transition-colors ${file ? 'border-brass' : 'border-rule2 hover:border-brass'
                             }`}
                         onDragOver={(e) => e.preventDefault()}
@@ -184,7 +207,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 )}
 
                 {/* Output format selector */}
-                <div className="mt-5">
+                <div className="mt-5" data-tutorial="output-format">
                     <p className="eyebrow mb-2">Output format</p>
                     <div className="grid grid-cols-3 gap-2">
                         {[
@@ -212,7 +235,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         }}
                                     />
                                     <span className="block font-mono text-sm leading-none">{f.label}</span>
-                                    <span className="block text-[10px] leading-tight text-center text-muted">{f.hint}</span>
+                                    <span className="block text-[11px] sm:text-[10px] leading-tight text-center text-muted">{f.hint}</span>
                                 </button>
                             );
                         })}
@@ -228,7 +251,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(clipMinSeconds || clipMaxSeconds) && (
+                        {(clipMinSeconds || clipMaxSeconds || !autoHook) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -259,24 +282,64 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide. Clip
                                 count is set by the number-of-clips slider above.
                             </p>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <span className="text-xs text-ink2">vertical layout</span>
+                                <select
+                                    value={layout}
+                                    onChange={(e) => setLayout(e.target.value)}
+                                    className="input-field !w-auto text-xs py-1.5"
+                                    aria-label="vertical layout"
+                                >
+                                    <option value="auto">Auto (AI picks per video)</option>
+                                    <option value="split">Two speakers stacked</option>
+                                    <option value="screencast">Screen over presenter</option>
+                                    <option value="none">Single crop only</option>
+                                </select>
+                            </div>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={autoHook}
+                                        onChange={(e) => setAutoHook(e.target.checked)}
+                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                                    />
+                                    auto hook titles on clips
+                                </label>
+                                {autoHook && (
+                                    <select
+                                        value={autoHookStyle}
+                                        onChange={(e) => setAutoHookStyle(e.target.value)}
+                                        className="input-field !w-auto text-xs py-1.5"
+                                    >
+                                        <option value="classic">Classic</option>
+                                        <option value="dark">Dark</option>
+                                        <option value="yellow">Yellow</option>
+                                        <option value="red">Red</option>
+                                        <option value="outline">Outline</option>
+                                        <option value="outline_yellow">Outline+</option>
+                                    </select>
+                                )}
+                            </div>
                         </div>
                     )}
                 </div>
 
-                <label className="flex items-start gap-2 mt-5 text-xs text-muted cursor-pointer select-none">
+                <label className="flex items-start gap-2.5 mt-5 text-left text-[13px] sm:text-xs leading-relaxed text-muted cursor-pointer select-none">
                     <input
                         type="checkbox"
                         checked={acknowledged}
                         onChange={(e) => setAcknowledged(e.target.checked)}
-                        className="mt-0.5 accent-[var(--color-accent)] cursor-pointer"
+                        className="mt-0.5 w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
                     />
                     <span>
-                        I confirm I own this content or have the rights to process it. I am responsible for any content I submit. See our <a href="/#legal" target="_blank" rel="noopener noreferrer" className="text-ink2 underline underline-offset-2 hover:text-brass transition-colors" onClick={(e) => e.stopPropagation()}>Terms & Privacy</a>.
+                        I confirm I own this content or have the rights to process it. I am responsible for any content I submit. See our <a href="/terms" target="_blank" rel="noopener noreferrer" className="text-ink2 underline underline-offset-2 hover:text-brass transition-colors" onClick={(e) => e.stopPropagation()}>Terms</a> and <a href="/privacy" target="_blank" rel="noopener noreferrer" className="text-ink2 underline underline-offset-2 hover:text-brass transition-colors" onClick={(e) => e.stopPropagation()}>Privacy Policy</a>.
                     </span>
                 </label>
 
                 <button
                     type="submit"
+                    data-tutorial="generate"
                     disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && !file)}
                     className="w-full btn-primary mt-4"
                 >

@@ -11,6 +11,7 @@ import { track } from '../lib/analytics';
 import { report as reportAttribution } from '../lib/attribution';
 
 const AuthContext = createContext(null);
+// eslint-disable-next-line react-refresh/only-export-components
 export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }) {
@@ -75,15 +76,16 @@ export function AuthProvider({ children }) {
         // channel produced an account. Awaited but never allowed to throw.
         await reportAttribution(apiJson);
       }
-      // Everyone lands in the app. Show the welcome plan-choice popup once per
-      // browser (on the first auth) for anyone not already on a paid plan —
-      // free is the default, paid is one click away. Never a pricing-page dump.
+      // Everyone lands in the app. First-time (unpaid) sign-in gets the Clip
+      // Generator tutorial, not a pricing dump — they need one successful job
+      // before the rest of the tools unlock. os_welcomed keeps this once-only
+      // even if they skip the tutorial.
       const paid = ['starter', 'creator', 'pro'].includes(signedInMe?.plan);
       let welcomed = false;
       try { welcomed = localStorage.getItem('os_welcomed') === '1'; } catch (_) { /* ignore */ }
       if (signedInMe?.user && !paid && !welcomed) {
         try {
-          localStorage.setItem('os_show_plan_choice', '1');
+          localStorage.setItem('os_show_clip_tutorial', '1');
           localStorage.setItem('os_welcomed', '1');
         } catch (_) { /* ignore */ }
       }
@@ -133,7 +135,9 @@ export function AuthProvider({ children }) {
 
   const value = {
     billingEnabled: config.billingEnabled,
+    localLlm: config.localLlm || null,
     googleAuthEnabled: config.googleAuthEnabled,
+    jobRetentionSeconds: config.jobRetentionSeconds || null,
     loading,
     signingIn,
     user: me?.user || null,

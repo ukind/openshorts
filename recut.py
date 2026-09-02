@@ -159,14 +159,18 @@ def virtual_transcript(transcript, segments):
             if w["e"] <= seg_start or w["s"] >= seg_end:
                 continue
             words.append({
-                "word": w["w"],
+                # Leading space = Whisper's word-boundary convention.
+                # transcript_words() strips it, and without it the caption
+                # block collector treats every word as a continuation fragment
+                # and burns the whole line glued together.
+                "word": " " + w["w"],
                 "start": round(max(0.0, w["s"] - seg_start) + offset, 3),
                 "end": round(min(seg_duration, w["e"] - seg_start) + offset, 3),
             })
         out_segments.append({
             "start": round(offset, 3),
             "end": round(offset + seg_duration, 3),
-            "text": " ".join(w["word"] for w in words),
+            "text": "".join(w["word"] for w in words).strip(),
             "words": words,
         })
         offset += seg_duration
@@ -260,7 +264,8 @@ def _run_ffmpeg(command):
 
 def perform_recut(*, input_path, segments, output_dir, clean_name,
                   reframe=False, output_format="auto", watermark=False,
-                  captions_transcript=None, runner=None, renderer=None,
+                  captions_transcript=None, force_strategy=None,
+                  crop_overrides=None, runner=None, renderer=None,
                   watermarker=None, captioner=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
@@ -274,6 +279,10 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
       ``virtual_transcript``); when given and non-empty, captions are burned
       LAST onto a ``subtitled_<ts>_`` derivative, preserving the invariant
       that the clean file stays clean for later re-styling.
+    - ``crop_overrides``: scene index -> crop centre as a fraction of the
+      source width, for scenes the user framed by hand. Source path only, for
+      the same reason as ``reframe``: the canonical file is already cropped, so
+      its framing can no longer be changed.
 
     The renderer/watermarker/captioner hooks default to main.py's
     implementations, imported lazily so this module stays importable without
@@ -292,11 +301,25 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                        runner=runner)
 
         if reframe:
-            render = renderer or _main_attr("render_clip")
+            if renderer is not None:
+                render = renderer  # injected fakes keep the 3-arg contract
+            else:
+                main_render = _main_attr("render_clip")
+
+                def render(i, o, f):
+                    return main_render(i, o, f, force_strategy=force_strategy,
+                                       crop_overrides=crop_overrides)
             if not render(work_path, out_path, output_format):
                 raise RuntimeError("reframe failed on the recut clip")
         else:
             shutil.move(work_path, out_path)
+            # No reframe means no fresh layout sidecar; the captions would fall
+            # back to the bottom on a stacked clip. Carry the input's layout
+            # ranges through the cut instead (empty when the input has none).
+            import layout_ranges
+            layout_ranges.write(out_path, [
+                (r["start"], r["end"], r["layout"])
+                for r in layout_ranges.remap(layout_ranges.read(input_path), segments)])
 
         if watermark:
             (watermarker or _main_attr("apply_watermark"))(out_path)

@@ -37,7 +37,7 @@ const S = {
 }
 
 const FEATURES = [
-  ['AI viral moment detection', 'Google Gemini 3.0 Flash scores the transcript and scene data to find the 3 to 15 strongest moments, so there is no manual scrubbing.'],
+  ['AI viral moment detection', 'Google Gemini 3.1 Flash-Lite scores the transcript and scene data to find the 3 to 15 strongest moments, so there is no manual scrubbing.'],
   ['Smart 9:16 vertical cropping', 'Dual-mode reframing with MediaPipe face tracking and a YOLOv8 fallback, stabilised so the camera holds still instead of swinging.'],
   ['Word-level automatic subtitles', 'faster-whisper produces a timestamp for every word, and the subtitles are burned in with FFmpeg.'],
   ['AI voice dubbing in 30+ languages', 'ElevenLabs translates the audio while preserving the speaker\'s voice, then the new track is re-transcribed so subtitles match.'],
@@ -54,7 +54,7 @@ const FEATURES = [
 
 const STEPS = [
   ['Upload a long-form video', 'Any video you own: podcasts, webinars, livestreams, interviews, or a YouTube link.'],
-  ['AI finds the best moments', 'Gemini 3.0 Flash returns 3 to 15 candidate clips of 15 to 60 seconds each.'],
+  ['AI finds the best moments', 'Gemini 3.1 Flash-Lite returns 3 to 15 candidate clips of 15 to 60 seconds each.'],
   ['Smart cropping to vertical 9:16', 'Face-tracked reframing keeps the subject centred without the camera swinging.'],
   ['Subtitles, hooks and effects', 'Word-level subtitles, an AI hook overlay, optional effects and dubbing into 30+ languages.'],
   ['Download or post directly', 'Export the clips or publish straight to TikTok, Instagram Reels and YouTube Shorts.'],
@@ -101,7 +101,7 @@ export const LANDING_FALLBACK = `<div id="seo-content" style="background:oklch(1
 <section style="${S.section};padding-top:4rem"><div style="${S.wrap}">
   <p style="${S.eyebrow}">AI clip generator &middot; cloud or self-hosted</p>
   <h1 style="${S.h1}">the free open source ai clip generator, built to clip what people actually watch.</h1>
-  <p style="${S.p};max-width:44rem;font-size:1.05rem">Turn long videos into viral 9:16 shorts, or generate UGC marketing videos with AI actors. Online in the cloud with zero setup, or self-hosted with Docker for free.</p>
+  <p style="${S.p};max-width:44rem;font-size:1.05rem">Turn long videos into viral 9:16 shorts, or generate UGC marketing videos with AI actors. Online in the cloud with zero setup, or self-hosted with Docker for free. Also a clipping tool for AI agents: Claude, ChatGPT and n8n drive it over <a href="/mcp" style="${S.a}">MCP</a>, or run a channel on autopilot with the <a href="/n8n-youtube-shorts-automation" style="${S.a}">n8n workflow</a>.</p>
   <p style="${S.muted};max-width:44rem"><strong style="color:oklch(75% 0.11 150)">No credit card required.</strong> 20 free minutes every month. Paid plans from $12/month without a watermark. Prefer to run it yourself? <a style="${S.a}" href="https://github.com/mutonby/openshorts" rel="noopener">Self-host free on GitHub</a>.</p>
 </div></section>
 
@@ -148,7 +148,8 @@ export const LANDING_FALLBACK = `<div id="seo-content" style="background:oklch(1
     <a style="${S.a}" href="/how-openshorts-works">How it works</a> &middot;
     <a style="${S.a}" href="/alternatives">All alternatives compared</a> &middot;
     <a style="${S.a}" href="/mcp">MCP server &amp; API</a> &middot;
-    <a style="${S.a}" href="/automate-shorts-api">Automate shorts via API</a>
+    <a style="${S.a}" href="/automate-shorts-api">Automate shorts via API</a> &middot;
+    <a style="${S.a}" href="/n8n-youtube-shorts-automation">n8n template: channel on autopilot</a>
   </p>
 </div></section>
 

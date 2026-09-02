@@ -45,8 +45,11 @@ skills-lock.json
 # Cloud env example kept local only (avoid leaking infra hints)
 .env.cloud.example
 
+
 # NVIDIA runtime cache
 .nv/
 
 # Local GameProfiles
 profiles/
+
+.worktrees

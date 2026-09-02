@@ -246,3 +246,91 @@ class StripeEvent(Base):
     type = Column(Text, nullable=True)
     created = Column(DateTime(timezone=True), nullable=True)
     processed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AccountDeletion(Base):
+    """Proof that an account was erased, kept after the user row is gone.
+
+    GDPR Art. 17 erasure has an accountability twin (Art. 5.2): if a former user
+    later claims we never deleted their account, the only way to answer is a
+    record that outlives the deletion. The identifying field is therefore a
+    sha256 of the account email, which confirms "yes, this address was deleted
+    on this date" without storing the address itself.
+
+    ``reason`` is one label from ``account.DELETION_REASONS``, never free text:
+    anything the user could type would land in a row that deliberately outlives
+    their account, which is the opposite of what this row is for.
+
+    ``stripe_customer_id`` is the one exception and it is deliberate: the
+    invoices behind it must be kept for six years under Spanish commercial law,
+    so the reference that lets us find them survives too (privacy policy §5).
+    There is no FK to ``users`` — the whole point is that the row it would
+    reference no longer exists.
+
+    Rows are dropped after DELETION_LOG_RETENTION_DAYS by the retention sweeper,
+    matching the "rights declarations and related logs: up to 5 years" line in
+    the privacy policy.
+    """
+    __tablename__ = "account_deletions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    former_user_id = Column(Text, nullable=False)        # the old uuid, resolves to nothing now
+    email_sha256 = Column(Text, nullable=False, index=True)
+    stripe_customer_id = Column(Text, nullable=True)
+    plan_at_deletion = Column(String(20), nullable=True)
+    r2_objects_deleted = Column(Integer, nullable=True)
+    reason = Column(String(32), nullable=True)           # one of account.DELETION_REASONS
+    deleted_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class OAuthClient(Base):
+    """An MCP client registered through OAuth dynamic client registration
+    (RFC 7591): claude.ai, ChatGPT, Cursor... They are public clients (no
+    secret): PKCE is what ties the authorization code to the party that
+    started the flow. Rows are not user-owned — one registration serves every
+    user of that client — so they survive account erasure."""
+    __tablename__ = "oauth_clients"
+    id = Column(Text, primary_key=True)               # client_id
+    client_name = Column(Text, nullable=False)
+    redirect_uris = Column(Text, nullable=False)      # JSON list
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class OAuthCode(Base):
+    """A short-lived authorization code (10 min, single use). Only its sha256
+    is stored; the code itself travels once, in the redirect back to the
+    client. Redeeming it mints an ``osk_`` API key for the user, which is what
+    the client keeps as its access token: the key shows up in the account
+    page like any other, and revoking it there disconnects the client."""
+    __tablename__ = "oauth_codes"
+    code_hash = Column(Text, primary_key=True)
+    client_id = Column(Text, ForeignKey("oauth_clients.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    redirect_uri = Column(Text, nullable=False)
+    code_challenge = Column(Text, nullable=False)
+    scope = Column(Text, nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ProxyUsage(Base):
+    """One row per event that put bytes through the per-GB paid proxy, or per
+    download route decision worth keeping (the winner and why the free routes
+    failed).
+
+    The monthly proxy counter in app.py is in-memory and the container log
+    rotates within the hour, so on 28-aug-2026 a $14 DataImpulse day could not
+    be reconstructed at all. This is the durable trail: which job, which route
+    won, how many paid bytes, and the failure text of every free attempt that
+    was tried first. Not user-owned data (no FK to users): it is operational
+    accounting and survives account erasure on purpose.
+    """
+    __tablename__ = "proxy_usage"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    source = Column(String(16), nullable=False)          # download | probe
+    job_id = Column(String(64), nullable=True, index=True)
+    url_host = Column(String(120), nullable=True)
+    route = Column(String(32), nullable=True)            # winning attempt label, or "none"
+    paid_bytes = Column(Integer, nullable=False, default=0)
+    detail = Column(JSONB, nullable=True)                # attempts: [{label, ok, bytes, error}]

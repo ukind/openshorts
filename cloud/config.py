@@ -219,6 +219,21 @@ class Settings:
     def stripe_webhook_secret(self) -> str:
         return os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
+    # AgentLedger (aikount.com) — issues the legally valid Spanish invoice for
+    # every Stripe charge; the account page lists them via /api/billing/invoices.
+    @property
+    def agentledger_api_url(self) -> str:
+        return os.environ.get("AGENTLEDGER_API_URL", "https://api.aikount.com/api/v1").rstrip("/")
+
+    @property
+    def agentledger_api_key(self) -> str:
+        return os.environ.get("AGENTLEDGER_API_KEY", "")
+
+    @property
+    def agentledger_treasury_id(self) -> str:
+        # The Stripe Connect treasury in AgentLedger that holds OpenShorts' customers.
+        return os.environ.get("AGENTLEDGER_TREASURY_ID", "720d3b70-3806-4c59-8729-2495b489a771")
+
     # Managed provider keys (server-owned, only handed to entitled users)
     @property
     def managed_gemini_key(self) -> str:
@@ -250,6 +265,25 @@ class Settings:
         return os.environ.get("R2_SECRET_ACCESS_KEY", "")
 
     @property
+    def r2_public_base(self) -> str:
+        """Base URL of a custom domain bound to the R2 bucket, e.g.
+        https://cdn.openshorts.app — unset means keep signing S3 URLs.
+
+        The S3 endpoint (*.r2.cloudflarestorage.com) is not a browser-facing
+        endpoint: measured 22-ago-2026, a presigned GET from Chrome on a Spanish
+        residential line returns 503 on every attempt while the same URL with the
+        same headers returns 206 at 11 MB/s from a datacenter. A custom domain
+        serves the same objects through the normal Cloudflare edge, which both
+        fixes that and puts the bytes on Cloudflare's network instead of a single
+        long path out of Hetzner (measured to the same client: 90 KB/s).
+
+        Objects under it are public. That matches the capability model already in
+        production for /videos/{job_id}/... (unauthenticated, the UUID is the
+        capability); anything stricter needs a Worker checking a signed token.
+        """
+        return os.environ.get("R2_PUBLIC_BASE", "").strip().rstrip("/")
+
+    @property
     def r2_configured(self) -> bool:
         return bool(self.r2_endpoint and self.r2_bucket and self.r2_access_key_id
                     and self.r2_secret_access_key)
@@ -257,6 +291,11 @@ class Settings:
 
 # Days a user's videos survive after their subscription ends (grace period).
 VIDEO_RETENTION_GRACE_DAYS = 7
+
+# How long the erasure log (cloud/models.AccountDeletion) is kept. Matches the
+# "rights declarations and related logs: up to 5 years" line in the privacy
+# policy, which in turn matches the statute of limitations for civil claims.
+DELETION_LOG_RETENTION_DAYS = 5 * 365
 
 
 settings = Settings()

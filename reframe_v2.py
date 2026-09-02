@@ -25,8 +25,10 @@ import active_speaker
 import camera_inset
 import punch_in
 import screencast_layout
+import layout_ranges
 import split_layout
-from ffmpeg_utils import video_encode_args, QUALITY_FAST, METADATA_SCRUB
+from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY_FAST,
+                          METADATA_SCRUB)
 
 ANALYSIS_MAX_WIDTH = 640
 
@@ -60,6 +62,18 @@ def delivery_size(orig_w, orig_h, aspect_ratio):
         out_h = int(round(out_w / aspect_ratio))
 
     return out_w + (out_w % 2), out_h + (out_h % 2)
+
+
+def source_already_fits(orig_w, orig_h, aspect_ratio, tol=0.01):
+    """True when the source is already at (or past) the target aspect.
+
+    Such a source has no width to throw away, so every layout that rearranges
+    the frame is a downgrade: GENERAL puts it in a blurred bed, SPLIT stacks
+    two crops of an already-narrow frame, SCREENCAST/INSET carve panels out of
+    it. TRACK is the only one that leaves it alone — its crop is the whole
+    frame — so a vertical upload should pass straight through.
+    """
+    return orig_w / float(orig_h) <= aspect_ratio * (1 + tol)
 
 
 def dedupe_sendcmd_lines(xs, fps, target="crop@c"):
@@ -121,7 +135,7 @@ def full_width_content_height(orig_w, orig_h, out_w):
     return fg_h + (fg_h % 2)
 
 
-def general_filtergraph(out_w, out_h, content_h=None):
+def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
     """Blurred-background 'general shot' layout: bg fills the frame (centre-
     cropped, blurred), fg is scaled to a readable share of the height and
     centred, overflowing the sides rather than floating small in the middle.
@@ -130,8 +144,16 @@ def general_filtergraph(out_w, out_h, content_h=None):
     turns the side-cropping off entirely, which is what a scene full of charts
     or spreadsheets needs: the default 0.42 ratio buys presence by throwing away
     ~24% of the width, and on that material the discarded columns are the point.
+
+    ``orig_w``/``orig_h`` floor the foreground at the height where the source
+    fills the output width. The 0.42 ratio buys presence on a LANDSCAPE source
+    by overflowing the sides; on a portrait one the same number is a shrink —
+    an already-9:16 upload came back as a 453px sliver floating over a blurred
+    copy of itself. Filling the width is the floor, never the target.
     """
     fg_h = content_h if content_h else int(out_h * GENERAL_CONTENT_HEIGHT_RATIO)
+    if orig_w and orig_h:
+        fg_h = max(fg_h, full_width_content_height(orig_w, orig_h, out_w))
     fg_h += fg_h % 2
     return (
         f"[0:v]split=2[bga][fga];"
@@ -146,6 +168,88 @@ def general_filtergraph(out_w, out_h, content_h=None):
 
 
 # --- analysis ---------------------------------------------------------------
+
+def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
+                         crop_w, orig_w, orig_h=None, splits=None):
+    """Frame the scenes the user positioned by hand.
+
+    ``overrides`` maps a scene index to either
+
+      * a number — the crop CENTRE as a fraction of the source width, giving a
+        single locked 9:16 window for that scene; or
+      * ``{"top": v, "bottom": v}`` — two centres, stacking those two regions
+        one above the other (the SPLIT layout). Each half is either a bare
+        fraction (horizontal only) or ``{"x": f, "y": f}``; SPLIT crops are
+        SHORTER than the source, so they carry a vertical centre too.
+
+    Fractions travel instead of pixels because the editor knows where it
+    dropped the rectangle, not the source's dimensions, and the same number
+    survives a source re-encode at another resolution.
+
+    A hand-framed scene overrides its automatic verdict outright: the single
+    form forces TRACK so a scene the detector had sent to GENERAL (blurred
+    background) comes back to a vertical crop, and the split form writes
+    straight into ``splits``, so the user can stack a scene the detector never
+    proposed — no dependency on SPLIT_LAYOUT being switched on.
+
+    Runs after every automatic pass, including the ALTERNATE writes, so a
+    manual choice always wins. Unknown scene indices and malformed values are
+    skipped rather than rejected: a stale editor tab must not fail the render.
+    """
+    max_x = max(0, orig_w - crop_w)
+
+    def to_x(fraction):
+        return max(0, min(int(round(float(fraction) * orig_w - crop_w / 2)), max_x))
+
+    for raw_idx, value in (overrides or {}).items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= idx < len(scene_boundaries):
+            continue
+        start_f, end_f = scene_boundaries[idx]
+        end_f = min(end_f, len(xs))
+        if end_f <= start_f:
+            continue
+
+        if isinstance(value, dict):
+            # Split: the halves are centres in SOURCE PIXELS, which is what
+            # split_filtergraph expects — unlike the single-crop path, there is
+            # no crop window to offset by.
+            # split_geometry reads centre[0]/centre[1]: each half is a POINT,
+            # not a horizontal position, because its crop is shorter than the
+            # source and has to be placed vertically as well.
+            def point(half):
+                if isinstance(half, dict):
+                    fx, fy = float(half['x']), float(half.get('y', 0.5))
+                else:
+                    fx, fy = float(half), 0.5
+                return (fx * orig_w, fy * orig_h)
+
+            try:
+                centres = (point(value['top']), point(value['bottom']))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if splits is None or not orig_h:
+                continue
+            splits[start_f] = centres
+            strategies[idx] = 'SPLIT'
+            continue
+
+        try:
+            x = to_x(value)
+        except (TypeError, ValueError):
+            continue
+        xs[start_f:end_f] = [x] * (end_f - start_f)
+        strategies[idx] = 'TRACK'
+        # A scene taken over by a single locked crop must not also carry a
+        # stale split recipe from the detector.
+        if splits is not None:
+            splits.pop(start_f, None)
+
+    return xs, strategies
+
 
 def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
                         fps, orig_w, orig_h, cameraman, tracker):
@@ -196,7 +300,17 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
                 cameraman.target_center_x = orig_w / 2
                 xs.append(None)
             else:
-                if frame_number % m.DETECT_STRIDE == 0:
+                is_scene_start = (
+                    current_scene_index < len(scenes_boundaries)
+                    and frame_number == scenes_boundaries[current_scene_index][0])
+                cut = is_scene_start and m.SCENE_CUT_RESET
+                if cut:
+                    # New shot: forget the old subject and cut to the new one
+                    # (see SmoothedCameraman.begin_scene).
+                    tracker.reset()
+                    cameraman.begin_scene()
+
+                if frame_number % m.DETECT_STRIDE == 0 or cut:
                     candidates = m.detect_face_candidates(frame)
                     for cand in candidates:
                         cand['box'] = [int(v * scale) for v in cand['box']]
@@ -204,14 +318,11 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
                     target_box = tracker.get_target(candidates, frame_number, orig_w)
                     if target_box:
                         cameraman.update_target(target_box)
-                    elif frame_number % m.YOLO_FALLBACK_STRIDE == 0:
+                    elif frame_number % m.YOLO_FALLBACK_STRIDE == 0 or cut:
                         person_box = m.detect_person_yolo(frame)
                         if person_box:
                             cameraman.update_target([int(v * scale) for v in person_box])
 
-                is_scene_start = (
-                    current_scene_index < len(scenes_boundaries)
-                    and frame_number == scenes_boundaries[current_scene_index][0])
                 x1, _y1, _x2, _y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 xs.append(x1)
 
@@ -230,12 +341,23 @@ def _run(cmd):
                    stderr=subprocess.PIPE, timeout=1800)
 
 
-def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
+def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
+           force_strategy=None, crop_overrides=None):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
     ``content_ranges`` comes from screencast_layout.detect_content_ranges() on
     the SOURCE video, already translated into this clip's timeline. None or []
     means the layout never triggers, which is the default.
+
+    ``force_strategy`` ('WIDE' / 'TRACK' / any layout the render loop knows)
+    applies that layout to EVERY scene, skipping the classifier and the layout
+    upgrades — the clip editor's whole-clip framing override.
+
+    ``crop_overrides`` maps scene index -> crop centre as a fraction of the
+    source width, for scenes the user framed by hand in the editor. Scenes not
+    listed keep the automatic camera, so correcting one bad shot never disturbs
+    the ones the tracker got right. Applied AFTER force_strategy: a per-scene
+    hand position always beats the whole-clip choice for the scenes it names.
     """
     import main as m
     content_ranges = content_ranges or []
@@ -256,7 +378,23 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total, fps))]
 
     scene_boundaries = [(s.get_frames(), e.get_frames()) for s, e in scenes]
-    strategies = m.analyze_scenes_strategy(input_video, scenes)
+    # A source shot vertical is already the output: nothing to reframe. The
+    # scene classifier still sends its face-less shots (a slide, a chart, a
+    # screen recording) to GENERAL, and GENERAL on such a source shrank the
+    # whole frame into the middle of a blurred copy of itself. Skip the
+    # classifier and every layout upgrade instead of trying to survive them.
+    passthrough = source_already_fits(orig_w, orig_h, aspect_ratio)
+    if force_strategy:
+        strategies = [force_strategy] * len(scenes)
+        content_ranges = []  # no screencast/inset upgrades over an explicit choice
+        print(f"   🎯 Framing override: every scene -> {force_strategy}")
+    elif passthrough:
+        strategies = ['TRACK'] * len(scenes)
+        content_ranges = []
+        print(f"   ↕️  Source is already {orig_w}x{orig_h} vertical — "
+              f"passing it through, no reframe")
+    else:
+        strategies = m.analyze_scenes_strategy(input_video, scenes)
 
     # SPLIT is an upgrade applied on top of the TRACK/GENERAL verdict, keyed by
     # the scene's START FRAME rather than its index: scene_frame_ranges() drops
@@ -265,8 +403,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
     # that begin past the last decoded frame, and those get dropped).
     splits = {}
     split_scene_of = {}
-    for scene_idx, centres in split_layout.detect_split_scenes(
-            input_video, scenes, strategies).items():
+    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+        input_video, scenes, strategies)
+    for scene_idx, centres in detected_splits.items():
         strategies[scene_idx] = 'SPLIT'
         start_f = scene_boundaries[scene_idx][0]
         splits[start_f] = centres
@@ -372,6 +511,14 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
         xs[start_f:end_f] = active_speaker.speaker_xs(
             held, centres, crop_w, orig_w, end_f - start_f, fps)
 
+    # Last word on the trajectory: a scene the user framed by hand beats every
+    # automatic verdict above, including the ALTERNATE writes.
+    if crop_overrides:
+        xs, strategies = apply_crop_overrides(
+            xs, strategies, scene_boundaries, crop_overrides, crop_w,
+            orig_w, orig_h=orig_h, splits=splits)
+        print(f"   ✋ Manual framing on {len(crop_overrides)} scene(s)")
+
     ranges = scene_frame_ranges(scene_boundaries, strategies, len(xs))
     if not ranges:
         raise RuntimeError("no usable scene ranges")
@@ -398,7 +545,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
                 graph = split_layout.split_filtergraph(
                     orig_w, orig_h, out_w, out_h, left, right)
             elif strategy == 'GENERAL':
-                graph = general_filtergraph(out_w, out_h)
+                graph = general_filtergraph(out_w, out_h,
+                                            orig_w=orig_w, orig_h=orig_h)
             else:
                 seg_xs = [x if x is not None else 0 for x in xs[start_f:end_f]]
                 cmd_path = os.path.join(workdir, f"cmd_{idx:03d}.txt")
@@ -412,11 +560,17 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
                     init = f"w={first[0]}:h={first[1]}:x={first[2]}:y={first[3]}"
                 else:
                     lines = dedupe_sendcmd_lines(seg_xs, fps)
-                    init = f"w={crop_w}:h={crop_h}:x={seg_xs[0]}:y=0"
+                    # sendcmd only ever moves x, so y is whatever it starts as.
+                    # crop_h equals the source height on any landscape input,
+                    # making this 0; it only bites on a source TALLER than the
+                    # target, where y=0 threw away the bottom of the frame
+                    # instead of trimming both ends.
+                    crop_y = max(0, (orig_h - crop_h) // 2)
+                    init = f"w={crop_w}:h={crop_h}:x={seg_xs[0]}:y={crop_y}"
                 with open(cmd_path, "w") as f:
                     f.write("\n".join(lines) + "\n")
                 graph = (
-                    f"[0:v]sendcmd=f='{cmd_path}',"
+                    f"[0:v]sendcmd=f='{escape_filter_value(cmd_path)}',"
                     f"crop@c={init},"
                     f"scale={out_w}:{out_h},setsar=1[v]"
                 )
@@ -451,5 +605,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None):
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
 
+    # Tell the caption pass which stretches are stacked (see layout_ranges).
+    layout_ranges.write(final_output_video,
+                        [(s / fps, e / fps, strategy) for s, e, strategy in ranges])
     print(f"   ✅ Clip saved to {final_output_video}")
     return True

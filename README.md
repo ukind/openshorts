@@ -9,6 +9,10 @@
 
 **Open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
 
+![Your podcast, and the vertical clip OpenShorts makes of it: both speakers stacked, captions on the seam](screenshots/split-before-after.gif)
+
+Two people on camera? OpenShorts stacks them instead of shrinking the wide shot, puts the captions on the seam where they cover nobody, and switches back to a face-tracked crop when the cut goes to one person. The AI picks the layout per video; nothing to configure.
+
 **Two ways to run it, same software either way:**
 
 |  | Self-hosted (this repo) | Hosted on [openshorts.app](https://www.openshorts.app/) |
@@ -77,8 +81,9 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 ## Key Features
 
 ### Clip Generator
-- **Viral Moment Detection**: Google Gemini 3.0 Flash analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
-- **Smart 9:16 Cropping**: Dual-mode AI reframing — TRACK mode (MediaPipe + YOLOv8 face tracking) and GENERAL mode (blurred background)
+- **Viral Moment Detection**: Google Gemini 3.1 Flash-Lite analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
+- **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
+- **Smart 9:16 Cropping**: AI reframing per scene — TRACK mode (MediaPipe + YOLOv8 face tracking), GENERAL mode (blurred background), SPLIT mode (two speakers stacked, captions on the seam) and SCREENCAST mode (screen over presenter); the layout is picked per video by Gemini or forced from the dashboard
 - **Auto Subtitles**: faster-whisper with word-level timestamps, styled and burned into clips
 - **AI Voice Dubbing**: ElevenLabs integration for 30+ languages with voice cloning
 - **Hook Text Overlays**: AI-generated attention-grabbing text overlays
@@ -159,6 +164,7 @@ Videos generated with OpenShorts AI Shorts — no camera, no studio, no actors:
 | **Social auto-publishing** | Yes | Pro only | TikTok only | Paid only | Paid only | No |
 | **Schedule uploads** | Yes | Pro only | No | Paid only | Paid only | No |
 | **Data privacy** | **Your server** | Their cloud | Their cloud | Their cloud | Their cloud | Their cloud |
+| **Works with a local LLM (Ollama)** | **Yes** | No | No | No | No | No |
 
 ---
 
@@ -169,6 +175,7 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 | Service | Free Tier | Paid Cost | Used For |
 |---------|-----------|-----------|----------|
 | **Google Gemini** | Free trial with generous limits | < $0.01 per 10-min video | Viral moment detection, script generation, web research |
+| **Local LLM (Ollama, LM Studio, vLLM...)** | **Free, your hardware** | $0 | Viral moment detection instead of Gemini (`LLM_BASE_URL`) |
 | **fal.ai** | Pay-per-use | ~$0.50-1.50 per AI Short | Actor generation, talking head video, lip-sync |
 | **ElevenLabs** | Free tier available | Pay-per-use | Voiceover, voice dubbing |
 | **Upload-Post** | **10 free uploads/month** to all networks (no credit card) | Pay-per-use | Auto-publishing to TikTok, Instagram, YouTube |
@@ -209,7 +216,7 @@ HuggingFace cache. Without the package, the VoiceOver page simply offers ElevenL
 
 ### 1. Clone
 ```bash
-git clone https://github.com/your-username/OpenShorts.git
+git clone https://github.com/mutonby/openshorts.git
 cd OpenShorts
 ```
 
@@ -233,7 +240,82 @@ Navigate to **`http://localhost:5175`**
 4. **YouTube Studio**: Generate thumbnails, titles, and descriptions for YouTube
 5. **UGC Gallery**: Browse all generated videos and avatars
 
+### 5. GPU acceleration (optional, NVIDIA)
+
+The default image is CPU-only. With an NVIDIA card (any card with NVENC, e.g. RTX 4060) an 8-minute video clips in about a minute instead of 5 to 8. Nothing is passed through in the VM sense — the container just gets access to the host GPU.
+
+**Host:** install the NVIDIA driver (`nvidia-smi` must work) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi   # sanity check
+```
+On Windows use Docker Desktop with the WSL2 backend and the Windows NVIDIA driver; no driver inside WSL.
+
+**Compose:** create `docker-compose.override.yml` next to `docker-compose.yml` (picked up automatically). `GPU: "1"` adds cuBLAS/cuDNN and onnxruntime-gpu to the image (~2 GB); `video` is required for NVENC.
+```yaml
+services:
+  backend:
+    build:
+      context: .
+      args:
+        GPU: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+```
+
+**`.env`:**
+```
+WHISPER_MODEL=large-v3-turbo
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE=float16
+FFMPEG_ENCODER=auto           # probes h264_nvenc at startup, falls back to x264
+TRANSCRIBE_BACKEND=parakeet   # optional: ~2x faster than whisper, 25 European languages, auto-falls back to whisper
+ASR_GPU_CONCURRENCY=1
+```
+
+**Verify:**
+```bash
+docker compose up --build -d
+docker exec openshorts-backend nvidia-smi -L
+docker exec openshorts-backend ffmpeg -hide_banner -f lavfi -i testsrc=size=256x256:rate=1 -frames:v 1 -c:v h264_nvenc -f null -
+```
+The backend log on the first job reports the chosen encoder and transcription device. A CUDA error in whisper (e.g. VRAM exhausted) retries once on CPU automatically. 8 GB of VRAM is enough for `large-v3-turbo` fp16 plus the detection models.
+
 ---
+
+### 6. Run without a Google key (local LLM, optional)
+
+The only cloud call in the clip pipeline is the moment picker: it sends the
+transcript (never the video) to Gemini. Point it at any OpenAI-compatible
+server instead and the whole pipeline stays on your box:
+
+```bash
+# .env
+LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
+LLM_MODEL=qwen2.5:14b                                # any chat model that follows instructions
+# LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
+```
+
+Works with Ollama, LM Studio, vLLM, llama.cpp server, LocalAI and OpenRouter.
+The dashboard stops asking for a Gemini key when this is set. Two things to
+know:
+
+- **Context length.** A scoring call carries three transcript windows
+  (~2-3k tokens) and the detail call up to ten (~5k on a long podcast).
+  Ollama defaults to a 4096-token context and truncates silently, so run it
+  with `OLLAMA_CONTEXT_LENGTH=16384` (or set `num_ctx` in a Modelfile); raise
+  `LLM_SCORE_BATCH` above 3 only if your context allows it. 7-8B models
+  return valid JSON reliably, 3B ones do not.
+- **What still needs Gemini.** Anything that has to look at frames: the
+  automatic layout picker (`AUTO_LAYOUT`), the on-screen content detector
+  and silent videos (no speech to clip by). Without a Gemini key those fall
+  back to the plain face-tracking crop, and a silent video fails with a
+  message that says so. Add a key alongside `LLM_BASE_URL` and you get both.
 
 ## Technical Pipeline
 
@@ -268,8 +350,10 @@ You don't need the dashboard. The whole pipeline is callable by AI agents and sc
 
 OpenShorts ships a built-in [MCP](https://modelcontextprotocol.io) server, so Claude, ChatGPT, Cursor or any MCP client can clip and publish videos for you:
 
+**claude.ai and ChatGPT**: paste `https://mcp.openshorts.app/mcp` as a custom connector (Settings → Connectors) and approve the access on openshorts.app. The server does OAuth 2.1 with dynamic client registration, so there is no key to copy; the connection shows up under Account → API keys, where revoking it disconnects the app.
+
 ```bash
-# Hosted (create an API key in your account page at openshorts.app):
+# Claude Code / Cursor / n8n (hosted): create an API key in your account page
 claude mcp add --transport http openshorts https://mcp.openshorts.app/mcp \
   --header "Authorization: Bearer osk_..."
 
@@ -277,7 +361,7 @@ claude mcp add --transport http openshorts https://mcp.openshorts.app/mcp \
 claude mcp add --transport http openshorts http://localhost:8000/mcp
 ```
 
-Tools: `process_video`, `get_job_status`, `list_clips`, `get_quota`, `add_subtitles`, `publish_clip`. A prompt like *"clip this podcast and schedule the best 3 to TikTok"* is now a one-liner in your agent of choice.
+Tools: `process_video` (URL or `upload_id`; `captions: false` when the source already has subtitles, `auto_hook: false` to skip the hook line, burned by default like the dashboard), `create_upload` (hand the agent a local file: PUT the bytes, then process), `get_job_status`, `list_clips`, `get_quota`, `add_subtitles`, `recut_clip`, `publish_clip`. A prompt like *"clip this podcast and schedule the best 3 to TikTok"* is now a one-liner in your agent of choice.
 
 ### REST API + API keys
 
@@ -365,11 +449,15 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `AWS_S3_BUCKET` | Private bucket for clip backup |
 | `AWS_S3_PUBLIC_BUCKET` | Public bucket for gallery/avatars |
 | `MAX_CONCURRENT_JOBS` | Concurrent processing limit (default: 5) |
+| `LLM_BASE_URL` | OpenAI-compatible server for the moment picker (Ollama, vLLM, LM Studio...). Set it and the Gemini key becomes optional |
+| `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
+| `LLM_API_KEY` | Bearer token for that server, if it checks one |
+| `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |
 |-----|------------|
-| `GEMINI_API_KEY` | Google Gemini — required |
+| `GEMINI_API_KEY` | Google Gemini — required unless `LLM_BASE_URL` is set (then only for layout picking and silent videos) |
 | `FAL_KEY` | fal.ai — required for AI Shorts |
 | `ELEVENLABS_API_KEY` | ElevenLabs — required for voiceover/dubbing |
 | `UPLOAD_POST_API_KEY` | Upload-Post — required, for social posting |

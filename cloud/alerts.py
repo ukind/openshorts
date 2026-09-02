@@ -3,6 +3,8 @@
 Tracks recent managed-job outcomes in memory and emails ADMIN_EMAIL (via Resend)
 when something looks broken, with a per-alert cooldown so it never spams.
 """
+import asyncio
+import os
 import time
 from collections import deque
 
@@ -56,6 +58,10 @@ def _classify_failure(err: str) -> str:
     # not actionable on our side. Named so the alert doesn't read as an outage.
     if "prohibited_content" in e or "blocked this video" in e or "blocked its answer" in e:
         return "blocked content (user video)"
+    # The source held nothing clip-shaped (typically an already-short video) —
+    # content-shaped like the policy block above, not an outage.
+    if "did not return usable clips" in e or "clip detection failed" in e:
+        return "no clips found (user video)"
     if "gemini" in e or "google.genai" in e:
         return "gemini"
     if "ffmpeg" in e or "reframe" in e:
@@ -121,14 +127,22 @@ async def record_job_outcome(ok: bool, error_text: str = ""):
     if ok:
         return
 
-    # 1) Proxy / credits problem — most urgent, alert immediately.
-    if _looks_like_proxy_error(error_text) and _cooldown_ok("proxy"):
-        await send_admin_alert(
-            "⚠️ Proxy error — may be out of credits",
-            "A managed job failed with a proxy-related error. Check your proxy "
-            "balance — downloads will keep failing until it's topped up.\n\n"
-            f"Error:\n{error_text[:1200]}",
-        )
+    # 1) Proxy / credits problem — most urgent, alert immediately AND open the
+    # incident so the proxy watcher keeps nagging until the balance is back
+    # (one alert at 3am is easy to miss; an exhausted proxy takes all
+    # YouTube-URL ingest down until someone tops it up).
+    if _looks_like_proxy_error(error_text):
+        if not _watch_down.get(_PAID_TARGET):
+            _watch_down[_PAID_TARGET] = time.time()
+            _watch_nag[_PAID_TARGET] = time.time()
+        if _cooldown_ok("proxy"):
+            await send_admin_alert(
+                "🔴 Proxy error — may be out of credits",
+                "A managed job failed with a proxy-related error. Check your proxy "
+                "balance — downloads will keep failing until it's topped up.\n"
+                "This repeats every 2 h until the proxy answers again.\n\n"
+                f"Error:\n{error_text[:1200]}",
+            )
         return
 
     # 2) High failure rate — report it honestly and classify the last error
@@ -142,3 +156,167 @@ async def record_job_outcome(ok: bool, error_text: str = ""):
             f"{fails} of the last {len(recent)} managed jobs failed.\n\n"
             f"Last error:\n{error_text[:1200]}",
         )
+
+
+# --- Proxy watcher --------------------------------------------------------------
+# A dead download route takes YouTube-URL ingest down (or silently moves it to
+# per-GB billing), and a single alert at the moment it dies is easy to miss.
+# The watcher probes every configured route on a schedule, keeps nagging on
+# Telegram until it's fixed, and confirms recovery (incident of 19-aug-2026:
+# DataImpulse 407 TRAFFIC_EXHAUSTED, found by accident hours later).
+#
+# Watched targets:
+# - "static proxy pool" (STATIC_PROXY_URLS): flat-rate ISP IPs, the primary
+#   route. Ingest still works when they die (paid fallback) but every GB
+#   starts costing money — that's worth a nag of its own.
+# - "paid proxy" (PROXY_URL): the per-GB last resort; dead = ingest at risk.
+_PROXY_PROBE_INTERVAL = 1800        # seconds between probes (30 min)
+_PROXY_RENOTIFY = 7200              # keep nagging every 2 h while it stays down
+# 204-No-Content endpoint: the probe costs a handful of bytes of paid traffic.
+# Plain HTTP on purpose: HTTPS through DataImpulse fails in httpx with an SSL
+# record-layer error even when the proxy is healthy (yt-dlp's stack is fine
+# with it), which would make an HTTPS probe cry wolf. An exhausted balance
+# rejects the request before forwarding, so HTTP still detects the 407.
+_PROXY_PROBE_URL = "http://www.google.com/generate_204"
+# The static pool gets probed against YouTube itself, not google.com: on
+# 28-aug-2026 YouTube refused the static IPs for hours ("Video unavailable" /
+# bot-check) while google.com kept answering 204, so the watcher said UP and
+# every job silently moved to the per-GB proxy ($14 that day). A healthy
+# static must return the watch page with a playable player response; bytes
+# through the statics are flat-rate, so the ~600 KB page is free.
+_STATIC_PROBE_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+_STATIC_OK_MARKERS = ('"playabilityStatus"', '"status":"OK"')
+_PROXY_STRIKES = 2                  # consecutive failed probes before alerting
+_watch_down = {}                    # target name -> down-since epoch
+_watch_nag = {}                     # target name -> last-nag epoch
+_watch_strikes = {}                 # target name -> consecutive failed probes
+
+_PAID_TARGET = "paid proxy"
+_STATIC_TARGET = "static proxy pool"
+
+
+def _watch_targets():
+    """[(name, [proxy urls])] — a target is up if ANY of its urls answers."""
+    targets = []
+    statics = [p.strip() for p in
+               os.environ.get("STATIC_PROXY_URLS", "").split(",") if p.strip()]
+    if statics:
+        targets.append((_STATIC_TARGET, statics))
+    paid = os.environ.get("PROXY_URL", "").strip()
+    if paid:
+        targets.append((_PAID_TARGET, [paid]))
+    return targets
+
+
+async def _probe_one(proxy):
+    """(ok, detail) for one request through one proxy.
+
+    The paid proxy keeps the plain-HTTP 204 probe (HTTPS through DataImpulse
+    breaks in httpx even when healthy). A static IP is probed against a real
+    YouTube watch page: answering is not enough, the page must carry a
+    playable player response, or the IP is flagged and every download is
+    about to fall through to per-GB billing.
+    """
+    is_paid = proxy == os.environ.get("PROXY_URL", "").strip()
+    try:
+        import httpx
+        async with httpx.AsyncClient(proxy=proxy, timeout=20) as client:
+            resp = await client.get(_PROXY_PROBE_URL if is_paid else _STATIC_PROBE_URL,
+                                    follow_redirects=not is_paid)
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}"
+        if is_paid:
+            return True, ""
+        body = resp.text or ""
+        if all(m in body for m in _STATIC_OK_MARKERS):
+            return True, ""
+        return False, ("YouTube answered but without a playable page "
+                       "(IP flagged: bot-check or 'unavailable')")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _watch_severity(name):
+    """(emoji, headline, impact) for a route being down, judged by what is
+    actually affected. A dead fallback while the primary answers is a lost
+    safety net, not an outage: the first version of this alert said "jobs
+    will keep failing" for that case and read as the platform being down
+    (27-aug-2026, a single ReadTimeout on the paid proxy)."""
+    static_down = bool(_watch_down.get(_STATIC_TARGET))
+    paid_down = bool(_watch_down.get(_PAID_TARGET))
+    other_configured = len(_watch_targets()) > 1
+    if not other_configured:
+        return "🔴", f"{name} DOWN", "It is the only YouTube route: YouTube-URL jobs are failing until it is fixed."
+    if static_down and paid_down:
+        return "🔴", "ALL YouTube proxies DOWN", "Static pool and paid proxy both fail: YouTube-URL jobs are failing. Direct file URLs are unaffected."
+    if name == _STATIC_TARGET:
+        return "🟠", "static proxy pool down, running on the paid proxy", ("YouTube jobs still work through the PER-GB paid proxy, so every download costs money until the statics are back.")
+    return "ℹ️", "paid proxy (fallback) not answering", ("No impact right now: the static pool is UP and carries all YouTube jobs. You only lose the safety net if the statics fail too.")
+
+
+async def _watch_update(name, ok, detail):
+    """Shared incident state machine: alert on down, nag, confirm recovery.
+
+    A route has to fail ``_PROXY_STRIKES`` probes in a row (30 min apart)
+    before anyone is paged: one ReadTimeout on a per-GB proxy is routine."""
+    now = time.time()
+    if ok:
+        _watch_strikes[name] = 0
+        if _watch_down.get(name):
+            mins = int((now - _watch_down[name]) / 60)
+            await send_admin_alert(
+                f"✅ {name} recovered",
+                f"The {name} answers again after ~{mins} min down.",
+            )
+            _watch_down[name] = None
+            _watch_nag[name] = 0.0
+        return
+    _watch_strikes[name] = _watch_strikes.get(name, 0) + 1
+    if not _watch_down.get(name):
+        if _watch_strikes[name] < _PROXY_STRIKES:
+            return  # one miss: wait for the next probe before saying anything
+        _watch_down[name] = now
+        _watch_nag[name] = now
+        icon, headline, impact = _watch_severity(name)
+        await send_admin_alert(
+            f"{icon} {headline}",
+            f"{impact}\n\nThe {name} failed {_PROXY_STRIKES} probes in a row "
+            f"({_PROXY_PROBE_INTERVAL // 60} min apart). This repeats every 2 h "
+            f"until it answers again.\n\nProbe error: {detail[:400]}",
+        )
+    elif now - _watch_nag[name] >= _PROXY_RENOTIFY:
+        _watch_nag[name] = now
+        hours = (now - _watch_down[name]) / 3600
+        icon, headline, impact = _watch_severity(name)
+        await send_admin_alert(
+            f"{icon} {headline} ({hours:.1f} h)",
+            f"{impact}\n\nProbe error: {detail[:400]}",
+        )
+
+
+async def proxy_watch_tick():
+    """One probe cycle over every configured route."""
+    # Paid-proxy events held back by the ledger's cooldown go out with the
+    # next tick at the latest (cloud/proxy_ledger.flush_alerts).
+    try:
+        from . import proxy_ledger
+        await proxy_ledger.flush_alerts()
+    except Exception:
+        pass
+    for name, urls in _watch_targets():
+        ok, detail = False, "no urls"
+        for u in urls:
+            ok, detail = await _probe_one(u)
+            if ok:
+                break
+        await _watch_update(name, ok, detail)
+
+
+async def proxy_watch_loop():
+    """Background task started from the app lifespan (managed mode only)."""
+    while True:
+        try:
+            await proxy_watch_tick()
+        except Exception as e:
+            print(f"⚠️  Proxy watch error: {e}")
+        await asyncio.sleep(_PROXY_PROBE_INTERVAL)

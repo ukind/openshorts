@@ -84,6 +84,55 @@ METADATA_SCRUB = ["-map_metadata", "-1", "-map_chapters", "-1",
 LOUDNORM_FILTER = "loudnorm=I=-14:TP=-2.0:LRA=11"
 
 
+# AI Act art. 50(2): a provider whose system generates synthetic audio or video
+# has to mark the output in a machine-readable way. The regulation asks for the
+# marking, not for a particular standard, and the cheap one that survives every
+# player and every upload is a container tag: `ffprobe -show_format` reads it
+# back, and TikTok/Reels/YouTube ignore it. Stamped by a stream copy, so it is
+# a remux (no quality loss, ~0.2 s) and never a re-encode.
+#
+# Deliberately narrow: it goes on outputs where a machine actually synthesised
+# voice or a person (dubbing, AI actors), not on an ordinary clip, whose audio
+# and pixels are the user's own footage. Marking everything would make the tag
+# mean nothing.
+AI_DISCLOSURE = "AI-generated content produced with OpenShorts (openshorts.app)"
+
+
+def mark_ai_generated(path, detail=""):
+    """Stamp AI Act art. 50(2) machine-readable tags on a finished file.
+
+    Returns True when the file now carries the tags. Never raises: a missing
+    tag must not lose the user the video they just paid minutes for.
+    """
+    note = f"{AI_DISCLOSURE}: {detail}" if detail else AI_DISCLOSURE
+    tmp = f"{path}.aitag.mp4"
+    # `comment` and not a custom `ai_generated` key: mp4 only carries the
+    # standard iTunes-style tags, and ffmpeg drops anything else without
+    # warning (verified with ffprobe -show_entries format_tags).
+    # -map 0 because ffmpeg's default picks one stream per type: a dubbed file
+    # that ever ships two audio tracks would come back with one.
+    cmd = ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy",
+           "-metadata", f"comment={note}",
+           "-movflags", "+faststart", tmp]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            print(f"[ai-tag] skipped for {os.path.basename(path)}: {r.stderr[-300:]}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return False
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"[ai-tag] skipped for {os.path.basename(path)}: {e}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
 def audio_encode_args():
     """AAC encode args for a delivered clip, with loudness normalisation."""
     args = ["-c:a", "aac"]
@@ -154,3 +203,23 @@ def video_encode_args(tier=QUALITY):
               f"(FFMPEG_ENCODER={mode})")
 
     return list((_NVENC_ARGS if use_nvenc else _X264_ARGS)[tier])
+
+
+def escape_filter_value(value):
+    r"""Escape a path/value for use inside a quoted FFmpeg filter argument.
+
+    Windows absolute paths are why this exists: ``:`` separates filter options,
+    so an interpolated ``C:/x/y.txt`` makes the parser look for an option named
+    ``/x/y.txt`` and the whole filtergraph fails to build.
+
+    NOTE: an apostrophe in the path cannot be made safe here. ffmpeg's
+    filtergraph parser is not a shell -- the shell idiom ``'\''`` was tried on
+    29-jul-2026 and is worse than doing nothing: it drops the apostrophe AND
+    swallows the following option, so ``ass='...Earth'\''s.ass':fontsdir='...'``
+    resolved to a filename of "...Earths.ass:fontsdir=..." and failed to open.
+
+    The only reliable answer is to keep apostrophes OUT of any path that is
+    interpolated into a filter. Callers generate their own filenames, so they
+    control this: use a neutral name, never one derived from a video title.
+    """
+    return value.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")

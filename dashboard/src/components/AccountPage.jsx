@@ -4,6 +4,10 @@ import { useAuth } from '../contexts/AuthContext';
 import { apiJson } from '../lib/api';
 import { track } from '../lib/analytics';
 import ApiKeysCard from './ApiKeysCard';
+import McpConnectCard from './McpConnectCard';
+import DeleteAccountCard from './DeleteAccountCard';
+import SocialAnalyticsCard from './SocialAnalyticsCard';
+import InvoicesCard from './InvoicesCard';
 
 const fmt1 = (n) => Math.round((n || 0) * 10) / 10;
 
@@ -181,6 +185,11 @@ export default function AccountPage() {
         </div>
       </div>
 
+      {/* Only accounts that ever had a Stripe relationship can have invoices. */}
+      {me.has_billing_account && <InvoicesCard />}
+
+      <SocialAnalyticsCard />
+
       {topups.length > 0 && (
         <div className="card p-6">
           <h3 className="font-display lowercase text-lg text-ink mb-1 flex items-center gap-2"><Plus size={16} className="text-brass" /> Buy more minutes</h3>
@@ -199,7 +208,11 @@ export default function AccountPage() {
         </div>
       )}
 
+      <McpConnectCard cloud />
+
       <ApiKeysCard />
+
+      <DeleteAccountCard />
     </div>
   );
 }
