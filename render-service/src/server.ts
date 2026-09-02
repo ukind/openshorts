@@ -41,13 +41,23 @@ const renderRequestSchema = z.object({
 // --- Express app ---
 
 const app = express();
+// CORS for Remotion headless Chrome fetching /output from different origin
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Range, Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const OUTPUT_DIR = process.env.OUTPUT_DIR || "/output";
 
 // Serve video files from the shared output volume so Remotion can access them via HTTP
-app.use("/output", express.static(OUTPUT_DIR));
+app.use("/output", express.static(OUTPUT_DIR, {
+  setHeaders(res) { res.setHeader("Access-Control-Allow-Origin", "*"); },
+}));
 
 // Health check
 app.get("/health", (_req, res) => {

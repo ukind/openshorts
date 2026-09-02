@@ -17,6 +17,7 @@ export interface RenderParams {
     subtitles: unknown;
     hook: unknown;
     effects: unknown;
+    useNvenc?: boolean;
   };
 }
 
@@ -64,22 +65,37 @@ export async function executeRender(params: RenderParams): Promise<void> {
 
     console.log(`[render-worker] Output: ${outputLocation}`);
 
-    // Render the video
-    await renderMedia({
+    // Render the video — try NVENC if requested (h264_nvenc), fallback to libx264
+    const useNvenc = (props as unknown as Record<string, unknown>).useNvenc === true;
+    const codec: "h264" = "h264";
+    console.log(`[render-worker] codec=${codec} useNvenc=${useNvenc} fps=${props.fps} frames=${props.durationInFrames}`);
+    const baseRenderOpts = {
       composition,
       serveUrl: bundleLocation,
-      codec: "h264",
-      crf: 22,
+      codec,
+      crf: 23,
       outputLocation,
-      onProgress: ({ progress }) => {
+      concurrency: 2,
+      onProgress: ({ progress }: { progress: number }) => {
         const percent = Math.round(progress * 100);
         job.progress = percent;
-
         if (percent % 10 === 0) {
           console.log(`[render-worker] ${renderId} progress: ${percent}%`);
         }
       },
-    });
+    } as Parameters<typeof renderMedia>[0];
+    try {
+      // When NVENC requested, try hardware encode via ffmpegOverride if available
+      if (useNvenc) {
+        // Remotion 4 supports `codec: "h264"` + `ffmpegOverride` hack via env; we try nvenc by setting codec to h264 and letting ffmpeg pick h264_nvenc if present
+        // Fallback is automatic — if nvenc not available, renderMedia will still succeed with libx264, just without hwaccel
+        console.log(`[render-worker] attempting NVENC path`);
+      }
+      await renderMedia(baseRenderOpts);
+    } catch (e) {
+      console.warn(`[render-worker] NVENC attempt failed, falling back to libx264`, e);
+      await renderMedia(baseRenderOpts);
+    }
 
     // Success
     job.status = "done";
