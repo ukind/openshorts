@@ -281,7 +281,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         setIsEditing(true);
         setEditError(null);
         try {
-            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            // Was: const apiKey = geminiApiKey || a dead localStorage fallback (the
+            // legacy plaintext key). App.jsx always passes geminiApiKey, and the
+            // geminiKey_v1 migration removes the key that fallback used to find.
+            const apiKey = geminiApiKey;
 
             // Managed (paid) users get the Gemini key resolved server-side;
             // only BYOK/self-host needs a local key.

@@ -26,6 +26,9 @@ import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 import { track } from './lib/panel';
+// The header-builder export lands in Phase 4 (handleProcess), its first
+// consumer — importing it here fails lint (no-unused-vars) in phase isolation.
+import { llmConfigComplete } from './lib/llm';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -197,7 +200,9 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
-  // Cloud auth/billing session (inert when billing is disabled).
+  // useAuth LLM fields are deferred to Phase 3 — first consumed there as
+  // LlmProviderCard props; destructuring them here fails lint (no-unused-vars)
+  // in phase isolation.
   const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
@@ -208,7 +213,29 @@ function App() {
   // the ephemeral local /videos/ files have been cleaned up (e.g. after a reload).
   const [durableClips, setDurableClips] = useState({});
 
-  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  // --- apiKey initializer — legacy plaintext → geminiKey_v1 ----------------------
+  // One-way migration, once per browser (Migration Notes). The blob stores
+  // JSON ({key: ...}), not the bare key: decrypt never throws, and under a
+  // rotated VITE_ENCRYPTION_KEY a bare blob decrypts to valid-base64 garbage
+  // that re-encrypts byte-identically (XOR involution) — but garbage never
+  // survives JSON.parse. The JSON shape is the rotation guard (D12).
+  const [apiKey, setApiKey] = useState(() => {
+    let value = '';
+    try {
+      const stored = localStorage.getItem('geminiKey_v1');
+      if (stored) {
+        const parsed = JSON.parse(decrypt(stored));
+        if (parsed && typeof parsed === 'object' && typeof parsed.key === 'string') {
+          value = parsed.key;
+        }
+      }
+      if (!value) value = localStorage.getItem('gemini_key') || '';
+    } catch (_) { /* unreadable storage or rotated-key garbage — start empty */ }
+    // The plaintext key is gone after this line, adopted or not. The
+    // persistence effect below writes the encrypted JSON form on this mount.
+    try { localStorage.removeItem('gemini_key'); } catch (_) { /* ignore */ }
+    return value;
+  });
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -227,6 +254,29 @@ function App() {
     const stored = localStorage.getItem('falKey_v1');
     if (stored) return decrypt(stored);
     return '';
+  });
+  // --- llmConfig state — after the falKey initializer -----------------------------
+  // One encrypted JSON blob, not three keys: one localStorage read, one write.
+  // The JSON parse is the corruption guard — every bad path (bad base64,
+  // key-rotated garbage, non-JSON, wrong shape) lands in the catch and starts
+  // from the empty triple. Nothing here blocks the app from booting.
+  // The setter lands in Phase 3 (the card's Save is its only writer); this
+  // phase reads and persists the value only.
+  const [llmConfig] = useState(() => {
+    try {
+      const stored = localStorage.getItem('llmConfig_v1');
+      if (stored) {
+        const parsed = JSON.parse(decrypt(stored));
+        if (parsed && typeof parsed === 'object') {
+          return {
+            baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
+            apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+            model: typeof parsed.model === 'string' ? parsed.model : '',
+          };
+        }
+      }
+    } catch (_) { /* corrupt or key-rotated blob — start empty */ }
+    return { baseUrl: '', apiKey: '', model: '' };
   });
 
   const [uploadUserId, setUploadUserId] = useState(() => localStorage.getItem('uploadUserId') || '');
@@ -568,11 +618,22 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, status, results, activeTab, noSource, projectState]);
 
+  // --- apiKey persistence — encrypted JSON like the other keys --------------------
   useEffect(() => {
-    // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
-    // For now keeping gemini plain for compatibility unless requested.
-    if (apiKey) localStorage.setItem('gemini_key', apiKey);
+    if (apiKey) {
+      try { localStorage.setItem('geminiKey_v1', encrypt(JSON.stringify({ key: apiKey }))); } catch (_) { /* ignore */ }
+    }
   }, [apiKey]);
+
+  // --- llmConfig persistence — same effect shape as the other keys (D8) -----------
+  // Guarded like the sibling keys: only a complete triple is persisted, so
+  // deleting the blob (and saving nothing after) restores the pre-feature
+  // state. Half-configured values live in memory only (D2).
+  useEffect(() => {
+    if (llmConfigComplete(llmConfig)) {
+      try { localStorage.setItem('llmConfig_v1', encrypt(JSON.stringify(llmConfig))); } catch (_) { /* ignore */ }
+    }
+  }, [llmConfig]);
 
   useEffect(() => {
     if (uploadPostKey) {

@@ -98,19 +98,35 @@ export function AuthProvider({ children }) {
     return true;
   }, [refreshMe]);
 
+  // --- config fetch with retry (D11) — replaces the one-shot mount fetch -----------
+  // A single bare fetch left config at its 2-key init forever on any transient
+  // failure — llmConfigured would stay false on a fully env-configured server
+  // and the banner would fire permanently. Three attempts, 500ms then 1s
+  // backoff; the happy path is still one fetch, once per mount.
+  const fetchConfig = useCallback(async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch(getApiUrl('/api/config'));
+        if (res.ok) return await res.json();
+      } catch (_) { /* network error — retry */ }
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+    return null; // stay on the init defaults (BYOK, no LLM fields)
+  }, []);
+
   useEffect(() => {
     (async () => {
-      try {
-        const cfg = await (await fetch(getApiUrl('/api/config'))).json();
+      const cfg = await fetchConfig();
+      if (cfg) {
         setConfig(cfg);
         if (cfg.billingEnabled) {
           const handled = await handleAuthHash();
           if (!handled) await refreshMe();
         }
-      } catch (_) { /* config fetch failed — stay in BYOK */ }
+      }
       setLoading(false);
     })();
-  }, [handleAuthHash, refreshMe]);
+  }, [fetchConfig, handleAuthHash, refreshMe]);
 
   const requestMagicLink = useCallback(async (email) => {
     const res = await apiFetch('/api/auth/magic-link', {
@@ -132,10 +148,18 @@ export function AuthProvider({ children }) {
     setMe(null);
   }, []);
 
+  // --- /api/config LLM fields (D3): consts before the `value` object --------------
+  const llmConfigured = !!config.llmConfigured;
+  const llmModel = config.llmModel || null;
+  const llmBaseUrl = config.llmBaseUrl || null;
+
   const value = {
     billingEnabled: config.billingEnabled,
     googleAuthEnabled: config.googleAuthEnabled,
     jobRetentionSeconds: config.jobRetentionSeconds || null,
+    llmConfigured,
+    llmModel,
+    llmBaseUrl,
     loading,
     signingIn,
     user: me?.user || null,
