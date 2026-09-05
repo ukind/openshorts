@@ -128,6 +128,9 @@ _RF_REJECT_MARKERS = ("response_format", "response format", "json_schema",
                       "json mode", "json_object")
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+# An interactive "test connection" must fail fast: a black-holed URL on
+# _TIMEOUT would hold a browser tab for five minutes.
+_PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
 
 _clients = {}  # base_url -> httpx.Client; one per deployment in practice
                # ponytail: unbounded dict, fine while base_urls are operator-set
@@ -145,6 +148,18 @@ def _http_client(base_url: str) -> httpx.Client:
                            % (base_url, e))
         _clients[base_url] = client
     return client
+
+
+def _probe_client(base_url: str) -> httpx.Client:
+    """A throwaway client for probe(). Deliberately NOT the _clients cache:
+    probed URLs come from a user, and caching one per attempt would grow that
+    dict without bound."""
+    try:
+        return httpx.Client(base_url=base_url.rstrip("/"),
+                            timeout=_PROBE_TIMEOUT, follow_redirects=True)
+    except httpx.InvalidURL as e:
+        raise LlmError("LLM provider endpoint URL is malformed (%s): %s"
+                       % (base_url, e))
 
 
 def config_from(base_url, api_key, task: Optional[str] = None,
@@ -353,12 +368,11 @@ def _json_contract(schema) -> str:
             "markdown fences, no commentary:\n%s" % schema_json)
 
 
-def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
-         temperature=None, max_tokens=None,
-         json_mode: bool = False) -> Tuple[object, Optional[dict]]:
-    """One chat-completions call against the configured endpoint. See the
-    module docstring for the full contract. Never retries on its own except
-    the response_format ladder; transient retries belong to callers."""
+def _require_usable(config: LlmConfig) -> str:
+    """The base_url of a config that can actually be called, else LlmError.
+
+    Lifted verbatim out of chat()'s prologue so probe() cannot drift from it:
+    a green probe must mean the same config is callable for real work."""
     base_url = (config.base_url or "").strip()
     host = base_url.split("//", 1)[-1].split("/")[0] if "//" in base_url else ""
     if not base_url.startswith(("http://", "https://")) or not host:
@@ -371,6 +385,16 @@ def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
             "The third-party LLM endpoint is configured but no model is "
             "set. Set LLM_MODEL, or a per-task LLM_MODEL_THUMBNAIL / "
             "LLM_MODEL_SAAS.")
+    return base_url
+
+
+def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
+         temperature=None, max_tokens=None,
+         json_mode: bool = False) -> Tuple[object, Optional[dict]]:
+    """One chat-completions call against the configured endpoint. See the
+    module docstring for the full contract. Never retries on its own except
+    the response_format ladder; transient retries belong to callers."""
+    base_url = _require_usable(config)
 
     # A non-pydantic schema (main.py's pinned tests pass `object`) degrades
     # to text mode; every schema real callers pass is a pydantic model.
@@ -452,3 +476,23 @@ def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
         raise LlmTransientError(
             "LLM provider response failed schema validation (retryable): %s" % e)
     return obj.model_dump(), _cost_from_usage(usage, config.model)
+
+
+def probe(config: LlmConfig) -> None:
+    """One minimal live call, to verify an endpoint before a real job runs.
+
+    Reuses _post's status-to-error mapping, so a rejection, transient failure
+    or block surfaces the same message a real job would see. A green result
+    means the endpoint accepted the request; it does not validate the
+    response body (probe() skips _assistant_text, so a 200 with an error
+    body or empty content still passes)."""
+    base_url = _require_usable(config)
+    client = _probe_client(base_url)
+    try:
+        _post(client, {"Authorization": "Bearer " + config.api_key,
+                       "Content-Type": "application/json"},
+              {"model": config.model,
+               "messages": [{"role": "user", "content": "ping"}],
+               "max_tokens": 1})
+    finally:
+        client.close()

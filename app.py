@@ -1865,14 +1865,91 @@ async def health_ready():
         return JSONResponse({"status": "stopping"}, status_code=503)
     return {"status": "ready"}
 
+
+def _env_llm_config():
+    """The server's own LLM_* config, or None — what /api/config reports.
+
+    Asks by TASK, never with task=None: config_from resolves
+    LLM_MODEL_<TASK> or LLM_MODEL, so "thumbnail" alone already covers a
+    plain LLM_MODEL server, while a task=None probe on a server configured
+    only with LLM_MODEL_THUMBNAIL would trip llm_client's once-only
+    "the third-party backend stays inactive" warning on a perfectly healthy
+    setup. Reporting such a server as unconfigured would also make the
+    dashboard demand a key it does not need."""
+    if BILLING_ENABLED:
+        return None
+    try:
+        import llm_client
+    except Exception:
+        return None
+    for task in ("thumbnail", "saas"):
+        cfg = llm_client.active_config(task)
+        if cfg is not None:
+            return cfg
+    return None
+
+
 @app.get("/api/config")
 async def get_config():
+    llm_cfg = _env_llm_config()
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
+        # Never the key. LlmConfig marks api_key repr=False and the dashboard
+        # only needs to know that a backend exists and which one it is; this
+        # endpoint is served before auth.
+        "llmConfigured": llm_cfg is not None,
+        "llmModel": llm_cfg.model if llm_cfg else None,
+        "llmBaseUrl": llm_cfg.base_url if llm_cfg else None,
     }
+
+
+@app.post("/api/llm/test")
+async def llm_test(request: Request):
+    """Self-host only: one minimal live call against the resolved provider.
+
+    Resolves exactly like a real request — the BYOK header triple when both
+    base and key are present, else the server's LLM_* env — so a green result
+    means the next job talks to that same endpoint. Loops the known tasks
+    ("thumbnail", "saas") for the env fallback, matching _env_llm_config:
+    a server with only LLM_MODEL_THUMBNAIL must resolve. Shares the
+    metadata-probe limiter, keyed by client host because self-host has no
+    user model."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    _check_probe_rate(request.client.host if request.client else "anon")
+    cfg = None
+    for task in ("thumbnail", "saas"):
+        cfg = await resolve_llm(request, task=task)
+        if cfg is not None:
+            break
+    if cfg is None:
+        raise HTTPException(status_code=400, detail=LLM_ENDPOINT_HINT)
+    import llm_client
+    started = time.monotonic()
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, llm_client.probe, cfg)
+    except Exception as e:
+        # Belt-and-suspenders (D13): a provider's error body can echo the
+        # Authorization header verbatim. Strip the key from the detail.
+        detail = str(e)
+        if cfg.api_key and cfg.api_key in detail:
+            detail = detail.replace(cfg.api_key, "***")
+        # Status-code discrimination (D10): a validation error (malformed
+        # URL, missing model) does NOT start with "LLM provider" and is a
+        # 400 — the caller's config is wrong, not the upstream. Everything
+        # else (upstream rejection, transient, blocked) starts with the
+        # prefix and is a 502. Never 402: apiFetch's 402 branch fires before
+        # apiJson sees the body and would render an OpenShorts top-up prompt.
+        if isinstance(e, llm_client.LlmError) and not str(e).startswith("LLM provider"):
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
+    return {"ok": True, "model": cfg.model,
+            "latencyMs": int((time.monotonic() - started) * 1000)}
+
 
 async def _probe_youtube_quality(url: str) -> dict:
     """Run quality_probe.py in a worker thread; {} on any failure (fail-open)."""

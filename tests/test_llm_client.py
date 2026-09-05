@@ -807,6 +807,76 @@ def test_chat_json_mode_requests_json_object_rung(mock_llm):
     assert len(seen) == 2  # json_object -> bare
     assert seen[0]["response_format"] == {"type": "json_object"}
 
+# --- probe() (connection test) --------------------------------------------------
+# Monkeypatches _probe_client, mirroring how this file already stands in for
+# _http_client. No server, no network.
+# Add after the json_mode test and before the alert-class tests.
+
+def _probe_transport(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler),
+                        base_url="https://provider.test/v1")
+
+
+def test_probe_succeeds_on_a_healthy_endpoint(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return _ok()
+
+    monkeypatch.setattr(llm_client, "_probe_client",
+                        lambda base_url: _probe_transport(handler))
+    assert llm_client.probe(CFG) is None
+    assert seen["url"].endswith("/chat/completions")
+    assert seen["auth"] == "Bearer k"
+    assert seen["body"]["model"] == "test-model"
+    assert seen["body"]["max_tokens"] == 1
+
+
+def test_probe_maps_a_rejected_key_to_llm_error(monkeypatch):
+    monkeypatch.setattr(llm_client, "_probe_client",
+                        lambda base_url: _probe_transport(
+                            lambda r: _err(401, "invalid api key")))
+    with pytest.raises(llm_client.LlmError) as exc:
+        llm_client.probe(CFG)
+    assert "LLM provider" in str(exc.value)
+
+
+def test_probe_maps_a_5xx_to_transient(monkeypatch):
+    monkeypatch.setattr(llm_client, "_probe_client",
+                        lambda base_url: _probe_transport(
+                            lambda r: _err(503, "overloaded")))
+    with pytest.raises(llm_client.LlmTransientError):
+        llm_client.probe(CFG)
+
+
+def test_probe_never_populates_the_shared_client_cache(monkeypatch):
+    # _clients is unbounded and keyed by base_url; probed URLs are user-supplied.
+    monkeypatch.setattr(llm_client, "_probe_client",
+                        lambda base_url: _probe_transport(lambda r: _ok()))
+    before = dict(llm_client._clients)
+    llm_client.probe(CFG)
+    assert llm_client._clients == before
+
+
+def test_probe_rejects_a_malformed_url_and_a_missing_model():
+    with pytest.raises(llm_client.LlmError):
+        llm_client.probe(llm_client.LlmConfig(
+            base_url="provider.test", api_key="k", model="m"))
+    with pytest.raises(llm_client.LlmError):
+        llm_client.probe(llm_client.LlmConfig(
+            base_url="https://provider.test/v1", api_key="k", model=""))
+
+
+def test_require_usable_accepts_a_valid_config():
+    # chat()'s prologue was refactored to call _require_usable; both paths
+    # must accept the same valid configs.
+    base = llm_client._require_usable(CFG)
+    assert base == CFG.base_url
+
+
 # --- alert-class tests (slice 4): cloud/alerts._classify_failure ---------------
 def _alerts():
     return pytest.importorskip("cloud.alerts", reason="cloud deps not installed")
