@@ -2312,7 +2312,10 @@ async def process_endpoint(
     # probe above already gets this right.
     cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
+    # A provider-only user has no Gemini key (api_key is None); None in env
+    # kills the subprocess with "environment can only contain strings".
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key # Override with key from request
     if llm_cfg is not None:
         # Per-request provider override travels to the subprocess as env —
         # the same road GEMINI_API_KEY takes (and the same resume caveat).
