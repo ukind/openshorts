@@ -27,9 +27,9 @@ import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 import { track } from './lib/panel';
-// The header-builder export lands in Phase 4 (handleProcess), its first
-// consumer — importing it here fails lint (no-unused-vars) in phase isolation.
-import { llmConfigComplete } from './lib/llm';
+// The X-LLM-* header builder rides with its sibling: the AI-backend gate and
+// below are its first consumers.
+import { llmConfigComplete, llmHeaders } from './lib/llm';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -767,7 +767,18 @@ function App() {
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  const keysMissing = !billingEnabled && (!apiKey || !uploadPostKey);
+  // The AI backend is any ONE of: a Gemini key, the saved provider triple, or a
+  // server-side LLM_* setup reported by /api/config. The AI half of the banner
+  // fires only when none of the three exists — a provider-only user runs the app.
+  // Cloud gate (D3): a stale browser blob from a self-host era of this origin
+  // must not reach cloud requests, gates or child components. The empty triple
+  // makes every consumer inert under billing.
+  const providerCfg = billingEnabled
+    ? { baseUrl: '', apiKey: '', model: '' }
+    : llmConfig;
+  const llmActive = llmConfigComplete(providerCfg) || !!llmConfigured;
+  const needsAiBackend = !apiKey && !llmActive;
+  const keysMissing = !billingEnabled && (needsAiBackend || !uploadPostKey);
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: show the welcome plan-choice popup once (AuthContext set the
@@ -849,9 +860,13 @@ function App() {
 
     try {
       let body;
-      // BYOK sends the Gemini header; managed users rely on the bearer token
-      // that apiFetch attaches automatically.
-      const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      // BYOK sends the Gemini header plus the provider triple; managed users
+      // rely on the bearer token that apiFetch attaches automatically. The
+      // triple is the cloud-gated value, so a stale blob cannot leak (D3).
+      const headers = {
+        ...llmHeaders(providerCfg),
+        ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
+      };
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
@@ -1229,10 +1244,10 @@ function App() {
               >
                 <AlertTriangle size={12} />
                 <span className="hidden md:inline">
-                  {!apiKey && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !apiKey
-                      ? 'Gemini API Key Missing'
+                  {needsAiBackend && !uploadPostKey
+                    ? 'AI & Upload-Post keys missing'
+                    : needsAiBackend
+                      ? 'AI Key Missing'
                       : 'Upload-Post API Key Missing'}
                 </span>
                 <span className="md:hidden">keys missing</span>
@@ -1249,10 +1264,10 @@ function App() {
               <div className="min-w-0">
                 <span className="font-medium text-ink">Required API keys missing.</span>{' '}
                 <span className="text-muted">
-                  {!apiKey && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !apiKey
-                      ? 'Set your Gemini API key to use OpenShorts.'
+                  {needsAiBackend && !uploadPostKey
+                    ? 'Set an AI key and your Upload-Post key to use OpenShorts.'
+                    : needsAiBackend
+                      ? 'Set a Gemini API key or an AI provider to use OpenShorts.'
                       : 'Set your Upload-Post API key to use OpenShorts.'}
                 </span>
               </div>
@@ -1539,7 +1554,7 @@ function App() {
 
           {/* View: SaaS Shorts */}
           {activeTab === 'saasshorts' && (
-            <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} managed={isManaged} />
+            <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} managed={isManaged} llmConfig={providerCfg} llmActive={llmActive} />
           )}
 
           {/* View: AI Agent */}
@@ -1679,6 +1694,8 @@ function App() {
           {activeTab === 'thumbnails' && (
             <ThumbnailStudio
               geminiApiKey={apiKey}
+              llmConfig={providerCfg}
+              llmActive={llmActive}
               uploadPostKey={uploadPostKey}
               uploadUserId={uploadUserId}
               managed={isManaged}
@@ -1998,10 +2015,10 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!apiKey && !uploadPostKey
+        title={needsAiBackend && !uploadPostKey
           ? 'Required API Keys Missing'
-          : !apiKey
-            ? 'Gemini API Key Required'
+          : needsAiBackend
+            ? 'AI Key Required'
             : 'Upload-Post API Key Required'}
         footer={
           <div className="flex gap-3">
@@ -2022,16 +2039,20 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts needs an <strong className="text-ink2">AI key</strong> — Gemini, or any
+            OpenAI-compatible provider — and an <strong className="text-ink2">Upload-Post</strong> API key.
+            Gemini and Upload-Post both have free tiers.
           </p>
 
-          {/* Gemini block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!apiKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
+          {/* AI block — a Gemini key or any OpenAI-compatible provider satisfies it */}
+          <div className={`rounded-input p-4 space-y-2 border ${needsAiBackend ? 'border-rule2' : 'border-rule opacity-70'}`}>
             <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {apiKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Gemini API Key {apiKey && <span className="text-ok">— set</span>}
+              {needsAiBackend ? <AlertTriangle size={12} className="text-warn" /> : <Check size={12} className="text-ok" />}
+              Gemini API Key{' '}
+              {apiKey && <span className="text-ok">— set</span>}
+              {!apiKey && llmActive && <span className="text-ok">— covered by your AI provider</span>}
             </p>
-            {!apiKey && (
+            {needsAiBackend && (
               <>
                 <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
                   <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-brass underline">aistudio.google.com/app/apikey</a></li>
@@ -2049,6 +2070,10 @@ function App() {
                     }
                   }}
                 />
+                <p className="text-xs text-muted">
+                  No Google key? Any OpenAI-compatible endpoint works too — Ollama, OpenRouter, vLLM.
+                  Close this dialog and set it up under Settings → AI Provider.
+                </p>
               </>
             )}
           </div>
