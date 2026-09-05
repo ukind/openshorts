@@ -5,6 +5,7 @@ import { apiFetch } from '../lib/api';
 import StepIndicator from './ui/StepIndicator';
 import SegmentedControl from './ui/SegmentedControl';
 import StarBanner from './StarBanner';
+import { llmHeaders } from '../lib/llm';
 
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'UGC Natural', desc: 'Authentic, talking to camera' },
@@ -40,11 +41,11 @@ function saveCache(url, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
-export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId, managed = false }) {
+export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, elevenLabsKey, falKey, uploadPostKey, uploadUserId, managed = false }) {
   // Managed (hosted plan): Gemini (script) + Upload-Post run server-side via the
   // bearer token — no BYOK Gemini key needed. fal.ai + ElevenLabs stay BYOK.
   const geminiHeader = geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {};
-  const needsGeminiKey = !geminiApiKey && !managed;
+  const needsAiBackend = !geminiApiKey && !llmActive && !managed;
   // Wizard state
   const [step, setStep] = useState(() => {
     const cache = loadCache();
@@ -200,8 +201,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   const handleAnalyze = async () => {
     if (!url.trim() && !description.trim()) return;
-    if (needsGeminiKey) {
-      setAnalyzeError('Gemini API key required. Set it in Settings.');
+    if (needsAiBackend) {
+      setAnalyzeError('An AI key is required — set a Gemini key or an AI provider in Settings.');
       return;
     }
 
@@ -214,6 +215,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         headers: {
           'Content-Type': 'application/json',
           ...geminiHeader,
+          ...llmHeaders(llmConfig),
         },
         body: JSON.stringify({
           url: url.trim() || undefined,

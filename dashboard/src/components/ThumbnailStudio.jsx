@@ -4,6 +4,7 @@ import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import StepIndicator from './ui/StepIndicator';
 import SegmentedControl from './ui/SegmentedControl';
+import { llmHeaders } from '../lib/llm';
 
 const STEPS = ['Input', 'Titles', 'Generate', 'Description', 'Publish'];
 
@@ -70,11 +71,12 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon }) {
   );
 }
 
-export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUserId, managed = false, onCreateClips = null }) {
+export default function ThumbnailStudio({ geminiApiKey, llmConfig, llmActive, uploadPostKey, uploadUserId, managed = false, onCreateClips = null }) {
   // Managed (hosted plan): Gemini runs server-side via the bearer token, no BYOK key.
   // Only send X-Gemini-Key for self-host BYOK. apiFetch attaches the bearer token.
   const keyHeader = geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {};
-  const needsKey = !geminiApiKey && !managed;
+  const needsAiBackend = !geminiApiKey && !llmActive && !managed;
+  const needsGeminiImage = !geminiApiKey && !managed;
   // Step management
   const [step, setStep] = useState(0);
   const [mode, setMode] = useState(null); // 'video' or 'manual'
@@ -152,7 +154,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
   // --- Step 1: Analyze Video ---
   const handleAnalyze = async () => {
-    if (needsKey) return alert('Please set your Gemini API key in Settings first.');
+    if (needsAiBackend) return alert('Please set a Gemini API key or an AI provider in Settings first.');
     setIsAnalyzing(true);
 
     try {
@@ -169,7 +171,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
       const res = await apiFetch('/api/thumbnail/analyze', {
         method: 'POST',
-        headers: keyHeader,
+        headers: { ...keyHeader, ...llmHeaders(llmConfig) },
         body: formData
       });
 
@@ -215,7 +217,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...keyHeader
+          ...keyHeader,
+          ...llmHeaders(llmConfig),
         },
         body: JSON.stringify({ title: manualTitle, session_id: newSessionId })
       }).catch(() => { });
@@ -238,7 +241,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...keyHeader
+          ...keyHeader,
+          ...llmHeaders(llmConfig),
         },
         body: JSON.stringify({ session_id: sessionId, message: userMsg })
       });
@@ -265,7 +269,10 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
   // --- Step 3: Generate Thumbnails ---
   const handleGenerate = async () => {
-    if (needsKey) return alert('Please set your Gemini API key in Settings first.');
+    // Image generation is Gemini-only by physics (app.py:5003-5006 resolves the
+    // Gemini key first and hard-fails without it); the concept-design text call
+    // inside the same endpoint can still run on the provider.
+    if (needsGeminiImage) return alert('AI image generation needs a Gemini API key. Set it in Settings first.');
     const finalTitle = selectedTitle || manualTitle;
     if (!finalTitle) return alert('Please select or enter a title first.');
 
@@ -285,7 +292,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
       const res = await apiFetch('/api/thumbnail/generate', {
         method: 'POST',
-        headers: keyHeader,
+        headers: { ...keyHeader, ...llmHeaders(llmConfig) },
         body: formData
       });
 
@@ -344,7 +351,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
   // --- Description Generation ---
   const handleGenerateDescription = async () => {
-    if (needsKey) return alert('Please set your Gemini API key in Settings first.');
+    if (needsAiBackend) return alert('Please set a Gemini API key or an AI provider in Settings first.');
     const finalTitle = selectedTitle || manualTitle;
     if (!finalTitle) return alert('Please select a title first.');
     if (!sessionId) return alert('No session available.');
@@ -355,7 +362,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...keyHeader
+          ...keyHeader,
+          ...llmHeaders(llmConfig),
         },
         body: JSON.stringify({ session_id: sessionId, title: finalTitle })
       });
@@ -491,20 +499,20 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
           <StepIndicator steps={STEPS} current={step} />
         </div>
 
-        {/* Gemini API Key Warning (self-host BYOK only; managed uses server key) */}
-        {needsKey && (
+        {/* AI backend warning (self-host BYOK only; managed uses server key) */}
+        {needsAiBackend && (
           <div className="mb-6 p-5 bg-warn/10 rounded-card flex items-start gap-3">
             <AlertCircle size={18} className="text-warn shrink-0 mt-0.5" />
             <div>
-              <p className="text-sm font-medium text-warn lowercase">Gemini API Key Required</p>
-              <p className="text-xs text-muted mt-1">YouTube Studio requires a Google Gemini API key to function. Please configure it in the <strong>Settings</strong> tab before using this feature. Gemini's free tier includes 1,500 requests per day.</p>
+              <p className="text-sm font-medium text-warn lowercase">AI Key Required</p>
+              <p className="text-xs text-muted mt-1">YouTube Studio needs an AI backend for titles and descriptions — a Gemini API key or any OpenAI-compatible provider. Configure one in the <strong>Settings</strong> tab. Gemini's free tier includes 1,500 requests per day.</p>
             </div>
           </div>
         )}
 
         {/* ===== STEP 0: Input Mode Selection ===== */}
         {step === 0 && (
-          <div className={`grid md:grid-cols-2 gap-6 ${needsKey ? 'opacity-50 pointer-events-none select-none' : ''}`}>
+          <div className={`grid md:grid-cols-2 gap-6 ${needsAiBackend ? 'opacity-50 pointer-events-none select-none' : ''}`}>
             {/* Mode A: Video Analysis */}
             <div className="card card-hover p-6 space-y-4">
               <div className="flex items-center gap-3 mb-2">
@@ -843,9 +851,16 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 />
               </div>
 
+              {needsGeminiImage && (
+                <p className="text-xs text-warn flex items-start gap-1.5">
+                  <AlertCircle size={12} className="shrink-0 mt-0.5" />
+                  AI image generation needs a Gemini key — your provider handles text only.
+                </p>
+              )}
+
               <button
                 onClick={handleGenerate}
-                disabled={isGenerating}
+                disabled={isGenerating || needsGeminiImage}
                 className="w-full btn-primary"
               >
                 {isGenerating ? (
