@@ -89,6 +89,12 @@ def audio_encode_args():
     args = ["-c:a", "aac"]
     if os.environ.get("AUDIO_NORMALIZE", "1").strip() != "0":
         args = ["-af", LOUDNORM_FILTER] + args
+    # loudnorm's DSP runs at 192 kHz and, unpinned, the AAC stream lands on
+    # 96 kHz — a rate Windows browser decoders reject, which reads as
+    # "the file is corrupt" in the preview player. Pin the delivery rate:
+    # 48 kHz is the web/social standard. Hook and subtitle passes re-mux
+    # audio with -c:a copy, so fixing it here covers every downstream layer.
+    args += ["-ar", "48000"]
     return args
 
 _probe_lock = threading.Lock()
