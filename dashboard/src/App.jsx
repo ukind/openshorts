@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu } from 'lucide-react';
 import KeyInput from './components/KeyInput';
+import LlmProviderCard from './components/LlmProviderCard';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
@@ -200,10 +201,10 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
-  // useAuth LLM fields are deferred to Phase 3 — first consumed there as
-  // LlmProviderCard props; destructuring them here fails lint (no-unused-vars)
-  // in phase isolation.
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds } = useAuth();
+  // The LLM fields are first consumed as the AI Provider card's props (the
+  // Settings self-host branch); Phase 2 left them undestructured to stay lint-clean.
+  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds,
+          llmConfigured, llmModel, llmBaseUrl } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
@@ -260,9 +261,9 @@ function App() {
   // The JSON parse is the corruption guard — every bad path (bad base64,
   // key-rotated garbage, non-JSON, wrong shape) lands in the catch and starts
   // from the empty triple. Nothing here blocks the app from booting.
-  // The setter lands in Phase 3 (the card's Save is its only writer); this
-  // phase reads and persists the value only.
-  const [llmConfig] = useState(() => {
+  // The AI Provider card's Save is the only writer of this config (the setter
+  // arrived with the card, in Phase 3).
+  const [llmConfig, setLlmConfig] = useState(() => {
     try {
       const stored = localStorage.getItem('llmConfig_v1');
       if (stored) {
@@ -1353,6 +1354,16 @@ function App() {
               ) : (
                 <>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+
+              {/* Self-host only: this mount lives in the !billingEnabled branch, so the
+                  provider surface is structurally absent on cloud (Requirement). */}
+              <LlmProviderCard
+                savedConfig={llmConfig}
+                onConfigSet={setLlmConfig}
+                llmConfigured={llmConfigured}
+                llmModel={llmModel}
+                llmBaseUrl={llmBaseUrl}
+              />
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
