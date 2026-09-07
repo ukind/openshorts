@@ -24,6 +24,7 @@ export async function apiFetch(path, options = {}) {
   const token = getToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
 
+  // Build and return the fetch request without automatic body serialization
   const res = await fetch(getApiUrl(path), { ...options, headers });
 
   if (res.status === 402) {
@@ -49,9 +50,22 @@ export class ApiError extends Error {
   }
 }
 
-// Convenience JSON helper.
+// Convenience JSON helper - ONLY this function should serialize objects to JSON
 export async function apiJson(path, options = {}) {
-  const res = await apiFetch(path, options);
+  let finalOptions = { ...options };
+
+  // Handle body serialization for JSON objects only
+  if (options.body instanceof FormData) {
+    // Pass FormData through unchanged
+  } else if (options.body && typeof options.body === 'object') {
+    // Only serialize JavaScript objects to JSON, exactly once
+    finalOptions.headers = { ...finalOptions.headers, 'Content-Type': 'application/json' };
+    finalOptions.body = JSON.stringify(options.body);
+  }
+  // If body is a string or null/undefined, pass through unchanged
+
+  const res = await apiFetch(path, finalOptions);
+
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     let detail = '';

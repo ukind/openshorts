@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Mic, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
@@ -36,7 +36,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onVoiceOver = null, onReframeClip = null }) {
     const [showModal, setShowModal] = useState(false);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
@@ -433,31 +433,39 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 return;
             }
 
-            // Fallback: legacy FFmpeg
+            // Fallback: legacy FFmpeg — include edited captions when user changed text
+            const payload = {
+                job_id: jobId,
+                clip_index: index,
+                position: options.position,
+                font_size: options.fontSize,
+                font_name: options.fontName,
+                font_color: options.fontColor,
+                border_color: options.borderColor,
+                border_width: options.borderWidth,
+                bg_color: options.bgColor,
+                bg_opacity: options.bgOpacity,
+                style: options.style || 'classic',
+                highlight_color: options.highlightColor || '#FFD700',
+                effect: options.effect || 'none',
+                base_opacity: options.baseOpacity ?? 1.0,
+                uppercase: options.uppercase || false,
+                margin_v: options.marginV,
+                word_gap: options.wordGap,
+				max_chars: options.maxChars,
+				max_duration: options.maxDuration,
+                line_height: options.lineHeight,
+                letter_spacing: options.letterSpacing,
+                input_filename: serverVideoFile
+            };
+            // When modal text was edited, Remotion holds the authoritative word timings
+            if (options.remotion && options.remotion.captions && options.remotion.captions.length > 0) {
+                payload.captions = options.remotion.captions;
+            }
             const res = await apiFetch('/api/subtitle', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    job_id: jobId,
-                    clip_index: index,
-                    position: options.position,
-                    font_size: options.fontSize,
-                    font_name: options.fontName,
-                    font_color: options.fontColor,
-                    border_color: options.borderColor,
-                    border_width: options.borderWidth,
-                    bg_color: options.bgColor,
-                    bg_opacity: options.bgOpacity,
-                    style: options.style || 'classic',
-                    highlight_color: options.highlightColor || '#FFD700',
-                    effect: options.effect || 'none',
-                    base_opacity: options.baseOpacity ?? 1.0,
-                    uppercase: options.uppercase || false,
-                    input_filename: serverVideoFile,
-                    // Edited caption text (clip-relative ms); null = server
-                    // regenerates from the transcript as before.
-                    words: options.captions || null
-                })
+                body: JSON.stringify(payload)
             });
 
             if (!res.ok) throw new Error(await res.text());
@@ -930,6 +938,17 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {isTranslating ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Languages size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
                         {isTranslating ? 'translating…' : 'dub voice'}
                     </button>
+
+                    {onVoiceOver && (
+                        <button
+                            onClick={() => onVoiceOver(index)}
+                            className={QUIET_BTN}
+                            title="Send this clip's raw version to the VoiceOver workflow"
+                        >
+                            <Mic size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                            voiceover
+                        </button>
+                    )}
 
                     <button
                         onClick={() => setShowModal(true)}

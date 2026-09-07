@@ -1,13 +1,26 @@
 services:
   backend:
-    build: .
+    build:
+      # CPU by default (Dockerfile ARG GPU=0). GPU hosts opt back in with
+      # --build-arg GPU=1 and re-enable the GPU lines (backend gpus key,
+      # renderer env).
+      context: .
     container_name: openshorts-backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - TZ=Europe/Rome
     ports:
       - "8000:8000"
     volumes:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      # Persistent cache for AI model downloads (Qwen3-TTS VoiceDesign ~4GB,
+      # Whisper/ASR models). Downloaded lazily at first use — keeps the image
+      # small and avoids "No space left on device" during builds.
+      - hf-cache:/app/.cache/huggingface
     restart: unless-stopped
 
   frontend:
@@ -40,3 +53,6 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  hf-cache:

@@ -23,11 +23,16 @@ RUN pip install --no-cache-dir -r requirements-billing.txt
 # container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2
 # (faster-whisper CUDA), onnx-asr + onnxruntime-gpu for Parakeet. Adds ~2GB,
 # so the default CPU image stays slim.
+# Local TTS (Qwen3-TTS VoiceDesign) also rides on the GPU build: qwen-tts is a
+# heavy dependency chain (transformers/gradio) and inference is only practical
+# on CUDA, so CPU images keep skipping it — /api/voiceover/tts/status then
+# reports it unavailable and the UI falls back to ElevenLabs.
 ARG GPU=0
 RUN if [ "$GPU" = "1" ]; then \
       pip install --no-cache-dir \
         "nvidia-cublas-cu12<13" "nvidia-cudnn-cu12>=9,<10" \
-        onnx-asr onnxruntime-gpu; \
+        onnx-asr onnxruntime-gpu \
+        qwen-tts; \
     fi
 
 # Final stage
@@ -52,7 +57,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     fonts-liberation \
     fonts-noto-color-emoji \
+    fonts-symbola \
     && rm -rf /var/lib/apt/lists/*
+
+ARG GPU=0
+# sox: runtime dependency of the qwen-tts audio toolchain (bundled on PyPI as a
+# source wheel needs build tools; the distro package is the reliable path).
+RUN if [ "$GPU" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends sox \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Deno JS runtime — required by yt-dlp for some extractor challenges.
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
@@ -105,6 +119,11 @@ USER appuser
 
 # Pre-download YOLO model on build (now running as appuser)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+# Qwen3-TTS model download is intentionally lazy. The model is ~4GB and
+# downloading it into an image layer exhausts Docker's build storage (and gets
+# duplicated on every rebuild). At runtime voiceover.py downloads it on first
+# use into /app/.cache/huggingface; docker-compose mounts that cache persistently.
 
 # Expose FastAPI port
 EXPOSE 8000

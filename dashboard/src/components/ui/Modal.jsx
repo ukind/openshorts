@@ -18,6 +18,7 @@ const SIZES = {
   md: 'max-w-md',
   lg: 'max-w-2xl',
   xl: 'max-w-5xl',
+  '2xl': 'max-w-[1400px]',
 };
 
 export default function Modal({ isOpen, onClose, title, eyebrow, size = 'md', children, footer, hideClose = false }) {

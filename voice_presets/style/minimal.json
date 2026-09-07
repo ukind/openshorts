@@ -1,0 +1,8 @@
+{
+  "id": "minimal",
+  "title": "Minimal",
+  "kind": "generic",
+  "prompt": "Generate minimal, understated captions.\nExamples: \"nice.\", \"oh.\", \"well then.\"\nKeep it subtle. Less is more. Max 3 words per caption.",
+  "created_at": "2026-08-30T18:53:27.068541",
+  "updated_at": "2026-08-30T18:53:27.068541"
+}

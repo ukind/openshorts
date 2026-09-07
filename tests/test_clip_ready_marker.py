@@ -43,7 +43,12 @@ class TestClipReadyMarker:
         _feed(self.job_id,
               "🎬 Processing Clip 1",
               "CLIP_READY 0 subtitled_1_My_Video_clip_1.mp4")
-        assert app.jobs[self.job_id]["logs"] == ["🎬 Processing Clip 1"]
+        # app.py prefixes user-facing log lines with a timestamp; the marker
+        # must still never reach the log.
+        logs = app.jobs[self.job_id]["logs"]
+        assert len(logs) == 1
+        assert logs[0].endswith("🎬 Processing Clip 1")
+        assert not any("CLIP_READY" in line for line in logs)
 
     def test_clips_arriving_out_of_order_keep_their_own_index(self):
         # CLIP_WORKERS renders three clips at once, so clip 3 can finish first.

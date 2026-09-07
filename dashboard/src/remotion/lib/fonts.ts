@@ -16,15 +16,35 @@ export const notoSerifFontFace = `
 `;
 
 /**
- * Map of subtitle font families to their CSS-safe names.
- * These match the options available in SubtitleModal.jsx.
+ * Anton — bundled so Remotion (Chromium) matches FFmpeg/libass (fontmap: Impact→Anton).
+ * Without this, getFontStack('Anton') fell back to system sans-serif (smaller/lighter)
+ * when emoji switched the burn from FFmpeg (libass Anton) to Remotion (animated).
+ */
+export const ANTON_FONT_FAMILY = "Anton";
+
+export const antonFontFace = `
+@font-face {
+  font-family: '${ANTON_FONT_FAMILY}';
+  src: url('${staticFile("fonts/Anton-Regular.ttf")}') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+}
+`;
+
+/**
+ * Map of subtitle font families to CSS stacks.
+ * Must match fonts/openshorts-fontmap.conf (libass aliases) so FFmpeg vs Remotion
+ * render the same: Verdana/Arial/Helvetica → Liberation Sans, Georgia → Liberation Serif,
+ * Impact → Anton. Missing entries fell back to system sans-serif in Remotion (Chromium)
+ * and appeared smaller/lighter than FFmpeg's Liberation/Anton when emoji triggered Remotion.
  */
 export const SUBTITLE_FONTS: Record<string, string> = {
-  Verdana: "Verdana, Geneva, sans-serif",
-  Arial: "Arial, Helvetica, sans-serif",
-  Impact: "Impact, Haettenschweiler, sans-serif",
-  Helvetica: "Helvetica, Arial, sans-serif",
-  Georgia: "Georgia, 'Times New Roman', serif",
+  Anton: "'Anton', Impact, sans-serif",
+  Verdana: "'Liberation Sans', Verdana, Geneva, sans-serif",
+  Arial: "'Liberation Sans', Arial, Helvetica, sans-serif",
+  Impact: "'Anton', Impact, Haettenschweiler, sans-serif",
+  Helvetica: "'Liberation Sans', Helvetica, Arial, sans-serif",
+  Georgia: "'Liberation Serif', Georgia, 'Times New Roman', serif",
   "Courier New": "'Courier New', Courier, monospace",
 };
 

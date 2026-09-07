@@ -1,0 +1,12 @@
+{
+  "id": "action",
+  "title": "Action Hype (fallback)",
+  "prompt": "gender: Male.\npitch: Mid-range male pitch with sharp upward inflections during exciting moments.\nspeed: Very fast-paced, rapid-fire delivery matching gaming action.\nvolume: Loud and projecting, nearly shouting during intense plays.\nage: Young adult, 20s to early 30s.\nclarity: Highly articulate, every word distinct even at speed.\nfluency: Extremely fluent with no hesitations, continuous flow.\naccent: American English, neutral.\ntexture: Bright, energetic vocal quality with slight rasp.\nemotion: Intense excitement, hype, constant enthusiasm.\ntone: Upbeat, authoritative, commanding attention.\npersonality: Confident, extroverted, engaging, competitive edge.",
+  "kind": "generic",
+  "tags": [
+    "gaming",
+    "auto"
+  ],
+  "created_at": "2026-08-30T18:53:27.073661",
+  "updated_at": "2026-08-30T18:53:27.073661"
+}

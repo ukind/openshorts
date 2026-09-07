@@ -19,7 +19,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
     const [showAdvanced, setShowAdvanced] = useState(false);
-    const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
     // Auto-hook: burn the AI hook text into every clip. On by default; the
@@ -79,7 +78,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
         e.preventDefault();
         if (!acknowledged) return;
         const advanced = {
-            targetClips: targetClips || null,
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
@@ -108,7 +106,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
     return (
         <div className="card p-4 sm:p-6 animate-fade">
-            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule">
+            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule" data-tutorial="source-tabs">
                 <button
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'file'
@@ -135,7 +133,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
             <form onSubmit={handleSubmit}>
                 {mode === 'url' ? (
-                    <div className="space-y-4">
+                    <div className="space-y-4" data-tutorial="drop-zone">
                         <div className="relative">
                             <input
                                 type="url"
@@ -174,6 +172,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 ) : (
                     <div
+                        data-tutorial="drop-zone"
                         className={`border-2 border-dashed rounded-card p-6 sm:p-8 text-center transition-colors ${file ? 'border-brass' : 'border-rule2 hover:border-brass'
                             }`}
                         onDragOver={(e) => e.preventDefault()}
@@ -208,7 +207,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 )}
 
                 {/* Output format selector */}
-                <div className="mt-5">
+                <div className="mt-5" data-tutorial="output-format">
                     <p className="eyebrow mb-2">Output format</p>
                     <div className="grid grid-cols-3 gap-2">
                         {[
@@ -252,24 +251,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(clipMinSeconds || clipMaxSeconds || !autoHook) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
                     {showAdvanced && (
-                        /* Stacked on a phone: three number fields side by side leaves
-                           ~100px each, which crushes both label and value. */
-                        <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-2 animate-fade">
-                            <div>
-                                <p className="eyebrow mb-1.5">clips to aim for</p>
-                                <input
-                                    type="number" min="1" max="15" step="1"
-                                    value={targetClips}
-                                    onChange={(e) => setTargetClips(e.target.value)}
-                                    placeholder="auto"
-                                    className="input-field"
-                                />
-                            </div>
+                        <div className="mt-3 grid grid-cols-2 gap-2 animate-fade">
                             <div>
                                 <p className="eyebrow mb-1.5">min length (s)</p>
                                 <input
@@ -290,9 +277,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     className="input-field"
                                 />
                             </div>
-                            <p className="col-span-1 sm:col-span-3 text-[11px] leading-relaxed text-muted">
+                            <p className="col-span-2 text-[11px] leading-relaxed text-muted">
                                 Targets, not guarantees: the AI returns fewer clips when the
-                                material doesn't hold them. Leave blank to let it decide.
+                                material doesn't hold them. Leave blank to let it decide. Clip
+                                count is set by the number-of-clips slider above.
                             </p>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
@@ -351,6 +339,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
                 <button
                     type="submit"
+                    data-tutorial="generate"
                     disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && !file)}
                     className="w-full btn-primary mt-4"
                 >

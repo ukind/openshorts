@@ -1,0 +1,11 @@
+{
+  "id": "funny",
+  "title": "Funny Commentary",
+  "prompt": "gender: Male.\npitch: Mid to slightly high male pitch with playful variations.\nspeed: Moderate pace with deliberate pauses for comedic timing.\nvolume: Conversational, occasionally louder for punchlines.\nage: Young adult, early to mid 20s.\nclarity: Clear but relaxed, not overly precise.\nfluency: Fluent with intentional hesitations for humor, occasional 'uh', 'like'.\naccent: American English, casual GenZ cadence.\ntexture: Smooth, light vocal quality with natural warmth.\nemotion: Amused, ironic, playfully sarcastic.\ntone: Laid-back, chill, slightly deadpan with smirk energy.\npersonality: Witty, self-aware, relatable, gently mocking.",
+  "kind": "generic",
+  "tags": [
+    "funny"
+  ],
+  "created_at": "2026-08-30T18:53:27.075281",
+  "updated_at": "2026-08-30T18:53:27.075281"
+}

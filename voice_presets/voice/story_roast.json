@@ -1,0 +1,11 @@
+{
+  "id": "story_roast",
+  "title": "Roast Comedian",
+  "prompt": "gender: Male.\npitch: Mid to high pitch with sarcastic inflections and exaggerated tones.\nspeed: Variable, speeding up for punchlines, slowing for emphasis.\nvolume: Moderate to loud, performative and theatrical.\nage: Young adult, mid to late 20s.\nclarity: Very clear, ensuring every barb lands perfectly.\nfluency: Smooth with comedic pauses and timing.\naccent: American English, comedy podcast energy.\ntexture: Bright with playful edge, slight smirk audible.\nemotion: Amused mockery, playful cruelty, entertained.\ntone: Sarcastic, teasing, roast-comedy style.\npersonality: Quick-witted, sharp-tongued, charismatic instigator.",
+  "kind": "generic",
+  "tags": [
+    "story_roast"
+  ],
+  "created_at": "2026-08-30T18:53:27.077615",
+  "updated_at": "2026-08-30T18:53:27.077615"
+}

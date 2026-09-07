@@ -9,6 +9,7 @@
     "build": "tsc --noEmit"
   },
   "dependencies": {
+    "@remotion/animated-emoji": "4.0.447",
     "@remotion/cli": "4.0.447",
     "@remotion/google-fonts": "4.0.447",
     "@remotion/layout-utils": "4.0.447",

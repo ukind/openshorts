@@ -1,0 +1,8 @@
+{
+  "id": "gaming",
+  "title": "Gaming",
+  "kind": "generic",
+  "prompt": "Generate short, punchy captions like gaming content creators use.\nExamples: \"HEADSHOT!\", \"clutch play incoming...\", \"wait for it...\", \"GG EZ\", \"POV: you're cracked\"\nKeep captions 1-5 words. Use ALL CAPS for emphasis on action moments.",
+  "created_at": "2026-08-30T18:53:27.066527",
+  "updated_at": "2026-08-30T18:53:27.066527"
+}
