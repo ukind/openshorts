@@ -1,0 +1,11 @@
+{
+  "id": "story_creepypasta",
+  "title": "Creepypasta Narrator",
+  "prompt": "gender: Male.\npitch: Deep, low pitch with minimal variation, ominous undertones.\nspeed: Very slow, deliberate, each word drawn out for tension.\nvolume: Quiet to moderate, intimate and unsettling closeness.\nage: Middle-aged to older adult, 40s to 50s.\nclarity: Crystal clear whisper-level articulation.\nfluency: Controlled, methodical pacing building dread.\naccent: American English, neutral with slight rasp.\ntexture: Dark, gravelly with shadowy depth.\nemotion: Foreboding, sinister, building unease.\ntone: Ominous, creeping horror, inevitable dread.\npersonality: Mysterious, unsettling, knows something you don't.",
+  "kind": "generic",
+  "tags": [
+    "story_creepypasta"
+  ],
+  "created_at": "2026-08-30T18:53:27.078173",
+  "updated_at": "2026-08-30T18:53:27.078173"
+}

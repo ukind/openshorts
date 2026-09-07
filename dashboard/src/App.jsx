@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Users as UsersIcon, Mic, AudioLines } from 'lucide-react';
 import KeyInput from './components/KeyInput';
-import LlmProviderCard from './components/LlmProviderCard';
 import MediaInput from './components/MediaInput';
+import LlmProviderCard from './components/LlmProviderCard';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -17,19 +17,24 @@ import UsageMeter from './components/UsageMeter';
 import TopUpModal from './components/TopUpModal';
 import StarBanner from './components/StarBanner';
 import PlanChoiceModal from './components/PlanChoiceModal';
+import ClipTutorial from './components/ClipTutorial';
 import TrialUpgradeModal from './components/TrialUpgradeModal';
 import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
 import ProfileMenu from './components/ProfileMenu';
+import GameProfilesPage from './components/GameProfilesPage';
+import CreateEditProfileModal from './components/CreateEditProfileModal';
+import VoiceOverPage from './components/VoiceOverPage';
+import VoiceStylePresetsPage from './components/VoiceStylePresetsPage';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
-import { track } from './lib/panel';
 // The X-LLM-* header builder rides with its sibling: the AI-backend gate and
-// below are its first consumers.
+// the /api/process headers below are its first consumers.
 import { llmConfigComplete, llmHeaders } from './lib/llm';
+import { track } from './lib/panel';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -201,13 +206,14 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
-  // The LLM fields are first consumed as the AI Provider card's props (the
-  // Settings self-host branch); Phase 2 left them undestructured to stay lint-clean.
+  // Cloud auth/billing session + the two LLM surfaces: llmConfigured/Model/BaseUrl
+  // are our satellite family (/api/config), localLlm is their pipeline family.
   const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds,
-          llmConfigured, llmModel, llmBaseUrl } = useAuth();
+          llmConfigured, llmModel, llmBaseUrl, localLlm } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
+  const [tutorialPhase, setTutorialPhase] = useState(null); // null | intro | coach | celebrate
   const [showTrialUpgrade, setShowTrialUpgrade] = useState(false);
   const [topUpInfo, setTopUpInfo] = useState({});
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
@@ -237,6 +243,50 @@ function App() {
     try { localStorage.removeItem('gemini_key'); } catch (_) { /* ignore */ }
     return value;
   });
+  const [openaiKey, setOpenaiKey] = useState(localStorage.getItem('openai_key') || '');
+  const [openaiModel, setOpenaiModel] = useState(localStorage.getItem('openai_model') || 'gpt-4o-mini');
+  const [geminiModel, setGeminiModel] = useState(localStorage.getItem('gemini_model') || 'gemini-3.1-flash-lite');
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState(localStorage.getItem('openai_base_url') || '');
+  const [aiProvider, setAiProvider] = useState(localStorage.getItem('ai_provider') || 'gemini');
+  const [openaiModels, setOpenaiModels] = useState([]);
+  const [openaiModelsLoading, setOpenaiModelsLoading] = useState(false);
+  const [openaiModelsError, setOpenaiModelsError] = useState(null);
+  const [openaiModelDropdownOpen, setOpenaiModelDropdownOpen] = useState(false);
+  const [geminiModelDropdownOpen, setGeminiModelDropdownOpen] = useState(false);
+  // Phase 4: Cheap multimodal toggles (each enhancement beyond default Whisper toggleable)
+  const [enableScene, setEnableScene] = useState(() => {
+    const v = localStorage.getItem('enable_scene');
+    return v === null ? true : v !== '0';
+  });
+  const [enableAudio, setEnableAudio] = useState(() => {
+    const v = localStorage.getItem('enable_audio');
+    return v === null ? true : v !== '0';
+  });
+  const [enableVisual, setEnableVisual] = useState(() => {
+    const v = localStorage.getItem('enable_visual');
+    return v === null ? true : v !== '0';
+  });
+  const [enableVision, setEnableVision] = useState(() => {
+    const v = localStorage.getItem('enable_vision');
+    return v === null ? true : v !== '0';
+  });
+  const [enableDeep, setEnableDeep] = useState(() => {
+    const v = localStorage.getItem('enable_deep');
+    return v === '1';
+  });
+  const [enableEnhance, setEnableEnhance] = useState(() => localStorage.getItem('enable_enhance') === '1');
+  const [enableEmoji, setEnableEmoji] = useState(() => localStorage.getItem('enable_emoji') === '1');
+  const [targetClips, setTargetClips] = useState(() => {
+    const v = parseInt(localStorage.getItem('target_clips') || '5', 10);
+    return isNaN(v) ? 5 : Math.min(10, Math.max(1, v));
+  });
+  const [deepProvider, setDeepProvider] = useState(() => localStorage.getItem('deep_provider') || '');
+  // Game Profile selector for clip generation (Phase 5)
+  const [gameProfiles, setGameProfiles] = useState([]);
+  const [selectedProfileId, setSelectedProfileId] = useState(() => localStorage.getItem('selected_game_profile') || '');
+  const [editingSelectedProfile, setEditingSelectedProfile] = useState(null);
+  const selectedGameProfileStub = gameProfiles.find(pr => pr.id === selectedProfileId) || null;
+  const [selectedGameProfile, setSelectedGameProfile] = useState(null);
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -256,13 +306,13 @@ function App() {
     if (stored) return decrypt(stored);
     return '';
   });
+
   // --- llmConfig state — after the falKey initializer -----------------------------
   // One encrypted JSON blob, not three keys: one localStorage read, one write.
   // The JSON parse is the corruption guard — every bad path (bad base64,
   // key-rotated garbage, non-JSON, wrong shape) lands in the catch and starts
   // from the empty triple. Nothing here blocks the app from booting.
-  // The AI Provider card's Save is the only writer of this config (the setter
-  // arrived with the card, in Phase 3).
+  // The AI Provider card's Save is the only writer of this config.
   const [llmConfig, setLlmConfig] = useState(() => {
     try {
       const stored = localStorage.getItem('llmConfig_v1');
@@ -342,6 +392,15 @@ function App() {
   // Clip editor overlay: index of the clip being edited, or null.
   const [editingClip, setEditingClip] = useState(null);
   const [reframingClip, setReframingClip] = useState(null);
+  // VoiceOver hand-off: {clipIndex} when the user clicked a ResultCard's
+  // VoiceOver button — consumed by the VoiceOver page to preselect the clip.
+  const [voiceoverSource, setVoiceoverSource] = useState(null);
+  // Once the VoiceOver page has been opened it stays mounted for the session
+  // (hidden between visits) so a running generation isn't lost by tab switching.
+  const [voiceoverMounted, setVoiceoverMounted] = useState(false);
+  useEffect(() => {
+    if (activeTab === 'voiceover') setVoiceoverMounted(true);
+  }, [activeTab]);
 
   // Silent-success "saved" states for the settings key inputs (design.md: no alert popups)
   const [elevenLabsSaved, setElevenLabsSaved] = useState(false);
@@ -476,8 +535,15 @@ function App() {
 
   // Reopen an archived project from the History tab: the backend re-downloads
   // its files from R2 into the server's working dir and returns the full state.
+  // VoiceOver projects are routed to the VoiceOver page instead — the Clip
+  // Generator can't edit them (no source video / transcript).
   const restoreProject = async (projectJobId) => {
     const data = await apiJson(`/api/projects/${projectJobId}/restore`, { method: 'POST' });
+    if (data.voiceover) {
+      setVoiceoverSource({ clipIndex: null, jobId: data.job_id, restored: data });
+      setActiveTab('voiceover');
+      return data;
+    }
     flushClipState();
     setProjectState(data.project_state || null);
     setNoSource(true);
@@ -488,6 +554,7 @@ function App() {
     setQualityGate(null);
     setStatus('complete');
     setActiveTab('dashboard');
+    return data;
   };
 
   // Apply one subtitle style to every clip of the job, sequentially.
@@ -529,6 +596,7 @@ function App() {
       }
     }
     setBulkSub({ running: false, current: total, total, errors });
+    refreshMe();
     // Refresh results so each ResultCard picks up its new subtitled video_url.
     try {
       const data = await pollJob(jobId);
@@ -636,6 +704,25 @@ function App() {
     }
   }, [llmConfig]);
 
+
+  useEffect(() => {
+    if (openaiKey) localStorage.setItem('openai_key', openaiKey); else localStorage.removeItem('openai_key');
+    if (openaiModel) localStorage.setItem('openai_model', openaiModel);
+    if (geminiModel) localStorage.setItem('gemini_model', geminiModel);
+    if (openaiBaseUrl) localStorage.setItem('openai_base_url', openaiBaseUrl); else localStorage.removeItem('openai_base_url');
+    localStorage.setItem('ai_provider', aiProvider);
+    localStorage.setItem('enable_scene', enableScene ? '1' : '0');
+    localStorage.setItem('enable_audio', enableAudio ? '1' : '0');
+    localStorage.setItem('enable_visual', enableVisual ? '1' : '0');
+    localStorage.setItem('enable_vision', enableVision ? '1' : '0');
+    localStorage.setItem('enable_deep', enableDeep ? '1' : '0');
+    localStorage.setItem('enable_enhance', enableEnhance ? '1' : '0');
+    localStorage.setItem('enable_emoji', enableEmoji ? '1' : '0');
+    localStorage.setItem('target_clips', String(targetClips));
+    if (deepProvider) localStorage.setItem('deep_provider', deepProvider); else localStorage.removeItem('deep_provider');
+    if (selectedProfileId) localStorage.setItem('selected_game_profile', selectedProfileId); else localStorage.removeItem('selected_game_profile');
+  }, [apiKey, openaiKey, openaiModel, openaiBaseUrl, geminiModel, aiProvider, enableScene, enableAudio, enableVisual, enableVision, enableDeep, enableEnhance, enableEmoji, targetClips, deepProvider, selectedProfileId]);
+
   useEffect(() => {
     if (uploadPostKey) {
       localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
@@ -656,6 +743,45 @@ function App() {
       localStorage.setItem('falKey_v1', encrypt(falKey));
     }
   }, [falKey]);
+
+  // Fetch full profile for selected (list endpoint is truncated)
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedProfileId) { setSelectedGameProfile(null); return; }
+    // If stub not yet loaded, wait
+    if (!selectedGameProfileStub) { setSelectedGameProfile(null); return; }
+    const loadFull = async () => {
+      try {
+        const full = await apiJson(`/api/game-profiles/${selectedProfileId}`);
+        if (!cancelled) setSelectedGameProfile(full);
+      } catch {
+        if (!cancelled) setSelectedGameProfile(selectedGameProfileStub);
+      }
+    };
+    loadFull();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProfileId, selectedGameProfileStub?.updated_at]);
+
+  // Load game profiles for clip generator dropdown
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await apiJson('/api/game-profiles');
+        if (!cancelled) {
+          setGameProfiles(Array.isArray(data) ? data : []);
+          // Validate selected still exists
+          if (selectedProfileId && !data.find(p => p.id === selectedProfileId)) {
+            setSelectedProfileId('');
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    load();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if ((uploadPostKey || isManaged) && userProfiles.length === 0) {
@@ -722,11 +848,13 @@ function App() {
           if (data.status === 'completed') {
             setStatus('complete');
             clearInterval(interval);
+            refreshMe();
           } else if (data.status === 'failed') {
             setStatus('error');
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setLogs(prev => [...prev, "Error: " + errorMsg]);
             clearInterval(interval);
+            refreshMe();
           } else {
             // Update logs if available
             if (data.logs) setLogs(data.logs);
@@ -737,7 +865,7 @@ function App() {
       }, 2000);
     }
     return () => clearInterval(interval);
-  }, [status, jobId]);
+  }, [status, jobId, refreshMe]);
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -748,7 +876,11 @@ function App() {
       const res = await apiFetch('/api/social/user', {
         headers: uploadPostKey ? { 'X-Upload-Post-Key': uploadPostKey } : {}
       });
-      if (!res.ok) throw new Error("Failed to fetch");
+      if (!res.ok) {
+        // Silent boot probe: 401/400 just means key is invalid/missing — don't spam
+        if (silent && (res.status === 401 || res.status === 400)) return;
+        throw new Error(`Failed to fetch (${res.status})`);
+      }
       const data = await res.json();
       if (data.profiles && data.profiles.length > 0) {
         setUserProfiles(data.profiles);
@@ -760,40 +892,98 @@ function App() {
         alert("No profiles found for this API Key.");
       }
     } catch (e) {
-      if (!silent) alert("Error fetching User Profiles. Please check key.");
+      if (silent) {
+        // Boot probe failure is expected when no valid key is stored — quiet
+        console.debug("[social/user] silent fetch failed:", e.message);
+        return;
+      }
+      alert("Error fetching User Profiles. Please check key.");
       console.error(e);
     }
   };
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  // The AI backend is any ONE of: a Gemini key, the saved provider triple, or a
-  // server-side LLM_* setup reported by /api/config. The AI half of the banner
-  // fires only when none of the three exists — a provider-only user runs the app.
+  // The AI backend is any ONE of: a Gemini key, the saved satellite provider
+  // triple (llmConfig), a server-side LLM_* setup reported by /api/config
+  // (llmConfigured), or the pipeline provider the server reports (localLlm).
   // Cloud gate (D3): a stale browser blob from a self-host era of this origin
   // must not reach cloud requests, gates or child components. The empty triple
   // makes every consumer inert under billing.
   const providerCfg = billingEnabled
     ? { baseUrl: '', apiKey: '', model: '' }
     : llmConfig;
-  const llmActive = llmConfigComplete(providerCfg) || !!llmConfigured;
+  const llmActive = llmConfigComplete(providerCfg) || !!llmConfigured || !!localLlm;
   const needsAiBackend = !apiKey && !llmActive;
   const keysMissing = !billingEnabled && (needsAiBackend || !uploadPostKey);
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
-  // Fresh sign-up: show the welcome plan-choice popup once (AuthContext set the
-  // flag after the auth redirect). Fires for free users too, so it's gated on
-  // being signed in rather than on entitlement.
+  // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
+  // after the auth redirect). QA: #app?tutorial=1. Resume coach if they refreshed
+  // mid-job. Runs once on mount so a later isSignedIn flip cannot reset intro→coach.
   useEffect(() => {
-    if (billingEnabled && isSignedIn) {
-      let flagged = false;
-      try { flagged = localStorage.getItem('os_show_plan_choice') === '1'; } catch (_) { /* ignore */ }
-      if (flagged) {
-        setShowPlanChoice(true);
-        try { localStorage.removeItem('os_show_plan_choice'); } catch (_) { /* ignore */ }
-      }
+    let showTutorial = false;
+    let resumeCoach = false;
+    try {
+      const q = new URLSearchParams((window.location.hash.split('?')[1] || ''));
+      const qa = q.get('tutorial');
+      if (qa === '1') showTutorial = true;
+      if (qa === 'coach') resumeCoach = true;
+      if (qa === 'celebrate') { setTutorialPhase('celebrate'); return; }
+      if (localStorage.getItem('os_show_clip_tutorial') === '1') showTutorial = true;
+      if (localStorage.getItem('os_clip_tutorial') === 'coach') resumeCoach = true;
+    } catch (_) { /* ignore */ }
+    if (showTutorial) {
+      setTutorialPhase('intro');
+      setActiveTab('dashboard');
+    } else if (resumeCoach) {
+      setTutorialPhase('coach');
+      setActiveTab('dashboard');
     }
-  }, [billingEnabled, isSignedIn]);
+  }, []);
+
+  // Legacy: an older build may still have set os_show_plan_choice. Don't open it
+  // on top of the tutorial.
+  useEffect(() => {
+    if (tutorialPhase) return;
+    if (!(billingEnabled && isSignedIn)) return;
+    let showPlans = false;
+    try { showPlans = localStorage.getItem('os_show_plan_choice') === '1'; } catch (_) { /* ignore */ }
+    if (showPlans) {
+      setShowPlanChoice(true);
+      try { localStorage.removeItem('os_show_plan_choice'); } catch (_) { /* ignore */ }
+    }
+  }, [billingEnabled, isSignedIn, tutorialPhase]);
+
+  const tutorialLock = tutorialPhase === 'intro' || tutorialPhase === 'coach' || tutorialPhase === 'celebrate';
+
+  useEffect(() => {
+    if (tutorialLock && activeTab !== 'dashboard') setActiveTab('dashboard');
+  }, [tutorialLock, activeTab]);
+
+  useEffect(() => {
+    if (tutorialPhase === 'coach' && status === 'complete' && (results?.clips?.length > 0)) {
+      setTutorialPhase('celebrate');
+      track('ClipTutorialCompleted', { props: { clips: results.clips.length } });
+    }
+  }, [tutorialPhase, status, results]);
+
+  const finishTutorial = () => {
+    try { localStorage.setItem('os_clip_tutorial', 'done'); } catch (_) { /* ignore */ }
+    try { localStorage.removeItem('os_show_clip_tutorial'); } catch (_) { /* ignore */ }
+    setTutorialPhase(null);
+  };
+  const startTutorial = () => {
+    try { localStorage.setItem('os_clip_tutorial', 'coach'); } catch (_) { /* ignore */ }
+    try { localStorage.removeItem('os_show_clip_tutorial'); } catch (_) { /* ignore */ }
+    track('ClipTutorialStarted');
+    setTutorialPhase('coach');
+    setActiveTab('dashboard');
+  };
+  const skipTutorial = () => {
+    track('ClipTutorialSkipped', { props: { phase: tutorialPhase } });
+    finishTutorial();
+  };
   // Included in the plan (fully managed, no keys): Clip Generator + YouTube Studio.
   // Advanced (bring your own fal.ai + ElevenLabs keys): AI Shorts + AI Agent.
   const INCLUDED_TOOL_TABS = ['dashboard', 'thumbnails'];
@@ -806,7 +996,7 @@ function App() {
   // connected yet. userProfiles being empty (not yet fetched / none created)
   // also counts as "not connected" — that is the 97% case.
   const connectedSocials = ((userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected) || [];
-  const showSocialNudge = isManaged && !socialNudgeDismissed && connectedSocials.length === 0;
+  const showSocialNudge = isManaged && !socialNudgeDismissed && connectedSocials.length === 0 && !tutorialLock;
 
   // One Seen event per job, only when the banner actually rendered.
   const socialNudgeSeenRef = useRef(null);
@@ -860,18 +1050,35 @@ function App() {
 
     try {
       let body;
-      // BYOK sends the Gemini header plus the provider triple; managed users
-      // rely on the bearer token that apiFetch attaches automatically. The
-      // triple is the cloud-gated value, so a stale blob cannot leak (D3).
+      // BYOK: the satellite triple (X-LLM-*) rides with the pipeline family.
+      // llmHeaders builds from the cloud-gated providerCfg, so a stale
+      // self-host blob cannot leak into a cloud request (D3). The Gemini key
+      // is our encrypted apiKey, attached once here; the provider-family
+      // fields below are theirs (X-AI-Provider / X-OpenAI-* / toggles /
+      // X-Target-Clips / X-Deep-Provider / X-Game-Profile-Id).
       const headers = {
         ...llmHeaders(providerCfg),
         ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
+        'X-AI-Provider': aiProvider,
+        'X-Enable-Scene': enableScene ? '1' : '0',
+        'X-Enable-Audio': enableAudio ? '1' : '0',
+        'X-Enable-Visual': enableVisual ? '1' : '0',
+        'X-Enable-Vision': enableVision ? '1' : '0',
+        'X-Enable-Deep': enableDeep ? '1' : '0',
+        'X-Enable-Enhance': enableEnhance ? '1' : '0',
+        'X-Enable-Emoji': enableEmoji ? '1' : '0',
+        'X-Target-Clips': String(targetClips),
+        ...(deepProvider ? { 'X-Deep-Provider': deepProvider } : {}),
+        ...(selectedProfileId ? { 'X-Game-Profile-Id': selectedProfileId } : {}),
       };
+      if (openaiKey) headers['X-OpenAI-Key'] = openaiKey;
+      if (openaiModel) headers['X-OpenAI-Model'] = openaiModel;
+      if (geminiModel) headers['X-Gemini-Model'] = geminiModel;
+      if (openaiBaseUrl) headers['X-OpenAI-Base-Url'] = openaiBaseUrl;
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
       const advanced = {
-        target_clips: data.targetClips || null,
         clip_min_seconds: data.clipMinSeconds || null,
         clip_max_seconds: data.clipMaxSeconds || null,
         // Sent explicitly both ways: absent means off for raw API callers,
@@ -881,6 +1088,21 @@ function App() {
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
       };
+      // Phase 4 toggles: always sent (default Whisper always on, others toggleable)
+      const cheapToggles = {
+        enable_scene: enableScene ? '1' : '0',
+        enable_audio: enableAudio ? '1' : '0',
+        enable_visual: enableVisual ? '1' : '0',
+        enable_vision: enableVision ? '1' : '0',
+        enable_deep: enableDeep ? '1' : '0',
+        enable_enhance: enableEnhance ? '1' : '0',
+        enable_emoji: enableEmoji ? '1' : '0',
+      };
+      const targetPayload = { target_clips: String(targetClips) };
+      const deepPayload = {
+        ...(deepProvider ? { deep_provider: deepProvider } : {}),
+      };
+      const profilePayload = selectedProfileId ? { game_profile_id: selectedProfileId } : {};
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
@@ -890,6 +1112,10 @@ function App() {
           output_format: data.outputFormat || 'auto',
           force_low_quality: forceLowQuality,
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...cheapToggles,
+          ...targetPayload,
+          ...deepPayload,
+          ...profilePayload,
         });
       } else if (data.type === 'thumbnail_session') {
         // Handover from Thumbnail Studio (issue #68): the video and transcript
@@ -909,6 +1135,10 @@ function App() {
         for (const [k, v] of Object.entries(advanced)) {
           if (v != null) formData.append(k, v);
         }
+        for (const [k, v] of Object.entries(cheapToggles)) formData.append(k, v);
+        for (const [k, v] of Object.entries(targetPayload)) formData.append(k, v);
+        for (const [k, v] of Object.entries(deepPayload)) if (v) formData.append(k, v);
+        if (selectedProfileId) formData.append('game_profile_id', selectedProfileId);
         body = formData;
       }
 
@@ -929,10 +1159,13 @@ function App() {
       if (data.type === 'thumbnail_session') {
         setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
       }
+      // Minutes are reserved at job start, not at complete.
+      refreshMe();
 
     } catch (e) {
       if (e instanceof QuotaError) {
         setStatus('idle');
+        refreshMe();
         // Trial users hit the trial minute cap → prompt them to activate the plan
         // now (unlocks full minutes). Active users → offer a top-up.
         if (me?.status === 'trialing') {
@@ -973,8 +1206,14 @@ function App() {
     { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
+    // History: cloud mode serves it from R2 (per-user — sign in first);
+    // self-host reads completed jobs straight off OUTPUT_DIR (its own
+    // durability boundary) and keeps the tab always on. D9 union rule.
+    ...((!billingEnabled || isSignedIn) ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
+    { id: 'voiceover', ord: '07', icon: Mic, label: 'VoiceOver', short: 'voice', byok: true },
+    { id: 'voice-style-presets', ord: '08', icon: AudioLines, label: 'Voice/Style Presets', short: 'presets' },
+    { id: 'game-profiles', ord: '09', icon: UsersIcon, label: 'Game Profiles', short: 'games' },
+    { id: 'settings', ord: '10', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -987,7 +1226,12 @@ function App() {
     return () => document.removeEventListener('keydown', onKey);
   }, [navOpen]);
 
-  const goToTab = (id) => { setActiveTab(id); setNavOpen(false); };
+  const goToTab = (id) => {
+    if (tutorialLock && id !== 'dashboard') return;
+    setActiveTab(id);
+    setNavOpen(false);
+  };
+  const tabLocked = (id) => tutorialLock && id !== 'dashboard';
 
   // Shared footer links (landing, repo, pricing, contact) — same list in the
   // desktop rail and the mobile drawer, so they can never drift apart.
@@ -1046,16 +1290,20 @@ function App() {
           return (
             <button
               key={item.id}
-              onClick={() => setActiveTab(item.id)}
-              title={item.label}
-              className={`relative w-full flex items-center gap-3 px-3 py-2.5 rounded-input transition-colors ${isActive ? 'bg-paper3 text-ink' : 'text-muted hover:text-ink2 hover:bg-paper3/50'}`}
+              data-tutorial={item.id === 'dashboard' ? 'nav-clips' : undefined}
+              onClick={() => goToTab(item.id)}
+              title={tabLocked(item.id) ? 'Finish your first clips to unlock' : item.label}
+              disabled={tabLocked(item.id)}
+              className={`relative w-full flex items-center gap-3 px-3 py-2.5 rounded-input transition-colors ${isActive ? 'bg-paper3 text-ink' : 'text-muted hover:text-ink2 hover:bg-paper3/50'} ${tabLocked(item.id) ? 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted' : ''}`}
             >
               {isActive && (
                 <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-brass rounded-full" aria-hidden="true" />
               )}
               <NavIcon size={18} className={`shrink-0 ${isActive ? 'text-brass' : ''}`} />
               <span className="text-sm lowercase hidden lg:block flex-1 text-left truncate">{item.label}</span>
-              {item.byok && <span className="readout hidden lg:block">BYOK</span>}
+              {tabLocked(item.id)
+                ? <Lock size={12} className="shrink-0 hidden lg:block" />
+                : item.byok ? <span className="readout hidden lg:block">BYOK</span> : null}
               <span className="readout hidden lg:block">{item.ord}</span>
             </button>
           );
@@ -1106,15 +1354,19 @@ function App() {
               <button
                 key={item.id}
                 onClick={() => goToTab(item.id)}
+                disabled={tabLocked(item.id)}
                 aria-current={isActive ? 'page' : undefined}
-                className={`relative w-full flex items-center gap-3 px-3 py-3 rounded-input transition-colors ${isActive ? 'bg-paper3 text-ink' : 'text-muted active:bg-paper3/60'}`}
+                title={tabLocked(item.id) ? 'Finish your first clips to unlock' : undefined}
+                className={`relative w-full flex items-center gap-3 px-3 py-3 rounded-input transition-colors ${isActive ? 'bg-paper3 text-ink' : 'text-muted active:bg-paper3/60'} ${tabLocked(item.id) ? 'opacity-40 cursor-not-allowed' : ''}`}
               >
                 {isActive && (
                   <span className="absolute left-0 top-2 bottom-2 w-0.5 bg-brass rounded-full" aria-hidden="true" />
                 )}
                 <NavIcon size={18} className={`shrink-0 ${isActive ? 'text-brass' : ''}`} />
                 <span className="text-[0.95rem] lowercase flex-1 text-left truncate">{item.label}</span>
-                {item.byok && <span className="readout shrink-0">BYOK</span>}
+                {tabLocked(item.id)
+                  ? <Lock size={12} className="shrink-0" />
+                  : item.byok ? <span className="readout shrink-0">BYOK</span> : null}
               </button>
             );
           })}
@@ -1142,9 +1394,12 @@ function App() {
             return (
               <button
                 key={item.id}
+                data-tutorial={item.id === 'dashboard' ? 'nav-clips' : undefined}
                 onClick={() => goToTab(item.id)}
+                disabled={tabLocked(item.id)}
                 aria-current={isActive ? 'page' : undefined}
-                className={`flex-1 min-w-0 flex flex-col items-center justify-center gap-1 py-2 min-h-[56px] transition-colors ${isActive ? 'text-ink' : 'text-muted active:text-ink2'}`}
+                title={tabLocked(item.id) ? 'Finish your first clips to unlock' : undefined}
+                className={`flex-1 min-w-0 flex flex-col items-center justify-center gap-1 py-2 min-h-[56px] transition-colors ${isActive ? 'text-ink' : 'text-muted active:text-ink2'} ${tabLocked(item.id) ? 'opacity-40 cursor-not-allowed' : ''}`}
               >
                 <NavIcon size={19} className={isActive ? 'text-brass' : ''} />
                 <span className="text-[10.5px] lowercase leading-none truncate max-w-full px-0.5">{item.short}</span>
@@ -1186,7 +1441,7 @@ function App() {
             >
               <Menu size={20} />
             </button>
-            <span className="md:hidden font-display lowercase text-base text-ink truncate">
+            <span data-tutorial="nav-clips" className="md:hidden font-display lowercase text-base text-ink truncate">
               {activeNav?.label || 'openshorts'}
             </span>
             {status !== 'idle' && (
@@ -1238,7 +1493,7 @@ function App() {
                 same thing, and two warnings in a 360px header is just noise. */}
             {keysMissing && (
               <button
-                onClick={() => (billingEnabled && !isSignedIn ? setShowLogin(true) : setActiveTab('settings'))}
+                onClick={() => (billingEnabled && !isSignedIn ? setShowLogin(true) : goToTab('settings'))}
                 className="badge-warn hover:brightness-125 transition-all hidden sm:inline-flex"
                 title="Configure API keys or choose a plan"
               >
@@ -1273,7 +1528,7 @@ function App() {
               </div>
             </div>
             <button
-              onClick={() => setActiveTab('settings')}
+              onClick={() => goToTab('settings')}
               className="btn-quiet px-3 py-1.5 text-xs shrink-0 w-full sm:w-auto"
             >
               Go to Settings
@@ -1303,7 +1558,7 @@ function App() {
         {gateThisTab && <TrialGate toolName={TOOL_NAMES[activeTab] || 'this'} />}
 
         {/* Advanced tools (AI Shorts, AI Agent): BYOK fal.ai + ElevenLabs notice. */}
-        {advancedThisTab && <AdvancedBanner needsPlan={needsPlan} onKeys={() => setActiveTab('settings')} />}
+        {advancedThisTab && <AdvancedBanner needsPlan={needsPlan} onKeys={() => goToTab('settings')} />}
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
@@ -1368,10 +1623,11 @@ function App() {
                 </div>
               ) : (
                 <>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
-
+              <KeyInput onKeySet={setApiKey} savedKey={apiKey} geminiModel={geminiModel} setGeminiModel={setGeminiModel} dropdownOpen={geminiModelDropdownOpen} setDropdownOpen={setGeminiModelDropdownOpen} />
               {/* Self-host only: this mount lives in the !billingEnabled branch, so the
-                  provider surface is structurally absent on cloud (Requirement). */}
+                  provider surface is structurally absent on cloud (Requirement). This
+                  card writes the satellite triple (X-LLM-*); the OpenAI card below
+                  writes the pipeline family (X-OpenAI-*) — both coexist (D5). */}
               <LlmProviderCard
                 savedConfig={llmConfig}
                 onConfigSet={setLlmConfig}
@@ -1379,6 +1635,130 @@ function App() {
                 llmModel={llmModel}
                 llmBaseUrl={llmBaseUrl}
               />
+
+              {/* OpenAI / Compatible API — overrides env if provided */}
+              <div className="card p-4 sm:p-6 mb-8 animate-fade">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="p-2 bg-paper3 rounded-input text-brass">
+                    <Bot size={18} />
+                  </div>
+                  <h2 className="font-display lowercase text-lg text-ink">OpenAI / Compatible API</h2>
+                  <span className="readout">BYOK</span>
+                </div>
+                <p className="text-xs text-muted mb-4 leading-relaxed">
+                  Optional — when set, these override server env <code className="readout">OPENAI_MODEL</code> / <code className="readout">OPENAI_BASE_URL</code> / <code className="readout">OPENAI_API_KEY</code>. Leave empty to use server defaults. Works with OpenAI, Azure, or local servers (LM Studio / Ollama).
+                </p>
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-ink mb-1">API Key <span className="text-muted font-normal">(not required for local servers)</span></label>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="password"
+                        value={openaiKey}
+                        onChange={(e) => setOpenaiKey(e.target.value)}
+                        placeholder="sk-... (leave empty for local)"
+                        className="input-field font-mono flex-1"
+                      />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const base = (openaiBaseUrl || "").trim().replace(/\/$/, "") || "https://api.openai.com/v1";
+                          try {
+                            const h = {};
+                            if (openaiKey) h["Authorization"] = `Bearer ${openaiKey}`;
+                            let res = await fetch(`/api/openai/models?base_url=${encodeURIComponent(base)}`, { headers: h });
+                            if (!res.ok) res = await fetch(`${base}/models`, { headers: openaiKey ? { Authorization: `Bearer ${openaiKey}` } : {} });
+                            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                            const j = await res.json();
+                            const list = j.data || j.models || j;
+                            const ids = Array.isArray(list) ? list.map(m => m.id || m.name || m).filter(Boolean) : [];
+                            if (ids.length === 0) throw new Error("No models returned");
+                            setOpenaiModels(ids);
+                            alert(`OpenAI OK — ${ids.length} models from server`);
+                          } catch (e) { alert(`Test failed: ${e.message || e}`); }
+                        }}
+                        className="btn-quiet px-3 py-1.5 text-xs whitespace-nowrap"
+                        title="Test OpenAI connection + fetch models"
+                      >
+                        Test
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-ink mb-1">Model</label>
+                      <div className="flex gap-1.5 relative">
+                        <input
+
+                          value={openaiModel}
+                          onChange={(e) => setOpenaiModel(e.target.value)}
+                          placeholder="gpt-4o-mini"
+                          onFocus={() => setOpenaiModelDropdownOpen(true)}
+                          onBlur={() => setTimeout(() => setOpenaiModelDropdownOpen(false), 150)}
+                          className="input-field font-mono flex-1"
+                        />
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const base = (openaiBaseUrl || '').trim().replace(/\/$/, '') || 'https://api.openai.com/v1';
+                            setOpenaiModelsLoading(true); setOpenaiModelsError(null);
+                            try {
+                              const h = {};
+                              if (openaiKey) h['Authorization'] = `Bearer ${openaiKey}`;
+                              // First try via backend proxy to avoid CORS on local servers
+                              let res = await fetch(`/api/openai/models?base_url=${encodeURIComponent(base)}`, { headers: h });
+                              if (!res.ok) {
+                                // Fallback direct fetch (for browser-accessible servers)
+                                res = await fetch(`${base}/models`, { headers: openaiKey ? { Authorization: `Bearer ${openaiKey}` } : {} });
+                              }
+                              if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                              const j = await res.json();
+                              // OpenAI format: {data:[{id:...}]} or {models:[...]}
+                              const list = j.data || j.models || j;
+                              const ids = Array.isArray(list) ? list.map(m => m.id || m.name || m).filter(Boolean) : [];
+                              if (ids.length === 0) throw new Error('No models returned');
+                              setOpenaiModels(ids);
+                            } catch (e) {
+                              setOpenaiModelsError(e.message || 'Failed to fetch models');
+                            } finally { setOpenaiModelsLoading(false); }
+                          }}
+                          className="btn-quiet px-2 py-1 text-xs whitespace-nowrap"
+                          title="Fetch models from Base URL"
+                        >
+                          {openaiModelsLoading ? <Loader2 size={12} className="animate-spin" /> : 'Refresh'}
+                        </button>
+                      </div>
+
+                      {openaiModelDropdownOpen && (
+                          <div className="mt-1 max-h-48 overflow-y-auto bg-paper border border-rule rounded-input shadow-lg custom-scrollbar">
+                            {(() => {
+                              const base = openaiModels.length > 0 ? openaiModels : ["gpt-4o","gpt-4o-mini","gpt-4-turbo","gpt-3.5-turbo","qwen3-vl-8b-instruct","qwen2.5-72b-instruct"];
+                              return base.map(m => (
+                                <button key={m} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setOpenaiModel(m); setOpenaiModelDropdownOpen(false); }}
+                                  className={`w-full text-left px-3 py-2 text-sm font-mono hover:bg-paper3 transition-colors ${openaiModel===m ? "bg-paper3 text-brass" : "text-ink"}`}>{m}</button>
+                              ));
+                            })()}
+                          </div>
+                        )}
+                        {openaiModelsError && <p className="text-micro text-warn mt-1">{openaiModelsError}</p>}
+                      {openaiModels.length > 0 && <p className="text-micro text-muted mt-1">{openaiModels.length} models from server — pick or type custom.</p>}
+                      {!openaiModels.length && !openaiModelsError && <p className="text-micro text-muted mt-1">Click Refresh to detect local models, or type custom.</p>}
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-ink mb-1">Base URL</label>
+                      <input
+                        type="text"
+                        value={openaiBaseUrl}
+                        onChange={(e) => setOpenaiBaseUrl(e.target.value)}
+                        placeholder="https://api.openai.com/v1"
+                        className="input-field font-mono"
+                      />
+                      <p className="text-micro text-muted mt-1">e.g. <code className="readout">http://host.docker.internal:1234/v1</code> for LM Studio</p>
+                    </div>
+                  </div>
+                  <p className="text-micro text-muted">Saves automatically — use Test next to API Key to verify.</p>
+                </div>
+              </div>
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -1691,6 +2071,45 @@ function App() {
             </div>
           )}
 
+          {activeTab === 'game-profiles' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-6 md:p-8">
+                <GameProfilesPage />
+              </div>
+            </div>
+          )}
+
+          {/* VoiceOver stays mounted (hidden via CSS) so in-flight generation
+              state — options, job progress, logs — survives tab switches. */}
+          {voiceoverMounted && (
+            <div className={`h-full overflow-y-auto custom-scrollbar ${activeTab === 'voiceover' ? '' : 'hidden'}`}>
+              <div className="max-w-6xl mx-auto p-6 md:p-8">
+                <VoiceOverPage
+                  presetSource={voiceoverSource}
+                  onClearPresetSource={() => setVoiceoverSource(null)}
+                  aiProvider={aiProvider}
+                  geminiApiKey={apiKey}
+                  geminiModel={geminiModel}
+                  openaiApiKey={openaiKey}
+                  openaiModel={openaiModel}
+                  openaiBaseUrl={openaiBaseUrl}
+                  elevenLabsKey={elevenLabsKey}
+                  results={results}
+                  jobId={jobId}
+                  gameProfiles={gameProfiles}
+                />
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'voice-style-presets' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-6 md:p-8">
+                <VoiceStylePresetsPage />
+              </div>
+            </div>
+          )}
+
           {activeTab === 'thumbnails' && (
             <ThumbnailStudio
               geminiApiKey={apiKey}
@@ -1731,19 +2150,208 @@ function App() {
                   </p>
                   {/* The same pipeline is an MCP server: point people at the
                       one place that explains how to drive it from an agent. */}
+                  {!tutorialLock && (
                   <p className="text-xs text-muted">
                     Or let an agent do it:{' '}
                     <a
                       href={billingEnabled ? '#/account' : '#app'}
-                      onClick={(e) => { if (!billingEnabled) { e.preventDefault(); setActiveTab('settings'); } }}
+                      onClick={(e) => { if (!billingEnabled) { e.preventDefault(); goToTab('settings'); } }}
                       className="text-ink2 underline underline-offset-2 hover:text-brass transition-colors"
                     >
                       connect Claude, ChatGPT or n8n →
                     </a>
                   </p>
+                  )}
                 </div>
 
+                {/* AI Provider selector for clip generation */}
+                <div className="card p-3 mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Bot size={14} className="text-brass" />
+                    <span className="text-sm font-medium text-ink lowercase">AI provider for this job</span>
+                    <span className="readout">{aiProvider}</span>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setAiProvider('gemini')}
+                      className={aiProvider === 'gemini' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
+                    >
+                      Gemini
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAiProvider('openai')}
+                      className={aiProvider === 'openai' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
+                    >
+                      OpenAI
+                    </button>
+                  </div>
+                </div>
+                {/* Phase 4: Cheap multimodal toggles */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><Activity size={14} className="text-brass" /> candidate detection</span>
+                    <span className="text-micro text-muted">fine-tune what the AI looks for</span>
+                  </div>
+                  <p className="text-sm text-muted mb-3">Every video is scanned for viral moments. Your transcript is always analyzed, plus optional signals that catch moments even when no one is speaking — sudden loudness, screams, scene cuts, and visual motion. Keep them on for best coverage, or toggle off to focus on dialogue.</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <label className={`flex items-center justify-between gap-2 p-2 rounded-input border cursor-pointer ${enableScene ? 'bg-paper3 border-brass/40' : 'bg-paper border-rule'}`}>
+                      <span className="text-sm text-ink lowercase">scene detection</span>
+                      <input type="checkbox" checked={enableScene} onChange={e => setEnableScene(e.target.checked)} className="accent-[var(--color-accent)]" />
+                    </label>
+                    <label className={`flex items-center justify-between gap-2 p-2 rounded-input border cursor-pointer ${enableAudio ? 'bg-paper3 border-brass/40' : 'bg-paper border-rule'}`}>
+                      <span className="text-sm text-ink lowercase">audio events</span>
+                      <input type="checkbox" checked={enableAudio} onChange={e => setEnableAudio(e.target.checked)} className="accent-[var(--color-accent)]" />
+                    </label>
+                    <label className={`flex items-center justify-between gap-2 p-2 rounded-input border cursor-pointer ${enableVisual ? 'bg-paper3 border-brass/40' : 'bg-paper border-rule'}`}>
+                      <span className="text-sm text-ink lowercase">visual activity</span>
+                      <input type="checkbox" checked={enableVisual} onChange={e => setEnableVisual(e.target.checked)} className="accent-[var(--color-accent)]" />
+                    </label>
+                  </div>
+                  <div className="text-micro text-muted mt-2">Catches scene changes, audio spikes, reactions and motion — so even a quiet moment followed by a sudden scare won’t be missed</div>
+                </div>
+                {/* Advanced video analysis — Phase 6 Vision */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><Activity size={14} className="text-brass" /> advanced video analysis</span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" checked={enableVision} onChange={e => setEnableVision(e.target.checked)} className="sr-only peer" />
+                      <div className="w-9 h-5 bg-paper border border-rule rounded-full peer peer-checked:bg-brass peer-checked:border-brass transition-colors"></div>
+                      <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4 shadow"></div>
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted mt-2">When on, each candidate is analyzed with 6 frames (3 uniform + 3 around peaks like screams and loudness). Also expands candidates so vision has more choice. Slower but more thorough — toggle off for speed.</p>
+                  <div className="text-micro text-muted mt-1">{enableVision ? '👁️ Vision ON — 6 frames per window, more candidates' : 'Vision OFF — faster, transcript + audio only'}</div>
+                </div>
+                {/* Deep full-VOD analysis — autoshorts deep (16 frames via qwen3-vl-8b/Gemini) */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><Activity size={14} className="text-brass" /> deep full-vod scan</span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" checked={enableDeep} onChange={e => setEnableDeep(e.target.checked)} className="sr-only peer" />
+                      <div className="w-9 h-5 bg-paper border border-rule rounded-full peer peer-checked:bg-brass peer-checked:border-brass transition-colors"></div>
+                      <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4 shadow"></div>
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted mt-2">Before the regular candidate search, the AI watches the whole video from start to finish and notes the best moments — HOOK to PAYOFF. With Gemini it actually views the footage; with OpenAI-compatible models it inspects a frame sample across the full duration. The strongest finds are then always among the final clips, and a selected game profile steers what counts as a moment.</p>
+                  <div className="text-micro text-muted mt-1">{enableDeep ? 'Deep ON — the AI sees the whole video before picking' : 'Deep OFF — cheap + transcript only'}</div>
+                  {enableDeep && (
+                    <div className="mt-3 pt-3 border-t border-rule space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-ink lowercase">deep provider</span>
+                        <div className="flex gap-1">
+                          <button type="button" onClick={() => setDeepProvider('')} className={deepProvider === '' ? 'btn-primary px-2 py-1 text-xs' : 'btn-quiet px-2 py-1 text-xs'}>same as job</button>
+                          <button type="button" onClick={() => setDeepProvider('gemini')} className={deepProvider === 'gemini' ? 'btn-primary px-2 py-1 text-xs' : 'btn-quiet px-2 py-1 text-xs'}>Gemini</button>
+                          <button type="button" onClick={() => setDeepProvider('openai')} className={deepProvider === 'openai' ? 'btn-primary px-2 py-1 text-xs' : 'btn-quiet px-2 py-1 text-xs'}>OpenAI</button>
+                        </div>
+                      </div>
+                      <div className="text-micro text-muted">{deepProvider ? `Deep will use ${deepProvider} separate from main ${aiProvider} — ${deepProvider === 'gemini' ? geminiModel : openaiModel}` : `Deep uses same provider as job (${aiProvider})`}</div>
+                    </div>
+                  )}
+                </div>
+                {/* Subtitle enhancement — Phase 15: LLM correction + emoji, post-Whisper before analysis */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><span className="text-brass">✎</span> LLM subtitle enhancement</span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" checked={enableEnhance} onChange={e => { const v=e.target.checked; setEnableEnhance(v); if(!v) setEnableEmoji(false); }} className="sr-only peer" />
+                      <div className="w-9 h-5 bg-paper border border-rule rounded-full peer peer-checked:bg-brass peer-checked:border-brass transition-colors"></div>
+                      <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4 shadow"></div>
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted mt-2">Corrects Whisper mistakes (keeps language, preserves timestamps, never invents dialogue). Runs right after transcription so deep/vision see the clean text.</p>
+                  <div className="flex items-center justify-between mt-3 pt-3 border-t border-rule">
+                    <span className="text-sm text-ink lowercase flex items-center gap-2"><span>😊</span> add emoji</span>
+                    <label className={`relative inline-flex items-center ${!enableEnhance ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}>
+                      <input type="checkbox" checked={enableEmoji} disabled={!enableEnhance} onChange={e => setEnableEmoji(e.target.checked)} className="sr-only peer" />
+                      <div className="w-9 h-5 bg-paper border border-rule rounded-full peer peer-checked:bg-brass peer-checked:border-brass transition-colors"></div>
+                      <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4 shadow"></div>
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted mt-1">When on, adds emojis conservatively where fitting — LLM decides how many, not spam. Requires enhancement on.</p>
+                  <div className="text-micro text-muted mt-1">{enableEnhance ? (enableEmoji ? 'Enhancement + emoji ON' : 'Enhancement ON, emoji OFF') : 'Enhancement OFF — raw Whisper text'}</div>
+                </div>
+                {/* Target clips count */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><LayoutGrid size={14} className="text-brass" /> number of clips</span>
+                    <span className="readout">{targetClips} clips</span>
+                  </div>
+                  <div className="flex items-center gap-3 mt-2">
+                    <input type="range" min="1" max="10" value={targetClips} onChange={e => setTargetClips(parseInt(e.target.value,10))} className="flex-1 accent-[var(--color-accent)]" />
+                    <select value={targetClips} onChange={e => setTargetClips(parseInt(e.target.value,10))} className="bg-paper border border-rule rounded-input px-2 py-1 text-sm text-ink w-16">
+                      {[1,2,3,4,5,6,7,8,9,10].map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                  <div className="text-micro text-muted mt-1">Deep clips (if enabled) are always included — the rest are filled from vision/transcript</div>
+                </div>
+                <p className="text-micro text-muted mb-3 px-1">Gemini uses <code className="readout">GEMINI_API_KEY</code> (or X-Gemini-Key). OpenAI uses the settings above (model/base URL/key) and forwards <code className="readout">OPENAI_*</code> envs to the job. Keys from Settings override server env.</p>
+                {/* Game Profile selector for this job (Phase 5) */}
+                <div className="card p-3 mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-medium text-ink lowercase flex items-center gap-2"><UsersIcon size={14} className="text-brass" /> game profile for this clip</span>
+                    <span className="text-micro text-muted">optional — tunes scoring</span>
+                  </div>
+                  <p className="text-sm text-muted mb-3">Pick a Game Profile to tailor viral scoring to your game’s style — weights and AI analysis are injected into clip selection. Leave as none for universal scoring.</p>
+                  <div className="flex gap-2">
+                    <select
+                      value={selectedProfileId}
+                      onChange={e => setSelectedProfileId(e.target.value)}
+                      className="flex-1 bg-paper border border-rule rounded-input px-3 py-2 text-sm text-ink focus:outline-none focus:border-brass"
+                    >
+                      <option value="">— none (universal) —</option>
+                      {gameProfiles.map(prof => (
+                        <option key={prof.id} value={prof.id}>{prof.name} · {prof.game_title || prof.game_type || 'custom'}</option>
+                      ))}
+                    </select>
+                    <button type="button" onClick={async () => { try { const d = await apiJson('/api/game-profiles'); setGameProfiles(Array.isArray(d)?d:[]);} catch { /* ignore */ }}} className="btn-quiet px-3 py-2 text-xs">Refresh</button>
+                  </div>
+                  {selectedProfileId ? (
+                    <div className="text-micro text-muted mt-2">Selected: <code className="readout">{(gameProfiles.find(pr => pr.id===selectedProfileId)?.name) || selectedProfileId}</code> — weights will affect ranking without another LLM call</div>
+                  ) : (
+                    <div className="text-micro text-muted mt-2">Tip: create profiles in Game Profiles — they store Steam metadata + custom tuning for scoring.</div>
+                  )}
+                  {selectedGameProfile && (
+                    <div className="mt-3 p-3 rounded-input border border-brass/30 bg-paper2 space-y-3 text-left">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-ink truncate">{selectedGameProfile.name || 'Unnamed'}</div>
+                          <div className="text-micro text-muted truncate">{selectedGameProfile.game_title || '—'}{selectedGameProfile.game_type ? ' · ' + selectedGameProfile.game_type : (selectedGameProfile.ai_analysis?.game_type ? ' · ' + selectedGameProfile.ai_analysis.game_type : '')}</div>
+                        </div>
+                        <button type="button" onClick={() => setEditingSelectedProfile(selectedGameProfile)} className="btn-quiet px-2 py-1 text-xs shrink-0">Edit</button>
+                      </div>
+                      {(selectedGameProfile.steam_description || selectedGameProfile.custom_description) && (
+                        <div className="space-y-1">
+                          {selectedGameProfile.steam_description && <p className="text-xs text-muted line-clamp-3"><span className="font-medium text-ink">Steam:</span> {selectedGameProfile.steam_description.slice(0, 200)}{selectedGameProfile.steam_description.length > 200 ? '…' : ''}</p>}
+                          {selectedGameProfile.custom_description && <p className="text-xs text-muted"><span className="font-medium text-ink">Custom notes:</span> {selectedGameProfile.custom_description.slice(0, 200)}{selectedGameProfile.custom_description.length > 200 ? '…' : ''}</p>}
+                        </div>
+                      )}
+                      {selectedGameProfile.ai_analysis && (
+                        <div className="space-y-1.5">
+                          {selectedGameProfile.ai_analysis.game_type && <div className="text-xs"><span className="font-medium text-ink">Game type:</span> <span className="text-muted">{selectedGameProfile.ai_analysis.game_type}</span></div>}
+                          {Array.isArray(selectedGameProfile.ai_analysis.gameplay_characteristics) && selectedGameProfile.ai_analysis.gameplay_characteristics.length > 0 && (
+                            <div className="text-xs"><span className="font-medium text-ink">Gameplay:</span> <span className="text-muted">{selectedGameProfile.ai_analysis.gameplay_characteristics.slice(0,4).join(' · ')}{selectedGameProfile.ai_analysis.gameplay_characteristics.length > 4 ? ' …' : ''}</span></div>
+                          )}
+                          {Array.isArray(selectedGameProfile.ai_analysis.key_moments) && selectedGameProfile.ai_analysis.key_moments.length > 0 && (
+                            <div className="text-xs"><span className="font-medium text-ink">Key moments:</span> <span className="text-muted">{selectedGameProfile.ai_analysis.key_moments.slice(0,4).join(' · ')}{selectedGameProfile.ai_analysis.key_moments.length > 4 ? ' …' : ''}</span></div>
+                          )}
+                        </div>
+                      )}
+                      <div>
+                        <div className="text-micro font-medium text-ink mb-1">Weights for LLM</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(() => { try { const w = selectedGameProfile.active_weights || selectedGameProfile.recommended_weights || {}; return Object.entries(w).map(([k,v]) => (<span key={k} className="px-2 py-0.5 rounded-full bg-brass/15 border border-brass/30 text-ink text-micro">{k.replace(/_/g, ' ')}: {typeof v === 'number' ? v.toFixed(2) : String(v)}</span>)); } catch { return <span className="text-micro text-muted">no weights</span>; } })()}
+                        </div>
+                      </div>
+                      <div className="text-micro text-muted border-t border-rule pt-2">All above + cheap timeline (scream, loudness, scene changes) are sent to the LLM for scoring.</div>
+                    </div>
+                  )}
+                </div>
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                {editingSelectedProfile && (
+                  <CreateEditProfileModal isOpen={!!editingSelectedProfile} profile={editingSelectedProfile} onClose={() => setEditingSelectedProfile(null)} onSave={async () => { setEditingSelectedProfile(null); try { const d = await apiJson('/api/game-profiles'); setGameProfiles(Array.isArray(d)?d:[]);} catch { /* ignore */ } }} aiProvider={aiProvider} geminiApiKey={apiKey} openaiApiKey={openaiKey} openaiModel={openaiModel} openaiBaseUrl={openaiBaseUrl} />
+                )}
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
@@ -1826,12 +2434,17 @@ function App() {
                   </button>
                   {logsVisible && (
                     <div className="flex-1 p-3.5 sm:p-4 overflow-y-auto font-mono text-[11px] sm:text-xs space-y-1.5 custom-scrollbar text-muted break-words">
-                      {logs.map((log, i) => (
-                        <div key={i} className={`flex gap-2 ${log.toLowerCase().includes('error') ? 'text-danger' : 'text-muted'}`}>
-                          <span className="text-muted opacity-50 shrink-0 hidden sm:inline">{new Date().toLocaleTimeString()}</span>
-                          <span className="min-w-0 break-words">{log}</span>
-                        </div>
-                      ))}
+                      {logs.map((log, i) => {
+                        const m = log.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)$/);
+                        const ts = m ? m[1] : '--:--:--';
+                        const msg = m ? m[2] : log;
+                        return (
+                          <div key={i} className={`flex gap-2 ${log.toLowerCase().includes('error') ? 'text-danger' : 'text-muted'}`}>
+                            <span className="text-muted opacity-50 shrink-0 hidden sm:inline">{ts}</span>
+                            <span className="min-w-0 break-words">{msg}</span>
+                          </div>
+                        );
+                      })}
                       {status === 'processing' && (
                         <div className="animate-pulse text-brass">_</div>
                       )}
@@ -1842,6 +2455,31 @@ function App() {
 
               {/* Right Panel: Results Grid */}
               <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 transition-all duration-700 ease-in-out`}>
+                {/* VOD Title/Description from deep (or fallback) — with ~10 timestamps */}
+                {(results?.vod_title || results?.vod_description) && (
+                  <div className="card p-3 mb-4 border-brass/30 bg-paper2 space-y-2">
+                    <div className="flex items-center gap-2 text-sm font-medium text-ink lowercase"><Globe size={14} className="text-brass" /> VOD title & description for Twitch</div>
+                    {results?.vod_title && (
+                      <div className="space-y-1">
+                        <div className="text-micro text-muted">Title</div>
+                        <div className="flex gap-2">
+                          <input value={results.vod_title} readOnly className="flex-1 bg-paper border border-rule rounded-input px-3 py-2 text-sm text-ink" />
+                          <button type="button" onClick={() => navigator.clipboard.writeText(results.vod_title)} className="btn-quiet px-3 py-2 text-xs">Copy</button>
+                        </div>
+                      </div>
+                    )}
+                    {results?.vod_description && (
+                      <div className="space-y-1">
+                        <div className="text-micro text-muted">Description (with timestamps)</div>
+                        <textarea value={results.vod_description} readOnly rows={3} className="w-full bg-paper border border-rule rounded-input px-3 py-2 text-sm text-ink resize-none" />
+                        <div className="flex gap-2">
+                          <button type="button" onClick={() => navigator.clipboard.writeText(results.vod_description)} className="btn-quiet px-2 py-1 text-xs">Copy</button>
+                          <button type="button" onClick={() => navigator.clipboard.writeText((results.vod_title||"") + "\n\n" + (results.vod_description||""))} className="btn-quiet px-2 py-1 text-xs">Copy both</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {/* Title + counters on one row, the two actions on their own row
                     below. Wrapping them all together dropped a lone half-width
                     "schedule week" pill under the title on a phone. */}
@@ -1855,7 +2493,7 @@ function App() {
                     )}
                     {results?.cost_analysis && !isManaged && (
                       <span className="readout bg-paper3 px-2.5 py-1 rounded-full" title={`Input: ${results.cost_analysis.input_tokens} | Output: ${results.cost_analysis.output_tokens}`}>
-                        GEMINI · ${results.cost_analysis.total_cost.toFixed(5)}
+                        {(results.cost_analysis.provider || aiProvider || 'ai').toUpperCase()} · ${results.cost_analysis.total_cost.toFixed(5)}
                       </span>
                     )}
                   </h2>
@@ -1976,6 +2614,10 @@ function App() {
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                           onBulkSubtitle={handleBulkSubtitles}
+                          onVoiceOver={(idx) => {
+                            setVoiceoverSource({ clipIndex: idx, jobId });
+                            setActiveTab('voiceover');
+                          }}
                           clipCount={results.clips.length}
                           bulkProgress={bulkSub}
                         />
@@ -2029,7 +2671,7 @@ function App() {
               Cancel
             </button>
             <button
-              onClick={() => { setShowKeyModal(false); setActiveTab('settings'); }}
+              onClick={() => { setShowKeyModal(false); goToTab('settings'); }}
               className="btn-primary flex-1 px-4 py-2 text-sm"
             >
               Go to Settings
@@ -2167,6 +2809,15 @@ function App() {
         />
       )}
       {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
+      {tutorialPhase && (
+        <ClipTutorial
+          phase={tutorialPhase}
+          jobStatus={status}
+          onStart={startTutorial}
+          onSkip={skipTutorial}
+          onDismissCelebrate={finishTutorial}
+        />
+      )}
       {showPlanChoice && <PlanChoiceModal onClose={() => setShowPlanChoice(false)} />}
       {showTopUp && (
         <TopUpModal

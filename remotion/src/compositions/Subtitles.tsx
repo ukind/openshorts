@@ -9,7 +9,46 @@ import {
 } from "remotion";
 import type { SubtitleConfig } from "../lib/types";
 import { groupCaptionsIntoBlocks, getActiveWordIndex } from "../lib/captions";
-import { getFontStack } from "../lib/fonts";
+import { getFontStack, antonFontFace, notoSerifFontFace } from "../lib/fonts";
+import { AnimatedEmoji, getAvailableEmojis } from "@remotion/animated-emoji";
+
+// Map codepoint (e.g. "1f525") -> emoji name ("fire") for AnimatedEmoji
+const CODEPOINT_TO_NAME = new Map<string, string>();
+for (const e of getAvailableEmojis() as unknown as Array<{name: string; codepoint: string}>) {
+  CODEPOINT_TO_NAME.set(e.codepoint.toLowerCase(), e.name);
+  const base = e.codepoint.split('_')[0].toLowerCase();
+  if (!CODEPOINT_TO_NAME.has(base)) CODEPOINT_TO_NAME.set(base, e.name);
+}
+function emojiNameForText(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  // Take first grapheme (emoji may be multiple codepoints with ZWJ/VS16)
+  // Convert to codepoints like "1f525" or "1f601"
+  const cps: string[] = [];
+  for (const ch of trimmed) {
+    const cp = ch.codePointAt(0);
+    if (cp !== undefined) {
+      // Skip VS16 (fe0f) and ZWJ (200d) for lookup, but keep for full codepoint check
+      if (cp === 0xfe0f || cp === 0x200d) continue;
+      // Skip skin tone modifiers for base lookup
+      if (cp >= 0x1f3fb && cp <= 0x1f3ff) continue;
+      cps.push(cp.toString(16).toLowerCase());
+    }
+  }
+  if (cps.length === 0) return null;
+  const joined = cps.join('_');
+  return CODEPOINT_TO_NAME.get(joined) || CODEPOINT_TO_NAME.get(cps[0]) || null;
+}
+function isEmojiWord(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  // If the word is only emoji characters (no letters/numbers), treat as emoji
+  const withoutEmoji = t.replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764]/gu, '').trim();
+  // If removing emoji leaves nothing or only variation selectors, it's emoji-only
+  const stripped = t.replace(/\uFE0F|\u200D|[\u{1F3FB}-\u{1F3FF}]/gu, '');
+  const hasLetter = /[a-zA-Z0-9\u00C0-\u024F]/.test(stripped);
+  return !hasLetter && emojiNameForText(t) !== null;
+}
 
 interface SubtitlesProps {
   config: SubtitleConfig;
@@ -21,12 +60,33 @@ const POSITION_MAP: Record<string, React.CSSProperties> = {
   bottom: { bottom: "10%", top: "auto" },
 };
 
+/** Dynamic vertical from style.marginV (0-100): 0→12% top, 50→45% top, 100→bottom 10%. Falls back to discrete POSITION_MAP for legacy. */
+function getPositionStyle(
+  style: SubtitleConfig["style"],
+  position: SubtitleConfig["position"]
+): React.CSSProperties {
+  const mv = (style as unknown as { marginV?: number }).marginV;
+  if (typeof mv === "number" && !Number.isNaN(mv)) {
+    const clamped = Math.max(0, Math.min(100, mv));
+    if (clamped >= 98) return { bottom: "10%", top: "auto" };
+    let topPct: number;
+    if (clamped <= 50) topPct = 12 + (clamped / 50) * 33;
+    else topPct = 45 + ((clamped - 50) / 50) * 45;
+    return { top: `${topPct}%`, bottom: "auto" };
+  }
+  return POSITION_MAP[position] ?? POSITION_MAP.bottom;
+}
+
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
   const { fps } = useVideoConfig();
-  const blocks = groupCaptionsIntoBlocks(config.captions);
+  const maxChars = (config as any).maxChars ?? 20;
+  const maxDuration = (config as any).maxDuration ?? 2000;
+  const blocks = groupCaptionsIntoBlocks(config.captions, maxChars, maxDuration);
 
   return (
     <AbsoluteFill>
+      <style>{antonFontFace}</style>
+      <style>{notoSerifFontFace}</style>
       {blocks.map((block, i) => {
         const startFrame = Math.round((block.startMs / 1000) * fps);
         const durationFrames = Math.max(
@@ -72,7 +132,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
   const currentTimeMs = blockStartMs + (frame / fps) * 1000;
   const activeIndex = getActiveWordIndex(block.words, currentTimeMs);
 
-  const positionStyle = POSITION_MAP[position] ?? POSITION_MAP.bottom;
+  const positionStyle = getPositionStyle(style, position);
   const fontStack = getFontStack(style.fontFamily);
 
   // Background box style
@@ -103,8 +163,10 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
           display: "flex",
           flexWrap: "wrap",
           justifyContent: "center",
-          gap: "6px 8px",
-          maxWidth: "85%",
+          alignItems: "center",
+          lineHeight: (style as unknown as { lineHeight?: number }).lineHeight ?? 1.0,
+          gap: `${(style as unknown as { wordGap?: number }).wordGap ?? 8}px`,
+          maxWidth: "95%",
           ...bgStyle,
         }}
       >
@@ -204,11 +266,37 @@ const WordSpan: React.FC<WordSpanProps> = ({
         ].join(", ")
       : "none";
 
+  // Animated emoji: render via Remotion's AnimatedEmoji (Google animated, Android color) when the word is an emoji.
+  // Emoji are intentionally larger than text (1.8×) so they pop, and text keeps its exact fontSize
+  // — previously text appeared smaller when emoji were present because the flex wrap with
+  // emoji spans compressed the line. Now emoji are 1.8× and vertically centered.
+  const emojiName = isEmojiWord(word) ? emojiNameForText(word) : null;
+  if (emojiName) {
+    const baseSize = Math.round(style.fontSize * 0.4 * 1920 / 288) ;
+    const size = Math.round(baseSize * 1.5); // bigger than text but not crushing line (was 1.8× raw, now 1.5× scaled)
+    return (
+      <span
+        style={{
+          display: "inline-block",
+          width: size,
+          height: size,
+          transform,
+          verticalAlign: "middle",
+          margin: "-2px 1px", // optical nudge so emoji don't push the baseline down
+          ...extraStyle,
+        }}
+      >
+        <AnimatedEmoji emoji={emojiName as any} style={{width: size, height: size}} />
+      </span>
+    );
+  }
+
+  const displayWord = (style as any).uppercase ? word.toUpperCase() : word;
   return (
     <span
       style={{
         fontFamily: fontStack,
-        fontSize: style.fontSize,
+        fontSize: Math.round(style.fontSize * 0.4 * 1920 / 288) ,
         fontWeight: 700,
         color: animation === "karaoke" && isActive ? undefined : color,
         textShadow:
@@ -218,10 +306,12 @@ const WordSpan: React.FC<WordSpanProps> = ({
         transform,
         display: "inline-block",
         transition: "none",
+        letterSpacing: `${(style as unknown as { letterSpacing?: number }).letterSpacing ?? 0}px`,
+        lineHeight: (style as unknown as { lineHeight?: number }).lineHeight ?? 1.0,
         ...extraStyle,
       }}
     >
-      {word}
+      {displayWord}
     </span>
   );
 };

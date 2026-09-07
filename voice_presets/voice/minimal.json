@@ -1,0 +1,11 @@
+{
+  "id": "minimal",
+  "title": "Minimal Calm",
+  "prompt": "gender: Male.\npitch: Low, steady pitch with minimal variation.\nspeed: Slow to moderate, unhurried and calm.\nvolume: Quiet to moderate, intimate and close.\nage: Young to middle-aged adult, 25 to 35.\nclarity: Clear but understated, effortless articulation.\nfluency: Smooth and easy, natural flow.\naccent: American English, neutral and unassuming.\ntexture: Soft, gentle vocal quality without harshness.\nemotion: Calm, composed, subtly confident.\ntone: Understated, reserved, quiet assurance.\npersonality: Introverted, thoughtful, self-contained.",
+  "kind": "generic",
+  "tags": [
+    "minimal"
+  ],
+  "created_at": "2026-08-30T18:53:27.075874",
+  "updated_at": "2026-08-30T18:53:27.075874"
+}

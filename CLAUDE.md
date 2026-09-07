@@ -120,16 +120,67 @@ Gemini era de las medidas continuas, no del modelo.
 `layout_picker.apply()` sólo **añade**: una elección explícita del usuario nunca
 se desactiva porque el modelo diga `none`.
 
-### Third-party LLM endpoint (optional, phase 1)
+### Hook grounding for on-screen clips (`hook_grounding.py`)
 
-`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` reroute the text stages to any
-OpenAI-compatible `/v1/chat/completions`. Per-task overrides:
-`LLM_MODEL_THUMBNAIL`, `LLM_MODEL_SAAS` (chain: `LLM_MODEL_<TASK>` then
-`LLM_MODEL`, never `GEMINI_MODEL*`).
+The hook and title come from the detail pass, which only reads the
+transcript, so on a clip whose meaning is on the screen (a settings dialog,
+a spreadsheet) they summarise the video's topic instead of naming what is
+shown. After the render, if the `<clip>.layout.json` sidecar says at least
+25% of the clip is `screencast` / `wide` / `inset` (plus `general` when the
+layout picker called the video a screencast: a face-less scene there is a
+slide or a dialog, not a group shot), three frames from those
+stretches at 1024px plus the clip's own words go to Gemini
+(`GroundedHook`) and `viral_hook_text` / `video_title_for_youtube_short`
+are rewritten in place before `auto_hook_clip` burns them; the originals
+stay under `hook_grounding.before`. Gemini-only (frames): with just a local
+LLM it logs one line and keeps the transcript hook. `HOOK_GROUNDING=0`
+disables it. The detail prompt itself now carries the rule "about this
+moment, not the video", which is the cheap half of the same fix.
 
-- Reroutes: clips score/detail, layout picker, thumbnail text, SaaS analyze/scripts.
-- Stays Gemini: image gen, silent-video, editor effects, SaaS grounded research, cloud/managed.
-- Half-configured (no model) → inert + warning; the default path is byte-identical when unset.
+### Third-party LLM endpoint (optional)
+
+`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` reroute the satellite text
+stages to any OpenAI-compatible `/v1/chat/completions` endpoint. Per-task
+overrides: `LLM_MODEL_THUMBNAIL`, `LLM_MODEL_SAAS` (chain:
+`LLM_MODEL_<TASK>` then `LLM_MODEL`, never `GEMINI_MODEL*`).
+
+- Reroutes: layout picker, thumbnail text, SaaS analyze/scripts; the MCP
+  server forwards `X-LLM-*` BYOK headers to the same stages.
+- Stays Gemini: image gen, silent-video, editor effects, SaaS grounded
+  research, cloud/managed.
+- All three vars are required. A bare `LLM_BASE_URL` without a key is inert
+  (keyless local servers belong to the pipeline provider block:
+  `AI_PROVIDER=openai` + `OPENAI_BASE_URL`, no key needed); a
+  half-configured endpoint (no model) stays inert with a one-line warning.
+  With everything unset the default path is byte-identical.
+
+### Stage ownership: `ai_provider.py` vs `llm_client.py`
+
+Two LLM systems coexist and each stage owns exactly one —
+`tests/test_no_double_route.py` pins that no stage can call both. The video
+pipeline (`main.py`: clip score/detail, deep analysis, vision pass,
+voiceover captions, VOD metadata) dispatches through
+`ai_provider.create_ai_provider`, selected by `AI_PROVIDER=gemini|openai`
+(server default) with per-job `X-AI-Provider` / `X-OpenAI-*` headers or the
+`OPENAI_*` env; keyless endpoints (Ollama, LM Studio) work with no key. The
+satellite text stages (layout picker, thumbnail titles/concepts/description,
+SaaS analyze/scripts) dispatch through `llm_client` on the `LLM_*` triple
+above or per-job `X-LLM-*` headers; a header key never travels to an
+env-configured base URL. The fork's third system (the local-LLM moment
+picker) is deleted: its gate exemption became `ai_backend_available()` and
+its `/api/config` `localLlm` flag now reports `_env_llm_config()`.
+The standing rule for future merges: the side whose base you
+take owns the stage.
+
+`ai_backend_available(request, gemini_key, provider)` is the single job
+gate: a Gemini key, a per-job openai provider, a BYOK `X-LLM-*` triple, or
+the server's own `LLM_*` env — any one lets a job start. `/api/config`
+reports both families from that one source: `llmConfigured`/`llmModel`/
+`llmBaseUrl` for the satellites, `localLlm` in the fork's exact dict shape.
+The env namespace split is the rule: `LLM_*` configures satellites only;
+`AI_PROVIDER`/`OPENAI_*`/`GEMINI_*` configure the pipeline only. Pipeline
+errors raise `AIProviderError` (string-sniffed retry classification);
+`AI_TIMEOUT` defaults to 30 s and `AI_TEMPERATURE` to 0.7.
 
 ### Thumbnail Studio (`thumbnail.py`, `/api/thumbnail/*`)
 
@@ -312,6 +363,31 @@ Stripe retry the same doomed event for three days.
 
 ### Concurrency Model
 Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Jobs auto-cleanup after 1 hour.
+
+### Paid proxy accounting (`cloud/proxy_ledger.py`)
+
+Downloads go direct → static ISP proxies (flat rate) → DataImpulse (per GB),
+and the duration probe (`cloud/metering.probe_url_minutes`) follows the same
+order. Two rules keep the per-GB proxy at zero on a normal day: the probe
+reaches it **only** when a static route failed for a reason another IP can
+fix (`static_failure_warrants_paid`: bot-check, 403/429, proxy/network
+errors), never for a private/removed/members-only video or a live stream
+with no duration (those failed the same on every IP and used to cost ~1.7 MB
+× 2 extractors each), and **never for a non-YouTube URL** (the download
+plan already excluded those; Twitch, Kick, Rumble and product pages were
+reaching it through the probe). `main.py` prints `PROXY_ROUTE=<json>` after
+every download (winner, paid bytes across all attempts including failed
+paid ones, each free attempt's error); `app.py` persists it as a
+`proxy_usage` row at job end and pages Telegram when the paid proxy carried
+bytes, folding a burst into one message per 5 min. The in-memory monthly
+counter and the container log (rotates within the hour) cannot answer "what
+cost $14 on the 28th"; the table can. `PAID_PROXY_DAILY_MB` (default
+500) is the hard ceiling: past it the paid proxy is dropped from the probe
+and from every new job's env until UTC midnight. The watcher probes the
+static pool against a real YouTube watch page (playable markers), not
+google.com — the 28th happened because YouTube refused the static IPs while
+google kept answering 204. On the dev Mac, do not keep
+`PROXY_URL` in `.env`: every local `main.py` run then bills DataImpulse.
 
 ### Deploys and running jobs (handover + drain)
 

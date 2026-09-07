@@ -50,9 +50,20 @@ INSTRUCTIONS = (
 
 # Headers an MCP caller may use to authenticate / bring their own keys; they are
 # forwarded verbatim to the internal endpoints so every existing auth path works.
+# The per-job provider/feature families arrived with the marsic parity merge —
+# their resolvers (resolve_ai_provider / resolve_openai / resolve_gemini) and
+# per-job env writers read them; without allowlisting, their features lose
+# BYOK through MCP.
 _FORWARD_HEADERS = ("authorization", "x-api-key", "x-gemini-key",
                     "x-upload-post-key", "x-llm-base-url", "x-llm-key",
-                    "x-llm-model")
+                    "x-llm-model",
+                    "x-ai-provider", "x-gemini-model", "x-openai-key",
+                    "x-openai-model", "x-openai-base-url",
+                    "x-game-profile-id", "x-deep-provider",
+                    "x-elevenlabs-key", "x-target-clips",
+                    "x-enable-scene", "x-enable-audio", "x-enable-visual",
+                    "x-enable-vision", "x-enable-deep", "x-enable-enhance",
+                    "x-enable-emoji")
 
 _LOG_TAIL = 10  # status logs are for humans; agents only need the tail
 

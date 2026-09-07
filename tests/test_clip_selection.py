@@ -158,6 +158,7 @@ class TestDetailPromptCarriesTheCount:
         low, high = clip_count_targets(5)
         prompt = gw.DETAIL_PROMPT_TEMPLATE.format(
             video_duration=300, language="es", min_clips=low, max_clips=high,
+            game_profile_json="{}",  # their post-merge template key; production passes "{}" when no profile is selected
             min_secs=15.0, max_secs=60.0, windows_json="[]")
         assert f"return {low} to {high} clips" in prompt
         assert "15 to 60 seconds" in prompt

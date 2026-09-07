@@ -15,6 +15,10 @@ ENV/
 *.egg-info/
 .pytest_cache/
 
+# Local/runtime caches
+.cache/
+.nv/
+
 # Node
 node_modules/
 remotion/node_modules/
@@ -55,10 +59,20 @@ docker-compose.yml
 # Docs
 README.md
 *.md
-
-
-
-
-
-
+# Animated emoji videos (2GB) — only needed in renderer, not backend.
+# Without this, `COPY . .` in backend would bloat the image and slow the build context.
+remotion/public/*.webm
+remotion/public/*.mp4
+remotion/public/100-*
+remotion/public/airplane-*
+remotion/public/alarm-*
+remotion/public/alien-*
+remotion/public/anatomical-*
+# Build context bloat — never need in image
+output/
+.hermes/
+.hermes/**
+coverage/
+.nyc_output/
+.tmp/
 

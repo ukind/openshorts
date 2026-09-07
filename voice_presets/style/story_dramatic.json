@@ -1,0 +1,8 @@
+{
+  "id": "story_dramatic",
+  "title": "Dramatic",
+  "kind": "story",
+  "prompt": "Generate epic cinematic narration.\nExamples: \"In the arena of champions, legends are born.\", \"The crowd holds their breath.\", \"One shot. One chance. Immortality awaits.\"\nWrite 2-3 sentences per caption. Epic tone, powerful delivery, movie trailer style. Fewer captions (2-4 max).",
+  "created_at": "2026-08-30T18:53:27.072328",
+  "updated_at": "2026-08-30T19:10:45.770133"
+}

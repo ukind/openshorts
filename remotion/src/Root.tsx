@@ -84,12 +84,15 @@ export const RemotionRoot: React.FC = () => {
         width={DEFAULT_PROPS.width}
         height={DEFAULT_PROPS.height}
         defaultProps={DEFAULT_PROPS}
-        calculateMetadata={({ props }) => ({
-          durationInFrames: props.durationInFrames,
-          fps: props.fps,
-          width: props.width,
-          height: props.height,
-        })}
+        calculateMetadata={async ({ props }) => {
+          // Use the actual clip duration from props — otherwise every burn is truncated to 30s (900 frames)
+          const p = props as ShortVideoProps;
+          const durationInFrames = p?.durationInFrames ?? DEFAULT_PROPS.durationInFrames;
+          const fps = p?.fps ?? DEFAULT_PROPS.fps;
+          const width = p?.width ?? DEFAULT_PROPS.width;
+          const height = p?.height ?? DEFAULT_PROPS.height;
+          return { durationInFrames, fps, width, height };
+        }}
       />
     </>
   );

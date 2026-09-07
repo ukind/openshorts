@@ -24,7 +24,10 @@ def client():
 @pytest.fixture(autouse=True)
 def _clean_slate(monkeypatch):
     for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
-              "LLM_MODEL_THUMBNAIL", "LLM_MODEL_SAAS"):
+              "LLM_MODEL_THUMBNAIL", "LLM_MODEL_SAAS",
+              "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
+              "OPENAI_BASE_URL", "GEMINI_API_KEY", "GEMINI_MODEL",
+              "LLM_PROVIDER"):
         monkeypatch.delenv(k, raising=False)
     app_module._probe_times.clear()
 
@@ -154,3 +157,91 @@ class TestConnectionCheck:
         res = client.post("/api/llm/test")
         assert res.status_code == 200
         assert res.json()["model"] == "thumb-only-model"
+
+def _llm_request(headers=None):
+    """A bare starlette Request — enough for the resolvers' header reads."""
+    from starlette.requests import Request as StarletteRequest
+    return StarletteRequest({"type": "http", "headers": [
+        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]})
+
+
+class TestMergedGate:
+    """Ported from the fork's deleted local-LLM gate tests (their file dies
+    with its module in the merge) plus the gate personas. The gate is
+    ai_backend_available(); /api/config reports both key families."""
+
+    def test_no_backend_reports_none_and_blocks_jobs(self, client):
+        cfg = client.get("/api/config").json()
+        assert cfg["llmConfigured"] is False
+        assert cfg["localLlm"] is None
+        res = client.post("/api/process", data={})
+        assert res.status_code == 400
+        assert res.json()["detail"] == app_module.LLM_ENDPOINT_HINT
+
+    def test_base_url_alone_is_inert(self, client, monkeypatch):
+        # Their old moment-picker backend activated on a bare base URL;
+        # llm_client needs base+key. Pins the accepted strictness change (D14).
+        monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+        cfg = client.get("/api/config").json()
+        assert cfg["llmConfigured"] is False
+        assert cfg["localLlm"] is None
+
+    def test_full_triple_reports_both_key_families(self, client, monkeypatch):
+        monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+        monkeypatch.setenv("LLM_API_KEY", "k")
+        monkeypatch.setenv("LLM_MODEL", "qwen2.5:14b")
+        cfg = client.get("/api/config").json()
+        assert cfg["llmConfigured"] is True
+        # Their exact describe() shape (ported from their deleted gate tests).
+        assert cfg["localLlm"] == {
+            "provider": "openai", "model": "qwen2.5:14b", "baseUrl": "http://llm.test/v1"}
+
+    def test_gemini_provider_env_keeps_llm_reporting(self, client, monkeypatch):
+        # Replaces their provider-override test — no reader left. AI_PROVIDER
+        # is the video pipeline's dial; it never mutes the env leg.
+        monkeypatch.setenv("AI_PROVIDER", "gemini")
+        monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+        monkeypatch.setenv("LLM_API_KEY", "k")
+        monkeypatch.setenv("LLM_MODEL", "m")
+        assert client.get("/api/config").json()["llmConfigured"] is True
+
+    def test_predicate_gemini_key_leg(self):
+        import asyncio
+        assert asyncio.run(
+            app_module.ai_backend_available(_llm_request(), gemini_key="k")) is True
+
+    def test_predicate_openai_provider_leg(self):
+        import asyncio
+        # No headers, no env, no Gemini key — the per-job provider leg alone.
+        assert asyncio.run(
+            app_module.ai_backend_available(_llm_request(), provider="openai")) is True
+
+    def test_predicate_byok_header_leg(self):
+        import asyncio
+        req = _llm_request({"X-LLM-Base-Url": "https://byok.test/v1",
+                            "X-LLM-Key": "k",
+                            "X-LLM-Model": "byok-model"})
+        assert asyncio.run(app_module.ai_backend_available(req)) is True
+
+    def test_predicate_env_leg(self, monkeypatch):
+        import asyncio
+        monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+        monkeypatch.setenv("LLM_API_KEY", "k")
+        monkeypatch.setenv("LLM_MODEL", "m")
+        assert asyncio.run(app_module.ai_backend_available(_llm_request())) is True
+
+    def test_predicate_false_when_nothing_configured(self):
+        import asyncio
+        assert asyncio.run(app_module.ai_backend_available(_llm_request())) is False
+
+    def test_provider_only_openai_job_passes_the_gate(self, client, monkeypatch):
+        # AI_PROVIDER=openai + OPENAI_* triple, no Gemini key: the job gate
+        # must not 400 with the LLM hint (their 25222f5 semantics, predicate
+        # edition). No url/file means the endpoint still rejects — later, with
+        # a different message, and without launching anything.
+        monkeypatch.setenv("AI_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://llm.test/v1")
+        monkeypatch.setenv("OPENAI_MODEL", "m")
+        res = client.post("/api/process", data={})
+        assert res.status_code == 400
+        assert res.json()["detail"] != app_module.LLM_ENDPOINT_HINT

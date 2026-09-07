@@ -1,0 +1,11 @@
+{
+  "id": "story_news",
+  "title": "Esports Newscaster",
+  "prompt": "gender: Male.\npitch: Mid-range male pitch, energetic and dynamic.\nspeed: Fast-paced, building excitement with rapid-fire delivery.\nvolume: Loud, projected, arena-filling energy.\nage: Young adult, late 20s to early 30s.\nclarity: Sharp, punchy enunciation, esports casting precision.\nfluency: Rapid-fire with hype pauses, building momentum.\naccent: American English, energetic gaming culture.\ntexture: Bright, electric vocal quality with infectious enthusiasm.\nemotion: Excited, hyped, passionate about the plays.\ntone: Enthusiastic, analytical, building tension and release.\npersonality: Charismatic caster, knowledgeable, gets hyped with the audience.",
+  "kind": "generic",
+  "tags": [
+    "story_news"
+  ],
+  "created_at": "2026-08-30T18:53:27.077053",
+  "updated_at": "2026-08-30T18:53:27.077053"
+}

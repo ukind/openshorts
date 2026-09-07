@@ -194,6 +194,14 @@ _PROXY_RENOTIFY = 7200              # keep nagging every 2 h while it stays down
 # with it), which would make an HTTPS probe cry wolf. An exhausted balance
 # rejects the request before forwarding, so HTTP still detects the 407.
 _PROXY_PROBE_URL = "http://www.google.com/generate_204"
+# The static pool gets probed against YouTube itself, not google.com: on
+# 28-aug-2026 YouTube refused the static IPs for hours ("Video unavailable" /
+# bot-check) while google.com kept answering 204, so the watcher said UP and
+# every job silently moved to the per-GB proxy ($14 that day). A healthy
+# static must return the watch page with a playable player response; bytes
+# through the statics are flat-rate, so the ~600 KB page is free.
+_STATIC_PROBE_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+_STATIC_OK_MARKERS = ('"playabilityStatus"', '"status":"OK"')
 _PROXY_STRIKES = 2                  # consecutive failed probes before alerting
 _watch_down = {}                    # target name -> down-since epoch
 _watch_nag = {}                     # target name -> last-nag epoch
@@ -217,14 +225,29 @@ def _watch_targets():
 
 
 async def _probe_one(proxy):
-    """(ok, detail) for one cheap request through one proxy."""
+    """(ok, detail) for one request through one proxy.
+
+    The paid proxy keeps the plain-HTTP 204 probe (HTTPS through DataImpulse
+    breaks in httpx even when healthy). A static IP is probed against a real
+    YouTube watch page: answering is not enough, the page must carry a
+    playable player response, or the IP is flagged and every download is
+    about to fall through to per-GB billing.
+    """
+    is_paid = proxy == os.environ.get("PROXY_URL", "").strip()
     try:
         import httpx
         async with httpx.AsyncClient(proxy=proxy, timeout=20) as client:
-            resp = await client.get(_PROXY_PROBE_URL)
-        if resp.status_code < 400:
+            resp = await client.get(_PROXY_PROBE_URL if is_paid else _STATIC_PROBE_URL,
+                                    follow_redirects=not is_paid)
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}"
+        if is_paid:
             return True, ""
-        return False, f"HTTP {resp.status_code}"
+        body = resp.text or ""
+        if all(m in body for m in _STATIC_OK_MARKERS):
+            return True, ""
+        return False, ("YouTube answered but without a playable page "
+                       "(IP flagged: bot-check or 'unavailable')")
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
@@ -289,6 +312,13 @@ async def _watch_update(name, ok, detail):
 
 async def proxy_watch_tick():
     """One probe cycle over every configured route."""
+    # Paid-proxy events held back by the ledger's cooldown go out with the
+    # next tick at the latest (cloud/proxy_ledger.flush_alerts).
+    try:
+        from . import proxy_ledger
+        await proxy_ledger.flush_alerts()
+    except Exception:
+        pass
     for name, urls in _watch_targets():
         ok, detail = False, "no urls"
         for u in urls:
