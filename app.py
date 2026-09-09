@@ -7150,6 +7150,7 @@ async def create_game_profile(request: Request, profile_data: dict):
             raise HTTPException(status_code=500, detail=f"Failed to create game profile: {str(e)}")
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import create_game_profile
 
@@ -7202,6 +7203,7 @@ async def list_game_profiles(request: Request):
         ]
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import list_game_profiles
 
@@ -7232,6 +7234,7 @@ async def export_game_profiles(request: Request):
         repo = LocalGameProfileRepository()
         profiles = repo.list_profiles()
     else:
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import list_game_profiles
         raw = await list_game_profiles(str(user.id))
@@ -7298,6 +7301,7 @@ async def import_game_profiles(request: Request):
 
     is_local = os.environ.get("LOCAL_GAMEPROFILES") == "1"
     if not is_local:
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         user_id = str(user.id)
     else:
@@ -7389,6 +7393,7 @@ async def get_game_profile(request: Request, profile_id: str):
         }
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import get_game_profile
 
@@ -7453,6 +7458,7 @@ async def update_game_profile(request: Request, profile_id: str, profile_data: d
         }
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import update_game_profile
 
@@ -7498,6 +7504,7 @@ async def delete_game_profile(request: Request, profile_id: str):
         return {"message": "Game profile deleted successfully"}
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import delete_game_profile
 
@@ -7543,6 +7550,7 @@ async def duplicate_game_profile(request: Request, profile_id: str):
         }
     else:
         # Cloud mode - use existing authentication
+        from cloud.auth import get_current_user_required
         user = await get_current_user_required(request)
         from cloud.game_profiles import duplicate_game_profile
 
