@@ -27,6 +27,11 @@ _RULES = [
     (re.compile(r'Found (\d+) viral clips'), '🔥 Found {0} viral clips!'),
     (re.compile(r'Processing Clip (\d+)'), '🎬 Creating clip {0}…'),
     (re.compile(r'Clip (\d+) ready'), '✅ Clip {0} ready'),
+    # FR2 capability skip warnings: child prints carry an HH:MM:SS prefix in
+    # the job log, so this rule must stay UNANCHORED (a ^ anchor would never
+    # match). Both skip lines (deep + vision) match; the capturing template
+    # drops the timestamp so the curated view matches the other friendly lines.
+    (re.compile(r'(?:\d{2}:\d{2}:\d{2} )?(👁️ .*skipped: .*)'), '{0}'),
 ]
 
 

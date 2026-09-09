@@ -145,7 +145,7 @@ Open on any generated clip for a full caption studio rather than a font picker:
 flowchart TD
     A[Source video] --> B[faster-whisper transcription\nword-level timestamps]
     B --> C{Silent video?}
-    C -- yes --> V[Gemini watches the full video\nvisual clip picking]
+    C -- yes --> V[Provider watches the video\nvisual clip picking]
     C -- no --> E[Optional LLM polish pass\nfix mishears + emojis]
     E --> D{Deep full-VOD scan?\nprovider/model selectable independently}
     D -- on --> F[Gemini: 12-16 frames or native\nlow-res proxy over whole VOD\ntop moments as priority candidates\n+ game profile context]
@@ -403,11 +403,13 @@ Gemini key. Two things to know:
   Ollama defaults to a 4096-token context and truncates silently, so raise
   it (`num_ctx` in a Modelfile). 7-8B models return valid JSON reliably, 3B
   ones do not.
-- **What still needs Gemini.** Anything that has to watch frames or
-  generate images: silent-video detection, thumbnail image generation,
-  editor effects, and SaaS grounded web research. The layout picker and
-  the thumbnail text stages reroute to the `LLM_*` endpoint. Add a Gemini
-  key alongside and you get both.
+- **What still needs Gemini.** Thumbnail image generation, editor
+  effects, and SaaS grounded web research. Silent-video detection runs on
+  your OpenAI-compatible endpoint with a vision model (it inspects 12
+  sampled frames; text-only models are skipped with a clear message).
+  Gemini keeps watching the native video upload when it is selected. The
+  layout picker and the thumbnail text stages reroute to the `LLM_*`
+  endpoint. Add a Gemini key alongside and you get both.
 
 ## Technical Pipeline
 
@@ -568,7 +570,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 **Client-side (encrypted in localStorage):**
 | Key | Description |
 |-----|------------|
-| `GEMINI_API_KEY` | Google Gemini — not needed for the clip pipeline when `AI_PROVIDER=openai` + `OPENAI_BASE_URL` are set; the `LLM_*` triple covers only the text stages. Still needed for silent videos, thumbnail image generation, editor effects and grounded web research |
+| `GEMINI_API_KEY` | Google Gemini — not needed for the clip pipeline when `AI_PROVIDER=openai` + `OPENAI_BASE_URL` are set; the `LLM_*` triple covers only the text stages. Still needed for thumbnail image generation, editor effects and grounded web research |
 | `FAL_KEY` | fal.ai — required for AI Shorts |
 | `ELEVENLABS_API_KEY` | ElevenLabs — required for voiceover/dubbing |
 | `UPLOAD_POST_API_KEY` | Upload-Post — required, for social posting |
@@ -611,7 +613,7 @@ editor effects stage and the other Gemini-only stages below do not reroute.
 | SaaS analyze + script generation | yes | |
 | SaaS web research (Google-Search grounding) | no — Gemini-only | skipped with a log line when only the endpoint is configured |
 | Thumbnail image generation | no — Gemini-only | needs a Gemini key as before |
-| Silent-video clip detection (vision) | no — Gemini-only | the endpoint cannot watch video |
+| Silent-video clip detection (vision) | yes — via the pipeline provider, with a vision model | the endpoint inspects 12 sampled frames across the video; a one-shot probe skips text-only models with a clear message. Gemini still watches the native upload |
 | Editor effects (/api/edit, /api/effects) | no — Gemini-only | video upload stages |
 | Cloud/managed mode | no — Gemini-pinned | `LLM_*` env vars are stripped from managed jobs |
 

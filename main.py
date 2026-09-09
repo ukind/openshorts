@@ -18,7 +18,6 @@ from tqdm import tqdm
 import yt_dlp
 import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
-from google import genai
 from google.genai import types as genai_types
 
 import gemini_worker
@@ -1954,6 +1953,36 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
         _short_dur = float(video_duration) if video_duration is not None else None
     except Exception:
         _short_dur = None
+    # --- Cheap multimodal candidate seeding (relocated above the ≤120 s
+    # shortcut, D6) so SHORT videos get cheap signals in the detail payload.
+    # Merge transcript windows with cheap event windows so a viral moment
+    # with meaningless transcript (silence -> jumpscare -> scream) still
+    # becomes a candidate. Each enhancement is toggleable.
+    cheap_events = []
+    try:
+        from cheap_events import extract_cheap_events, events_to_candidate_windows
+        cheap_enabled = ENABLE_SCENE_DETECTION or ENABLE_AUDIO_EVENTS or ENABLE_CHEAP_VISUAL
+        if cheap_enabled and video_path and os.path.exists(video_path):
+            cheap_events = extract_cheap_events(
+                video_path, transcript_result,
+                enable_scene=ENABLE_SCENE_DETECTION,
+                enable_audio=ENABLE_AUDIO_EVENTS,
+                enable_visual=ENABLE_CHEAP_VISUAL,
+            )
+            if cheap_events:
+                if DEBUG_LOGS:
+                    timeline = ", ".join(f"{e['timestamp']:.1f}s {e['type']}" for e in cheap_events[:20])
+                    print(f"   📡 Cheap events ({len(cheap_events)}): {timeline}" + (" ..." if len(cheap_events)>20 else ""))
+                    print(f"   Toggles: scene={ENABLE_SCENE_DETECTION} audio={ENABLE_AUDIO_EVENTS} visual={ENABLE_CHEAP_VISUAL}")
+                    # Verbose: per-type breakdown
+                    from collections import Counter
+                    cnt = Counter(e['type'] for e in cheap_events)
+                    print(f"   📊 Breakdown: {dict(cnt)} | audio dominance check: {'⚠️ many audio' if cnt.get('audio_activity',0)>500 else 'ok'}")
+                else:
+                    print(f"   📡 Cheap events: {len(cheap_events)} detected (scene={ENABLE_SCENE_DETECTION} audio={ENABLE_AUDIO_EVENTS} visual={ENABLE_CHEAP_VISUAL})")
+    except Exception as _ce:
+        print(f"⚠️ Cheap event seeding skipped: {_ce}")
+        _dbg(f"   cheap seeding error: {_ce}")
     if _short_dur is not None and _short_dur <= 120 and _short_dur > 0:
         print(f"📏 Short video ({_short_dur:.1f}s ≤ 120s) — whole clip as candidate (detail → title/description like approved)")
         min_secs, max_secs = clip_duration_bounds()
@@ -1988,11 +2017,25 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
             # Phase 5 enriched even for whole-clip (word timestamps + audio/scene)
             try:
                 _wc_ws = "; ".join(f"{ww['w']}@{ww['s']:.2f}" for ww in words[:28]) if words else "none"
-                _wc_ev = ", ".join(f"{ee.get('timestamp',0):.1f}s:{ee.get('type','')}" for ee in (cheap_events or [])[:10]) if 'cheap_events' in locals() and cheap_events else "none"
+                # D6 split: audio_events carries every in-window cheap event
+                # (long-path shape, main.py:2717-2719); scene_boundaries carries
+                # ONLY scene_change timestamps (long-path shape, :2728-2732) — the
+                # detail prompt's SCENE-CUT ALIGNMENT rule reads
+                # scene_boundaries and would misfire on audio spikes.
+                _ev_in = [ee for ee in (cheap_events or [])
+                          if ns - 0.5 <= float(ee.get("timestamp", 0)) <= ne + 0.5][:10]
+                _wc_audio = ", ".join(f"{ee.get('timestamp',0):.1f}s:{ee.get('type','')}"
+                                      for ee in _ev_in) if _ev_in else "none"
+                _scene_in = sorted({round(float(ee.get("timestamp", 0)), 1)
+                                    for ee in (cheap_events or [])
+                                    if ee.get("type") == "scene_change"
+                                    and ns - 0.5 <= float(ee.get("timestamp", 0)) <= ne + 0.5})
+                _wc_scene = ", ".join(f"{t:.1f}s" for t in _scene_in) if _scene_in else "none"
             except Exception:
                 _wc_ws = "none"
-                _wc_ev = "none"
-            payload = [{"id": "whole_clip", "start": float(ns), "end": float(ne), "text": whole_text, "surrounding_transcript": "none (whole video)", "word_timestamps": _wc_ws, "audio_events": _wc_ev, "scene_boundaries": _wc_ev}]
+                _wc_audio = "none"
+                _wc_scene = "none"
+            payload = [{"id": "whole_clip", "start": float(ns), "end": float(ne), "text": whole_text, "surrounding_transcript": "none (whole video)", "word_timestamps": _wc_ws, "audio_events": _wc_audio, "scene_boundaries": _wc_scene}]
             _detail_prompt = gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
                 video_duration=_short_dur, language=language,
                 game_profile_json=_wc_game_json,
@@ -2062,33 +2105,8 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
             window_seconds=max(90, int(max_secs * 1.5)))
         print(f"🪟 Built {len(windows)} candidate window(s) from the transcript.")
 
-        # --- Phase 4: Cheap multimodal candidate seeding ---
-        # Merge transcript windows with cheap event windows so a viral moment
-        # with meaningless transcript (silence -> jumpscare -> scream) still
-        # becomes a candidate. Each enhancement is toggleable.
-        cheap_events = []
         _deep_candidates = []
         try:
-            from cheap_events import extract_cheap_events, events_to_candidate_windows
-            cheap_enabled = ENABLE_SCENE_DETECTION or ENABLE_AUDIO_EVENTS or ENABLE_CHEAP_VISUAL
-            if cheap_enabled and video_path and os.path.exists(video_path):
-                cheap_events = extract_cheap_events(
-                    video_path, transcript_result,
-                    enable_scene=ENABLE_SCENE_DETECTION,
-                    enable_audio=ENABLE_AUDIO_EVENTS,
-                    enable_visual=ENABLE_CHEAP_VISUAL,
-                )
-                if cheap_events:
-                    if DEBUG_LOGS:
-                        timeline = ", ".join(f"{e['timestamp']:.1f}s {e['type']}" for e in cheap_events[:20])
-                        print(f"   📡 Cheap events ({len(cheap_events)}): {timeline}" + (" ..." if len(cheap_events)>20 else ""))
-                        print(f"   Toggles: scene={ENABLE_SCENE_DETECTION} audio={ENABLE_AUDIO_EVENTS} visual={ENABLE_CHEAP_VISUAL}")
-                        # Verbose: per-type breakdown
-                        from collections import Counter
-                        cnt = Counter(e['type'] for e in cheap_events)
-                        print(f"   📊 Breakdown: {dict(cnt)} | audio dominance check: {'⚠️ many audio' if cnt.get('audio_activity',0)>500 else 'ok'}")
-                    else:
-                        print(f"   📡 Cheap events: {len(cheap_events)} detected (scene={ENABLE_SCENE_DETECTION} audio={ENABLE_AUDIO_EVENTS} visual={ENABLE_CHEAP_VISUAL})")
             # E: Deep full-VOD scan with qwen3-vl-8b (toggle ENABLE_DEEP_ANALYSIS=1, OFF by default)
             _deep_candidates = []
             print(f"   [deep gate] ENABLE={ENABLE_DEEP_ANALYSIS} HAS={HAS_SEMANTIC_ANALYZER} video_path={bool(video_path)} dur={float(video_duration) if video_duration else 0:.1f} is_gemini={_get_ai_provider()=='gemini'}")
@@ -2107,6 +2125,22 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
                     _deep_frames = None
                     _used_native_video = False
                     _deep_nframes = 16 if _is_gemini else 12
+                    # FR2 gate (D3/D8): probe the deep provider once before
+                    # ANY deep frame extraction. Gemini (native video) is
+                    # exempt — always vision-capable. The verdict is cached
+                    # per identity in ai_provider, so deep and vision share
+                    # one probe call when identities match.
+                    _deep_probe_ok = True
+                    if not _is_gemini:
+                        _deep_probe_verdict = ai_provider.probe_vision_support(
+                            ai_provider.create_ai_provider(
+                                _deep_cfg["provider"], _deep_cfg["model"],
+                                api_key=_deep_cfg["api_key"],
+                                base_url=_deep_cfg["base_url"]))
+                        if _deep_probe_verdict == "no_vision":
+                            print("👁️ Deep scan skipped: the selected model cannot see images (text-only).")
+                            _dbg(f"   deep skip: probe no_vision (provider={_deep_cfg['provider']} model={_deep_cfg['model']})")
+                            _deep_probe_ok = False
                     if _is_gemini:
                         # Always try native via low-res proxy (like autoshorts) — proxy shrinks 1GB -> ~15MB so size check is on proxy, not original
                         try:
@@ -2116,7 +2150,7 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
                             _used_native_video = True
                         except Exception:
                             _used_native_video = False
-                    if not _used_native_video:
+                    if not _used_native_video and _deep_probe_ok:
                         _deep_frames = extract_frames_from_window(video_path, 0, float(video_duration), num_frames=_deep_nframes, peak_times=_peak_times if _peak_times else None)
                     if _used_native_video or (_deep_frames and len(_deep_frames) >= 8):
                         _ct = "\n".join(f"{e['timestamp']:.1f}s {e['type']}" for e in cheap_events[:30]) if cheap_events else "none"
@@ -2322,7 +2356,7 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
                                         print(f"   Deep debug: prov={_deep_provider} model={_deep_model} frames={len(_deep_frames) if _deep_frames else 0} prompt_len={len(_deep_prompt)}")
                         except Exception as _pe:
                             print(f"   ⚠️ Deep vision call failed ({_pe}) — falling back to standard analysis")
-                    else:
+                    elif _deep_probe_ok:
                         print("   ℹ️ Deep analysis skipped: not enough frames could be extracted")
                 except Exception as _de:
                     print(f"Deep analysis failed: {_de}")
@@ -2510,7 +2544,13 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
                 print(f"   ✅ Batch {b // SCORE_BATCH + 1}/{_score_batches} scored ({len(scored)} windows done)")
 
         # Vision analysis (Phase 6) — toggleable, runs even without GameProfile; GameProfile just biases scores
-        if HAS_SEMANTIC_ANALYZER and ENABLE_VISION_ANALYSIS:
+        _vision_probe_ok = True
+        if HAS_SEMANTIC_ANALYZER and ENABLE_VISION_ANALYSIS and scored:
+            _vision_probe_ok = ai_provider.probe_vision_support(ai_provider_instance) != "no_vision"
+            if not _vision_probe_ok:
+                print("👁️ Vision analysis skipped: the selected model cannot see images (text-only).")
+                _dbg(f"   vision skip: probe no_vision (provider={_provider} model={model_name})")
+        if HAS_SEMANTIC_ANALYZER and ENABLE_VISION_ANALYSIS and _vision_probe_ok:
             # Normalize scores for consistent application of profile weights
             max_score = max(w.get("score", 0) for w in scored) if scored else 1.0
             if max_score == 0:
@@ -2625,7 +2665,7 @@ def get_viral_clips(transcript_result, video_duration, game_profile_id=None, use
                 w["score"] = final_score
         if not ENABLE_VISION_ANALYSIS and DEBUG_LOGS:
             print(f"   ℹ️ Vision analysis OFF — skipping 6-frame extraction (toggle to enable)")
-        elif HAS_SEMANTIC_ANALYZER and ENABLE_VISION_ANALYSIS:
+        elif HAS_SEMANTIC_ANALYZER and ENABLE_VISION_ANALYSIS and _vision_probe_ok:
             print(f"✅ Vision analysis finished — {_vision_done} window(s) checked")
 
         # Shortlist the top windows; scale with duration so long videos surface
@@ -2885,71 +2925,108 @@ def speech_is_sparse(transcript, duration):
     return words < MIN_SPEECH_WORDS or words / minutes < MIN_SPEECH_WORDS_PER_MIN
 
 
-def get_visual_clips(video_path, video_duration, language="en"):
-    """Clip a SILENT video by vision: Gemini watches the footage and picks the
-    most engaging visual moments (no transcript). Returns the same
-    {"shorts", "cost_analysis"} shape as get_viral_clips, or None."""
-    print(f"🎥  Silent video — analyzing with {AI_PROVIDER.title()} vision (no transcript)...")
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        import llm_client
-        if llm_client.active_config() is not None:
-            print("❌ This video has no usable speech, so it has to be clipped by "
-                  "watching it, and that needs Gemini (a text-only LLM server "
-                  "cannot see the footage). Add a GEMINI_API_KEY for silent videos.")
-        else:
-            print("❌ Error: GEMINI_API_KEY not found. Silent-video analysis "
-                  "watches the footage on Gemini; the third-party LLM endpoint "
-                  "cannot replace it.")
-        return None
-    client = genai.Client(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
-    print(f"🎥  Model: {model_name} | uploading {os.path.basename(video_path)}…")
+def _silent_visual_prompt(video_duration, language):
+    """Shared silent-video prompt. No scoring windows to derive a count from,
+    so the visual fallback stays aligned with the main product range: 3-15 clips."""
+    def _env_int(name, default):
+        try:
+            return max(1, int(os.environ.get(name, "")))
+        except ValueError:
+            return default
+    v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
+    v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
+    v_min_secs, v_max_secs = clip_duration_bounds()
+    prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
+        video_duration=video_duration, language=language,
+        min_clips=v_min_clips, max_clips=v_max_clips,
+        min_secs=v_min_secs, max_secs=v_max_secs)
+    return v_min_clips, v_max_clips, prompt
 
+
+def get_visual_clips(video_path, video_duration, language="en"):
+    """Clip a SILENT video by vision: the configured provider watches the
+    footage and picks the most engaging visual moments (no transcript).
+    Gemini watches the native video upload; an OpenAI-compatible endpoint
+    inspects 12 sampled frames. Returns {"shorts"} on success (the silent
+    path contributes no cost data — no cost_analysis key), or None."""
+    provider_type = _get_ai_provider()
+    print(f"🎥  Silent video — analyzing with {provider_type.title()} vision (no transcript)...")
+
+    prov = None
     file_upload = None
     try:
-        file_upload = client.files.upload(file=video_path)
-        deadline = time.time() + 180
-        while True:
-            info = client.files.get(name=file_upload.name)
-            state = str(getattr(getattr(info, "state", info), "name", "")).upper()
-            if state == "ACTIVE":
-                break
-            if state == "FAILED":
-                print(f"❌ {AI_PROVIDER.title()} could not process the video.")
+        if provider_type == "gemini":
+            api_key = _get_gemini_api_key()
+            if not api_key:
+                print("❌ GEMINI_API_KEY not configured. Silent-video analysis on Gemini "
+                      "needs a key; or select an OpenAI-compatible vision model in the "
+                      "provider card.")
                 return None
-            if time.time() > deadline:
-                print(f"❌ {AI_PROVIDER.title()} video processing timed out.")
+            prov = ai_provider.create_ai_provider("gemini", _get_gemini_model(), api_key=api_key)
+            print(f"🎥  Model: {prov.model_name} | uploading {os.path.basename(video_path)}…")
+            # Native upload through the provider-held client (no raw genai.Client).
+            file_upload = prov.client.files.upload(file=video_path)
+            deadline = time.time() + 180
+            while True:
+                info = prov.client.files.get(name=file_upload.name)
+                state = str(getattr(getattr(info, "state", info), "name", "")).upper()
+                if state == "ACTIVE":
+                    break
+                if state == "FAILED":
+                    print(f"❌ {provider_type.title()} could not process the video.")
+                    return None
+                if time.time() > deadline:
+                    print(f"❌ {provider_type.title()} video processing timed out.")
+                    return None
+                time.sleep(2)
+            _v_min, _v_max, prompt = _silent_visual_prompt(video_duration, language)
+            # D4 defect fix: the upload is ATTACHED to the call — Gemini now
+            # actually watches the footage instead of inventing timestamps
+            # from prompt text alone.
+            _resp = prov.client.models.generate_content(
+                model=prov.model_name,
+                contents=[file_upload, prompt],
+                config=prov.genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=AI_TEMPERATURE,
+                ))
+            # Developer checkpoint 2026-09-08: blocked-content now surfaces
+            # properly (the old except GeminiBlockedError handler was dead —
+            # the silent path never called raise_if_blocked).
+            gemini_worker.raise_if_blocked(_resp)
+            parsed = gemini_worker._parse_json_response_text(
+                gemini_worker._get_response_text(_resp)) or {}
+        else:
+            if not HAS_SEMANTIC_ANALYZER:
+                # Same degradation as the deep gate: no frame extractor.
+                _dbg("   silent openai pass unavailable: semantic analyzer not installed")
                 return None
-            time.sleep(2)
+            # Deep-scan param shape (D2): stored params, applied via the
+            # Phase 1 precedence chain.
+            prov = ai_provider.create_ai_provider(
+                "openai", _get_openai_model(),
+                api_key=_get_openai_api_key(),
+                base_url=_get_openai_base_url(),
+                temperature=0.2, max_tokens=3000, timeout=90)
+            # FR2 pre-flight (D3/D5): one tiny-image probe BEFORE any
+            # screenshot is taken. Cached per identity (Phase 2).
+            if ai_provider.probe_vision_support(prov) == "no_vision":
+                print("👁️ Vision analysis skipped: the selected model cannot see images (text-only).")
+                return None
+            _frames = extract_frames_from_window(video_path, 0, float(video_duration), num_frames=12)
+            if not _frames:
+                print("⚠️ Could not extract frames for the silent-video pass.")
+                return None
+            _v_min, _v_max, prompt = _silent_visual_prompt(video_duration, language)
+            _content = [{"type": "text", "text": prompt}]
+            for _fr in _frames:
+                _content.append({"type": "image_url", "image_url": {"url": _fr["base64_image"]}})
+            _dbg(f"   silent pass: {len(_frames)} frames over the full duration (schema=VisualResponse)…")
+            result = prov.generate_content(
+                prompt, schema=gemini_worker.VisualResponse,
+                messages=[{"role": "user", "content": _content}])
+            parsed = result["response"] or {}
 
-        # The vision path has no scoring windows to derive a count from, so the
-        # Keep the visual fallback aligned with the main product range: 3-15 clips.
-        def _env_int(name, default):
-            try:
-                return max(1, int(os.environ.get(name, "")))
-            except ValueError:
-                return default
-        v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
-        v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
-        v_min_secs, v_max_secs = clip_duration_bounds()
-        prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
-            video_duration=video_duration, language=language,
-            min_clips=v_min_clips, max_clips=v_max_clips,
-            min_secs=v_min_secs, max_secs=v_max_secs)
-        # Silent-video path talks to Gemini directly (client built above);
-        # the shared provider abstraction needs provider vars this function
-        # never had — that used to be a latent NameError here.
-        from google.genai import types as _genai_types
-        _resp = client.models.generate_content(
-            model=model_name, contents=[prompt],
-            config=_genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=AI_TEMPERATURE,
-            ))
-        result = {"response": gemini_worker._parse_json_response_text(
-            gemini_worker._get_response_text(_resp)), "cost_analysis": None}
-        parsed = result["response"] or {}
         shorts = clip_quality.validate_clips(parsed.get("shorts") or [], video_duration)
         # Clamp to the real duration; drop anything degenerate.
         clean = []
@@ -2965,23 +3042,20 @@ def get_visual_clips(video_path, video_duration, language="en"):
             sorted(clean, key=lambda x: float(x.get("viral_score", x.get("predicted_score", 0)) or 0),
                    reverse=True), threshold=0.7)
 
-        cost = result.get("cost_analysis") if isinstance(result, dict) else None
-        if cost:
-            print(f"💰 Vision cost ({model_name}): ${cost.get('total_cost', 0):.6f}")
-        result = {"shorts": clean}
-        if cost:
-            result["cost_analysis"] = cost
-        return result
+        # The silent path contributes no cost data today (unchanged). The
+        # OpenAI-compatible provider returns cost_analysis=None structurally,
+        # so the probe's tiny call never enters a job total either.
+        return {"shorts": clean}
     except gemini_worker.GeminiBlockedError as e:
         print(f"🚫 {e}")
         raise
     except Exception as e:
-        print(f"❌ {AI_PROVIDER.title()} vision error: {e}")
+        print(f"❌ {provider_type.title()} vision error: {e}")
         return None
     finally:
         if file_upload is not None:
             try:
-                client.files.delete(name=file_upload.name)
+                prov.client.files.delete(name=file_upload.name)
             except Exception:
                 pass
 
@@ -3552,7 +3626,7 @@ if __name__ == '__main__':
             # wrote no metadata.json, so app.py marked the job failed anyway
             # (app.py:1087) after burning GPU on a render nobody could see.
             _err_provider = (AI_PROVIDER or os.environ.get("AI_PROVIDER") or "gemini").lower()
-            _err_label = "OpenAI" if _err_provider == "openai" else "Gemini"
+            _err_label = "OpenAI-compatible endpoint" if _err_provider == "openai" else "Gemini"
             raise RuntimeError(
                 f"Clip detection failed — {_err_label} did not return usable clips for this video.")
         else:

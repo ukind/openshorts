@@ -59,3 +59,14 @@ def test_errors_kept_without_paths():
 def test_consecutive_duplicates_collapse():
     logs = ["🎙️  Transcribing video...", "🎙️  Transcribing audio from: x.mp4"]
     assert friendly_logs(logs) == ["🎙️ Transcribing audio…"]
+
+
+def test_capability_skip_warnings_survive_the_cloud_whitelist():
+    # Child prints arrive timestamp-prefixed; the unanchored rule matches and
+    # the capturing template strips the timestamp.
+    assert friendly_log_line(
+        "15:42:10 👁️ Vision analysis skipped: the selected model cannot see images (text-only)."
+    ) == "👁️ Vision analysis skipped: the selected model cannot see images (text-only)."
+    assert friendly_log_line(
+        "15:42:11 👁️ Deep scan skipped: the selected model cannot see images (text-only)."
+    ) == "👁️ Deep scan skipped: the selected model cannot see images (text-only)."

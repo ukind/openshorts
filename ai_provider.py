@@ -23,6 +23,54 @@ from gemini_worker import (
 )
 
 
+
+# --- Sampling-parameter sanitization ----------------------------------------
+# Garbage, set-but-empty, and None values sanitize to None (= unset). At
+# request time an unset value falls through to the stored constructor value,
+# then to the frozen default. Bounds: temperature 0-2, max_tokens 1-8192,
+# timeout 5-600 seconds.
+
+def _sanitize_temperature(value) -> Optional[float]:
+    """Coerce a temperature setting to a bounded float, or None if unset."""
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num:  # NaN
+        return None
+    return max(0.0, min(2.0, num))
+
+
+def _sanitize_max_tokens(value) -> Optional[int]:
+    """Coerce a max_tokens setting to a bounded int, or None if unset."""
+    if value is None:
+        return None
+    try:
+        num = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if num < 1:
+        return None
+    return min(8192, num)
+
+
+def _sanitize_timeout(value) -> Optional[float]:
+    """Coerce a timeout setting to a bounded float, or None if unset."""
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num:  # NaN
+        return None
+    if num <= 0:
+        return None
+    return max(5.0, min(600.0, num))
+
+
 class AIProviderError(Exception):
     """Base exception for AI provider errors."""
     def __init__(self, message: str, provider: str = "unknown", model: str = "unknown"):
@@ -35,9 +83,18 @@ class AIProviderError(Exception):
 class AIProvider(ABC):
     """Abstract base class for AI providers."""
 
-    def __init__(self, model_name: str, api_key: Optional[str] = None):
+    def __init__(self, model_name: str, api_key: Optional[str] = None,
+                 temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None,
+                 timeout: Optional[float] = None):
         self.model_name = model_name
         self.api_key = api_key
+        # Sampling params are stored sanitized. Applying them is the
+        # subclass's job: OpenAI-compatible applies them at request time;
+        # Gemini stores but never applies (wire stays byte-identical, D7).
+        self.temperature = _sanitize_temperature(temperature)
+        self.max_tokens = _sanitize_max_tokens(max_tokens)
+        self.timeout = _sanitize_timeout(timeout)
 
     @abstractmethod
     def generate_content(
@@ -70,8 +127,14 @@ class AIProvider(ABC):
 class GeminiProvider(AIProvider):
     """Gemini-specific AI provider implementation."""
 
-    def __init__(self, model_name: str = "gemini-2.5-flash", api_key: Optional[str] = None):
-        super().__init__(model_name, api_key)
+    def __init__(self, model_name: str = "gemini-2.5-flash",
+                 api_key: Optional[str] = None,
+                 temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None,
+                 timeout: Optional[float] = None):
+        super().__init__(model_name, api_key,
+                         temperature=temperature, max_tokens=max_tokens,
+                         timeout=timeout)
 
         # Import here to avoid circular dependencies
         from google import genai
@@ -257,8 +320,14 @@ class GeminiProvider(AIProvider):
 class OpenAICompatibleProvider(AIProvider):
     """OpenAI-compatible AI provider implementation."""
 
-    def __init__(self, model_name: str = "gpt-4", api_key: Optional[str] = None, base_url: str = "https://api.openai.com/v1"):
-        super().__init__(model_name, api_key)
+    def __init__(self, model_name: str = "gpt-4", api_key: Optional[str] = None,
+                 base_url: str = "https://api.openai.com/v1",
+                 temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None,
+                 timeout: Optional[float] = None):
+        super().__init__(model_name, api_key,
+                         temperature=temperature, max_tokens=max_tokens,
+                         timeout=timeout)
         self.base_url = base_url
 
         # Import here to avoid circular dependencies
@@ -301,12 +370,26 @@ class OpenAICompatibleProvider(AIProvider):
                 {"role": "user", "content": prompt}
             ]
 
-        # Set up parameters
+        # Sampling-parameter precedence (D1): per-call kwarg > stored
+        # constructor value > frozen default. An explicit-None kwarg counts
+        # as unset, so callers can opt back into the stored/default value.
+        temperature = kwargs.get("temperature")
+        if temperature is None:
+            temperature = self.temperature
+        if temperature is None:
+            temperature = 0.7
+
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        if max_tokens is None:
+            max_tokens = 4096
+
         params = {
             "model": self.model_name,
             "messages": final_messages,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", 4096)
+            "temperature": temperature,
+            "max_tokens": max_tokens
         }
 
         # Add structured output format if schema is provided
@@ -324,9 +407,14 @@ class OpenAICompatibleProvider(AIProvider):
                 }
             }
 
-        # Add timeout if provided
-        if "timeout" in kwargs:
-            params["timeout"] = kwargs["timeout"]
+        # Timeout appears in the request only when a value exists (today's
+        # wire shape). The stored constructor value applies when no per-call
+        # kwarg is given.
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            timeout = self.timeout
+        if timeout is not None:
+            params["timeout"] = timeout
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -447,6 +535,89 @@ class OpenAICompatibleProvider(AIProvider):
         return "openai"
 
 
+# --- Vision capability probe (plan Phase 2) ---------------------------------
+# Placement: NEW section AFTER the OpenAICompatibleProvider class definition
+# (needs the class for isinstance) and BEFORE create_ai_provider.
+#
+# One tiny-image call per provider identity. Module-level cache: the provider
+# is rebuilt per score batch (main.py:2502) and one process per job
+# (app.py:2560) makes module state job-scoped. Verdict is tri-state:
+#   "no_vision"  — the endpoint rejects image parts; skip vision/deep frames
+#   "unknown"    — probe failed transiently or ambiguously; proceed as today
+#   "vision_ok"  — the endpoint accepted the image part
+_VISION_PROBE_CACHE: Dict[tuple, str] = {}
+
+# 8x8 gray PNG as a data URL — the probe payload (D5). Validity is pinned by
+# test_probe_image_is_a_valid_png (decode, IHDR len 13, 8x8).
+_PROBE_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAAAAADhZOFXAAAADklEQVR4nGNogAIGyhgAgIQgAQ2AJGEAAAAASUVORK5CYII="
+
+# The probe demands a JSON reply so a success path survives
+# generate_content's unconditional json.loads (ai_provider.py:330-341).
+_PROBE_PROMPT = 'Reply with exactly this JSON: {"ok": true}'
+
+# Exact transient token list from OpenAICompatibleProvider.generate_content
+# (ai_provider.py:420-424). Classification is transient-FIRST (D5): a
+# transient failure is never misread as no_vision, even if its text happens
+# to mention images (e.g. a 500 whose body mentions image handling).
+_PROBE_TRANSIENT_TOKENS = (
+    '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
+    '500', 'INTERNAL', 'overloaded', 'Deadline',
+    'timeout', 'connection', 'retry'
+)
+
+# Verified wire texts: Ollama Cloud 400 "this model does not support image
+# input"; LM Studio "Model does not support images. Please use a model that
+# does". The substring matches both.
+_PROBE_IMAGE_REJECT = "does not support image"
+
+
+def _classify_probe_failure(message: str) -> str:
+    """Classify a probe failure; transient-first (D5)."""
+    msg = str(message)
+    if any(tok in msg for tok in _PROBE_TRANSIENT_TOKENS):
+        return "unknown"
+    if _PROBE_IMAGE_REJECT in msg.lower():
+        return "no_vision"
+    return "unknown"
+
+
+def probe_vision_support(provider) -> str:
+    """Probe once per provider identity whether the endpoint accepts images.
+
+    Returns "no_vision" / "unknown" / "vision_ok". Non-OpenAI-compatible
+    providers (Gemini: native video upload) are always vision-capable and
+    never probed. The probe's cost stays out of the job total structurally:
+    OpenAICompatibleProvider.generate_content returns cost_analysis=None.
+    """
+    if not isinstance(provider, OpenAICompatibleProvider):
+        return "vision_ok"
+    key = (provider.get_provider_name(), provider.model_name,
+           provider.base_url, provider.api_key)
+    if key in _VISION_PROBE_CACHE:
+        return _VISION_PROBE_CACHE[key]
+    try:
+        provider.generate_content(
+            _PROBE_PROMPT,
+            schema=None,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _PROBE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": _PROBE_IMAGE}},
+                ],
+            }],
+            max_tokens=16,
+            timeout=15,
+        )
+        verdict = "vision_ok"
+    except AIProviderError as exc:
+        verdict = _classify_probe_failure(exc.message)
+    except Exception as exc:  # defensive: a probe bug must never crash a gate
+        verdict = _classify_probe_failure(str(exc))
+    _VISION_PROBE_CACHE[key] = verdict
+    return verdict
+
+
 def create_ai_provider(provider_type: str, model_name: str = None, api_key: str = None, **kwargs) -> AIProvider:
     """
     Factory function to create an AI provider instance.
@@ -465,10 +636,20 @@ def create_ai_provider(provider_type: str, model_name: str = None, api_key: str 
     """
     if provider_type.lower() == "gemini":
         model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        return GeminiProvider(model, api_key)
+        return GeminiProvider(
+            model, api_key,
+            temperature=kwargs.get("temperature"),
+            max_tokens=kwargs.get("max_tokens"),
+            timeout=kwargs.get("timeout"),
+        )
     elif provider_type.lower() == "openai":
         model = model_name or os.getenv("OPENAI_MODEL", "gpt-4")
         base_url = kwargs.get("base_url") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        return OpenAICompatibleProvider(model, api_key, base_url)
+        return OpenAICompatibleProvider(
+            model, api_key, base_url,
+            temperature=kwargs.get("temperature"),
+            max_tokens=kwargs.get("max_tokens"),
+            timeout=kwargs.get("timeout"),
+        )
     else:
         raise ValueError(f"Unsupported AI provider type: {provider_type}")

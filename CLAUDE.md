@@ -146,7 +146,7 @@ overrides: `LLM_MODEL_THUMBNAIL`, `LLM_MODEL_SAAS` (chain:
 
 - Reroutes: layout picker, thumbnail text, SaaS analyze/scripts; the MCP
   server forwards `X-LLM-*` BYOK headers to the same stages.
-- Stays Gemini: image gen, silent-video, editor effects, SaaS grounded
+- Stays Gemini: image gen, editor effects, SaaS grounded
   research, cloud/managed.
 - All three vars are required. A bare `LLM_BASE_URL` without a key is inert
   (keyless local servers belong to the pipeline provider block:
