@@ -54,3 +54,7 @@ profiles/
 
 .worktrees
 .zcode/
+# Local code-intel cache
+.dirac-cache/
+# rpiv: tmp is session scratch; artifacts/ stays tracked
+.rpiv/tmp/
