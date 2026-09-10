@@ -47,6 +47,18 @@ class TestConfigFields:
         assert cfg["llmModel"] == "gpt-oss:120b"
         assert cfg["llmBaseUrl"] == "https://ollama.test/v1"
 
+    def test_config_reports_server_openai_env(self, client, monkeypatch):
+        # FR9: /api/config reports the server's OPENAI_* env (presence only)
+        # so the unified card's badge can show the pipeline half. Read-only
+        # reporting — no resolver is involved.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-server")
+        monkeypatch.setenv("OPENAI_MODEL", "server-model")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://server.test/v1")
+        cfg = client.get("/api/config").json()
+        assert cfg["openaiConfigured"] is True
+        assert cfg["openaiModel"] == "server-model"
+        assert cfg["openaiBaseUrl"] == "http://server.test/v1"
+
     def test_the_api_key_never_appears_in_the_payload(self, client, monkeypatch):
         monkeypatch.setenv("LLM_BASE_URL", "https://ollama.test/v1")
         monkeypatch.setenv("LLM_API_KEY", "secret-key")

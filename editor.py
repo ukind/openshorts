@@ -24,9 +24,281 @@ class EditPlan(BaseModel):
     edits: List[EditDecision]
 
 
+class EffectsSegment(BaseModel):
+    """One Remotion effects segment — the frames arm's schema for the JSON
+    the Gemini arm parses loosely out of response.text (get_effects_config).
+    Field names match the wire keys the renderer reads (camelCase)."""
+    startSec: float
+    endSec: float
+    zoom: float = 1.0
+    zoomCenterX: float = 0.5
+    zoomCenterY: float = 0.5
+    brightness: float = 1.0
+    contrast: float = 1.0
+    saturate: float = 1.0
+
+
+class EffectsPlan(BaseModel):
+    segments: List[EffectsSegment]
+
+
+class FilterRepair(BaseModel):
+    """The repair round-trip's reply: just the corrected filter string."""
+    filter_string: str = ""
+
+
+def _edit_plan_prompt(duration, width, height, transcript, has_captions):
+    """The edit-decision prompt — ONE prompt, two transports: the Gemini Files
+    arm (VideoEditor.get_ffmpeg_filter) and the OpenAI-compatible frames arm
+    (frames_edit_plan). Extracted verbatim from get_ffmpeg_filter; the
+    f-string body is byte-identical, so both arms ask the same question."""
+    if width is None or height is None:
+        width, height = 1080, 1920
+    transcript_text = json.dumps(transcript) if transcript else "Not available."
+
+    caption_rule = ""
+    if has_captions:
+        caption_rule = (
+            "\n        CRITICAL: This video already has burned-in captions and/or a hook text. "
+            "Any zoom would crop or shift them off screen. Do NOT use zoom_in, punch_in or zoom_pulse — "
+            "only color_pop, bw_moment, flash and vignette are allowed.\n"
+        )
+
+    prompt = f"""
+        You are a viral short-form video editor (TikTok / Reels / Shorts). You receive a video and its transcript.
+        Decide WHERE a small set of tasteful, high-impact effects belongs. You do NOT write FFmpeg —
+        you return an edit decision list, and a deterministic renderer applies it safely.
+
+        Video duration: {duration:.1f} seconds. Resolution: {width}x{height}.
+
+        Available effect types:
+        - "zoom_in": slow push-in across the segment. Builds tension or focus on a key statement. strength 0.06-0.15, segment 1.5-6s.
+        - "punch_in": instant tighter framing for the whole segment. Emphasis, punchlines, "listen to this" moments. strength 0.06-0.15, segment 0.8-5s.
+        - "zoom_pulse": quick in-and-out pulse peaking mid-segment. Beat drops, single impactful words. strength 0.04-0.10, segment 0.4-1.2s.
+        - "color_pop": richer saturation/contrast. Energy, excitement, product/visual highlights. strength 0.2-1.0.
+        - "bw_moment": black & white. Drama, serious quotes, flashbacks.
+        - "flash": brief bright flash at segment start. Hard-cut energy, reveals. Use at most 2.
+        - "vignette": darkened edges. Focus, intimacy, storytelling moments.
+
+        Rules:
+        1. Match effects to the CONTENT: place them on the exact words or moments they emphasize, using the transcript timestamps.
+        2. Less is more: 2-6 edits per 30 seconds of video. A random effect is worse than no effect.
+        3. Never overlap two zoom-type edits (zoom_in/punch_in/zoom_pulse).
+        4. Calm, serious delivery => few or no motion effects. High-energy content => more punch.
+        {caption_rule}
+        TRANSCRIPT (with timestamps, the context of what is being said):
+        {transcript_text}
+
+        Return JSON only:
+        {{"edits": [{{"type": "punch_in", "start": 3.2, "end": 5.4, "strength": 0.1, "reason": "punchline"}}]}}
+        If no effects genuinely improve the video, return {{"edits": []}}.
+        """
+    return prompt
+
+
+def _effects_prompt(duration, fps, width, height, transcript):
+    """The Remotion effects prompt — shared by both arms, extracted verbatim
+    from get_effects_config (the same one-prompt-two-transports rule)."""
+    if width is None or height is None:
+        width, height = 1080, 1920
+    transcript_text = json.dumps(transcript) if transcript else "Not available."
+
+    prompt = f"""
+        You are an expert video editor analyzing a video and its transcript to generate dynamic visual effects for a Remotion-based renderer.
+
+        Video Duration: {duration} seconds.
+        Video FPS: {fps}
+        Video Resolution: {width}x{height}
+
+        TRANSCRIPT (Context of what is being said):
+        {transcript_text}
+
+        Your task is to produce a structured JSON describing time-based effect segments that cover the FULL video duration.
+
+        Each segment has these fields:
+        - "startSec" (number): Start time in seconds.
+        - "endSec" (number): End time in seconds.
+        - "zoom" (number): Zoom level. 1.0 = no zoom, max 1.5. Use subtle values like 1.05-1.2 for most cases.
+        - "zoomCenterX" (number): Horizontal focus point for zoom, 0.0 (left) to 1.0 (right). 0.5 = center.
+        - "zoomCenterY" (number): Vertical focus point for zoom, 0.0 (top) to 1.0 (bottom). 0.5 = center.
+        - "brightness" (number): Brightness multiplier. 1.0 = normal. Range 0.8-1.2.
+        - "contrast" (number): Contrast multiplier. 1.0 = normal. Range 0.8-1.3.
+        - "saturate" (number): Saturation multiplier. 1.0 = normal. Range 0.8-1.3.
+
+        Instructions:
+        1. ANALYZE the video content and transcript to understand mood, pacing, and key moments.
+        2. Apply CONTEXTUAL effects aligned with speech and action:
+           - Use slow, subtle zooms toward the speaker's face during speaking moments.
+           - Emphasize key moments, punchlines, or dramatic beats with slightly stronger zoom or contrast.
+           - Keep transitions smooth — avoid jarring jumps between segments.
+           - If nothing significant is happening, keep values at defaults (zoom 1.0, all multipliers 1.0).
+        3. Segments MUST cover the entire video duration from 0 to {duration} seconds with no gaps.
+        4. Prefer fewer, longer segments with gradual changes over many rapid short segments.
+        5. Output ONLY valid JSON, no explanations.
+
+        Output format:
+        {{
+            "segments": [
+                {{
+                    "startSec": 0,
+                    "endSec": 3.5,
+                    "zoom": 1.0,
+                    "zoomCenterX": 0.5,
+                    "zoomCenterY": 0.5,
+                    "brightness": 1.0,
+                    "contrast": 1.0,
+                    "saturate": 1.0
+                }}
+            ]
+        }}
+        """
+    return prompt
+
+
+def openai_configured(openai_key, openai_base):
+    """Whether a resolved OpenAI triple names a real endpoint.
+
+    resolve_openai (app.py:152-165) fills in defaults — base
+    https://api.openai.com/v1, key "" — when neither header nor env carries
+    them, so a bare base check would see a "configured" endpoint on a server
+    that set nothing. Same gate as the in-job arms (hook_grounding.py,
+    screencast_layout.py): a key, or a base URL other than the default. A
+    model alone is never one."""
+    key = (openai_key or "").strip()
+    base = (openai_base or "").strip()
+    return bool(key) or bool(base and base.rstrip("/") != "https://api.openai.com/v1")
+
+
+def openai_vision_arm(openai_key, openai_model, openai_base):
+    """Build + vision-probe the request-scoped OpenAI-compatible arm.
+
+    Returns (provider, None) or (None, reason); the caller turns a reason
+    into a clean 4xx. Never raises. Namespace law: pipeline family only
+    (ai_provider + the resolved OPENAI_* triple) — the LLM_* satellite env
+    never reaches this module (canary in tests/test_editor_frames.py)."""
+    if not openai_configured(openai_key, openai_base):
+        return None, "no OpenAI-compatible endpoint configured"
+    try:
+        import ai_provider
+        provider = ai_provider.create_ai_provider(
+            "openai",
+            (openai_model or "").strip() or None,
+            api_key=(openai_key or "").strip() or None,
+            base_url=(openai_base or "").strip(),
+            temperature=0.2, max_tokens=3000, timeout=120)
+    except ImportError as e:
+        return None, f"OpenAI SDK unavailable ({e})"
+    # One probe per provider identity (cached in ai_provider). "unknown"
+    # proceeds — only a confirmed text-only model refuses.
+    if ai_provider.probe_vision_support(provider) == "no_vision":
+        return None, ("the selected model cannot see images — set a "
+                      "vision-capable model or a Gemini key")
+    return provider, None
+
+
+def _frame_messages(prompt, frames):
+    """The clip as chat messages: the prompt plus each frame as an image_url
+    part — the in-job vision-pass shape (main.py:3015-3023)."""
+    import base64
+    content = [{"type": "text", "text": prompt}]
+    for b in frames:
+        content.append({"type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,"
+                                      + base64.b64encode(b).decode("ascii")}})
+    return [{"role": "user", "content": content}]
+
+
+def frames_edit_plan(provider, video_path, duration, fps=30, width=None,
+                     height=None, transcript=None, has_captions=False):
+    """The OpenAI-compatible arm of VideoEditor.get_ffmpeg_filter: the same
+    prompt and EditPlan schema, 12 frames @1024px (layout_picker's economy —
+    ~3k tokens whatever the clip length, vs a Files upload) instead of a
+    Gemini upload. Returns the same shape as get_ffmpeg_filter. Degrades on
+    unreadable frames or an empty plan: the clip stays untouched."""
+    import layout_picker
+    frames = layout_picker.sample_frames(video_path)
+    if not frames:
+        print("⚠️ No readable frames for the edit plan — keeping the clip untouched.")
+        return {"filter_string": None, "edits": []}
+    if width is None or height is None:
+        width, height = 1080, 1920
+    prompt = _edit_plan_prompt(duration, width, height, transcript, has_captions)
+    print("🤖 Asking the OpenAI-compatible endpoint for an edit decision list...")
+    result = provider.generate_content(
+        prompt, schema=EditPlan, messages=_frame_messages(prompt, frames))
+    raw_edits = (result.get("response") or {}).get("edits") or []
+    filter_string, applied = build_filter_string(
+        raw_edits, duration=duration, fps=fps, width=width, height=height,
+        has_captions=has_captions,
+    )
+    if not filter_string:
+        print("ℹ️ The model suggested no (valid) edits — keeping the clip untouched.")
+        return {"filter_string": None, "edits": []}
+    print(f"🎯 Applying {len(applied)} edits: "
+          + ", ".join(f"{e['type']}@{e['start']:.1f}s" for e in applied))
+    return {"filter_string": filter_string, "edits": applied}
+
+
+def frames_effects_config(provider, video_path, duration, fps=30,
+                          width=None, height=None, transcript=None):
+    """The OpenAI-compatible arm of VideoEditor.get_effects_config: the same
+    prompt, the segments validated against EffectsPlan (chat completions
+    reply best under an explicit schema; the Gemini arm keeps its loose
+    response.text parse). Returns the {"segments": [...]} shape, or None when
+    no frames could be read — get_effects_config's own failure shape."""
+    import layout_picker
+    frames = layout_picker.sample_frames(video_path)
+    if not frames:
+        print("⚠️ No readable frames for the effects config.")
+        return None
+    if width is None or height is None:
+        width, height = 1080, 1920
+    prompt = _effects_prompt(duration, fps, width, height, transcript)
+    print("🤖 Asking the OpenAI-compatible endpoint for a Remotion effects config...")
+    result = provider.generate_content(
+        prompt, schema=EffectsPlan, messages=_frame_messages(prompt, frames))
+    plan = result.get("response") or {}
+    return {"segments": plan.get("segments") or []}
+
+
+def openai_repair_filter(provider, filter_string, error_text, width, height):
+    """The OpenAI-compatible arm of VideoEditor._repair_filter: the same
+    one-shot repair round-trip, text-only — no frames needed, so the frames
+    path keeps the self-repair safety net. Returns the corrected string or
+    None; never raises."""
+    prompt = f"""
+        The following FFmpeg -vf filter string you generated fails to run.
+
+        FILTER:
+        {filter_string}
+
+        FFMPEG ERROR:
+        {error_text}
+
+        Fix the filter. Keep the same creative intent, obey the same rules as before:
+        - exact output resolution {width}x{height} (zoompan must set s={width}x{height}),
+        - no bare comparison operators (use between/lt/lte/gt/gte),
+        - expression values in single quotes.
+        Output JSON only: {{"filter_string": "..."}}
+        """
+    try:
+        result = provider.generate_content(prompt, schema=FilterRepair)
+        repaired = (result.get("response") or {}).get("filter_string")
+        return repaired if isinstance(repaired, str) and repaired.strip() else None
+    except Exception as e:
+        print(f"⚠️ Filter self-repair failed: {e}")
+        return None
+
+
 class VideoEditor:
-    def __init__(self, api_key):
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key, openai_provider=None):
+        # A Gemini key builds the client. Without one (the OpenAI-compatible
+        # frames arm) it stays None and every Gemini-only method is off:
+        # upload_video / get_ffmpeg_filter / get_effects_config are simply
+        # never called on that path, and _repair_filter's guard routes the
+        # repair to the OpenAI arm instead.
+        self.client = genai.Client(api_key=api_key) if api_key else None
+        self.openai_provider = openai_provider
         self.model_name = (
             os.environ.get("GEMINI_MODEL_EDITOR")
             or os.environ.get("GEMINI_MODEL")
@@ -71,45 +343,9 @@ class VideoEditor:
             # Keep prompt usable even if caller didn't pass dimensions.
             width, height = 1080, 1920
 
-        transcript_text = json.dumps(transcript) if transcript else "Not available."
-
-        caption_rule = ""
-        if has_captions:
-            caption_rule = (
-                "\n        CRITICAL: This video already has burned-in captions and/or a hook text. "
-                "Any zoom would crop or shift them off screen. Do NOT use zoom_in, punch_in or zoom_pulse — "
-                "only color_pop, bw_moment, flash and vignette are allowed.\n"
-            )
-
-        prompt = f"""
-        You are a viral short-form video editor (TikTok / Reels / Shorts). You receive a video and its transcript.
-        Decide WHERE a small set of tasteful, high-impact effects belongs. You do NOT write FFmpeg —
-        you return an edit decision list, and a deterministic renderer applies it safely.
-
-        Video duration: {duration:.1f} seconds. Resolution: {width}x{height}.
-
-        Available effect types:
-        - "zoom_in": slow push-in across the segment. Builds tension or focus on a key statement. strength 0.06-0.15, segment 1.5-6s.
-        - "punch_in": instant tighter framing for the whole segment. Emphasis, punchlines, "listen to this" moments. strength 0.06-0.15, segment 0.8-5s.
-        - "zoom_pulse": quick in-and-out pulse peaking mid-segment. Beat drops, single impactful words. strength 0.04-0.10, segment 0.4-1.2s.
-        - "color_pop": richer saturation/contrast. Energy, excitement, product/visual highlights. strength 0.2-1.0.
-        - "bw_moment": black & white. Drama, serious quotes, flashbacks.
-        - "flash": brief bright flash at segment start. Hard-cut energy, reveals. Use at most 2.
-        - "vignette": darkened edges. Focus, intimacy, storytelling moments.
-
-        Rules:
-        1. Match effects to the CONTENT: place them on the exact words or moments they emphasize, using the transcript timestamps.
-        2. Less is more: 2-6 edits per 30 seconds of video. A random effect is worse than no effect.
-        3. Never overlap two zoom-type edits (zoom_in/punch_in/zoom_pulse).
-        4. Calm, serious delivery => few or no motion effects. High-energy content => more punch.
-        {caption_rule}
-        TRANSCRIPT (with timestamps, the context of what is being said):
-        {transcript_text}
-
-        Return JSON only:
-        {{"edits": [{{"type": "punch_in", "start": 3.2, "end": 5.4, "strength": 0.1, "reason": "punchline"}}]}}
-        If no effects genuinely improve the video, return {{"edits": []}}.
-        """
+        # One prompt, two transports: shared verbatim with the frames arm
+        # (frames_edit_plan) so both arms ask the exact same question.
+        prompt = _edit_plan_prompt(duration, width, height, transcript, has_captions)
 
         print("🤖 Asking Gemini for an edit decision list...")
         # Low media resolution: Gemini samples at 1 FPS and normalizes frames to
@@ -165,57 +401,9 @@ class VideoEditor:
         if width is None or height is None:
             width, height = 1080, 1920
 
-        transcript_text = json.dumps(transcript) if transcript else "Not available."
-
-        prompt = f"""
-        You are an expert video editor analyzing a video and its transcript to generate dynamic visual effects for a Remotion-based renderer.
-
-        Video Duration: {duration} seconds.
-        Video FPS: {fps}
-        Video Resolution: {width}x{height}
-
-        TRANSCRIPT (Context of what is being said):
-        {transcript_text}
-
-        Your task is to produce a structured JSON describing time-based effect segments that cover the FULL video duration.
-
-        Each segment has these fields:
-        - "startSec" (number): Start time in seconds.
-        - "endSec" (number): End time in seconds.
-        - "zoom" (number): Zoom level. 1.0 = no zoom, max 1.5. Use subtle values like 1.05-1.2 for most cases.
-        - "zoomCenterX" (number): Horizontal focus point for zoom, 0.0 (left) to 1.0 (right). 0.5 = center.
-        - "zoomCenterY" (number): Vertical focus point for zoom, 0.0 (top) to 1.0 (bottom). 0.5 = center.
-        - "brightness" (number): Brightness multiplier. 1.0 = normal. Range 0.8-1.2.
-        - "contrast" (number): Contrast multiplier. 1.0 = normal. Range 0.8-1.3.
-        - "saturate" (number): Saturation multiplier. 1.0 = normal. Range 0.8-1.3.
-
-        Instructions:
-        1. ANALYZE the video content and transcript to understand mood, pacing, and key moments.
-        2. Apply CONTEXTUAL effects aligned with speech and action:
-           - Use slow, subtle zooms toward the speaker's face during speaking moments.
-           - Emphasize key moments, punchlines, or dramatic beats with slightly stronger zoom or contrast.
-           - Keep transitions smooth — avoid jarring jumps between segments.
-           - If nothing significant is happening, keep values at defaults (zoom 1.0, all multipliers 1.0).
-        3. Segments MUST cover the entire video duration from 0 to {duration} seconds with no gaps.
-        4. Prefer fewer, longer segments with gradual changes over many rapid short segments.
-        5. Output ONLY valid JSON, no explanations.
-
-        Output format:
-        {{
-            "segments": [
-                {{
-                    "startSec": 0,
-                    "endSec": 3.5,
-                    "zoom": 1.0,
-                    "zoomCenterX": 0.5,
-                    "zoomCenterY": 0.5,
-                    "brightness": 1.0,
-                    "contrast": 1.0,
-                    "saturate": 1.0
-                }}
-            ]
-        }}
-        """
+        # One prompt, two transports: shared verbatim with the frames arm
+        # (frames_effects_config).
+        prompt = _effects_prompt(duration, fps, width, height, transcript)
 
         print("🤖 Asking Gemini for Remotion effects config...")
         response = self.client.models.generate_content(
@@ -363,9 +551,13 @@ class VideoEditor:
         return False, stderr_text[-1500:]
 
     def _repair_filter(self, filter_string, error_text, width, height):
-        """One self-repair round-trip: show Gemini the FFmpeg error and ask for
-        a corrected filter string. Returns the new string or None."""
+        """One self-repair round-trip: show the model the FFmpeg error and ask
+        for a corrected filter string. Returns the new string or None."""
         if not self.client:
+            # No Gemini client: the OpenAI-compatible arm repairs text-only.
+            if self.openai_provider is not None:
+                return openai_repair_filter(
+                    self.openai_provider, filter_string, error_text, width, height)
             return None
         prompt = f"""
         The following FFmpeg -vf filter string you generated fails to run.

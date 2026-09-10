@@ -2071,6 +2071,16 @@ async def get_config():
         "llmConfigured": llm_cfg is not None,
         "llmModel": llm_cfg.model if llm_cfg else None,
         "llmBaseUrl": llm_cfg.base_url if llm_cfg else None,
+        # FR9: the server's pipeline-family env (OPENAI_*), read-only — the
+        # unified card's badge shows both halves. Presence only, never the
+        # key, and billing-pinned like the llm_* fields: a hosted server must
+        # not leak its env configuration to cloud clients (the same invariant
+        # ai_backend_available's docstring states).
+        "openaiConfigured": (not BILLING_ENABLED) and bool(
+            (os.environ.get("OPENAI_API_KEY") or "").strip()
+            or (os.environ.get("OPENAI_BASE_URL") or "").strip()),
+        "openaiModel": None if BILLING_ENABLED else (os.environ.get("OPENAI_MODEL") or None),
+        "openaiBaseUrl": None if BILLING_ENABLED else ((os.environ.get("OPENAI_BASE_URL") or "").strip() or None),
         # Their fork's flag, their exact describe() dict shape — both
         # dashboards consume these by name. None under billing: the pin
         # inside _env_llm_config covers it.
@@ -3272,7 +3282,8 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
         return False
 
 
-from editor import VideoEditor
+from editor import (VideoEditor, frames_edit_plan, frames_effects_config,
+                    openai_configured, openai_vision_arm)
 from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, generate_srt_from_captions
 
 # VoiceOver feature (TTS + presets, adapted from the AutoShorts reference)
@@ -3483,8 +3494,25 @@ async def edit_clip(
     body_key = None if BILLING_ENABLED else req.api_key
     _gemini_key, _gemini_model = await resolve_gemini(request)
     final_api_key = body_key or _gemini_key
-
-    if not final_api_key:
+    openai_key, openai_model, openai_base = resolve_openai(request)
+    # Gemini preferred (D2): the frames arm is the no-key fallback, the same
+    # precedence as the in-job stages. the gate predicate rejects resolve_openai's
+    # bare fallbacks (default base + empty key), so an unset server env can
+    # never route a request at api.openai.com.
+    use_openai = (not final_api_key
+                  and openai_configured(openai_key, openai_base))
+    openai_prov = None
+    if use_openai:
+        # Build + probe in the executor: both are blocking network calls and
+        # this gate runs on the event loop. A refused arm is a config problem
+        # → clean 400 here, where it survives (the big try below only has
+        # `except Exception`).
+        loop = asyncio.get_event_loop()
+        openai_prov, arm_error = await loop.run_in_executor(
+            None, openai_vision_arm, openai_key, openai_model, openai_base)
+        if openai_prov is None:
+            raise HTTPException(status_code=400, detail=arm_error)
+    if not final_api_key and not use_openai:
         raise gemini_missing_error()
 
     await _ensure_job_files(req.job_id, request)
@@ -3534,7 +3562,7 @@ async def edit_clip(
         # Run editing in a thread to avoid blocking main loop
         # Since VideoEditor uses blocking calls (subprocess, API wait)
         def run_edit():
-            editor = VideoEditor(api_key=final_api_key)
+            editor = VideoEditor(api_key=final_api_key, openai_provider=openai_prov)
 
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
             # Create a safe ASCII filename in the same directory
@@ -3546,8 +3574,11 @@ async def edit_clip(
             shutil.copy(input_path, safe_input_path)
 
             try:
-                # 1. Upload (using safe path)
-                vid_file = editor.upload_video(safe_input_path)
+                # 1. Upload (using safe path) — Gemini arm only. The frames
+                #    arm samples 12 frames locally inside frames_edit_plan.
+                vid_file = None
+                if not use_openai:
+                    vid_file = editor.upload_video(safe_input_path)
 
                 # 2. Get duration
                 import cv2
@@ -3575,7 +3606,13 @@ async def edit_clip(
                 # the editor when the source already carries them. `filename` is
                 # the original clip name (safe_input_path is an ASCII temp copy).
                 has_captions = ("subtitled_" in filename) or ("hook_" in filename) or ("hooked_" in filename)
-                filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
+                if use_openai:
+                    filter_data = frames_edit_plan(
+                        openai_prov, safe_input_path, duration, fps=fps,
+                        width=width, height=height, transcript=transcript,
+                        has_captions=has_captions)
+                else:
+                    filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
 
                 # 4. Apply
                 # Use safe output name first
@@ -4643,8 +4680,18 @@ async def generate_effects_config(
 ):
     """Generate structured EffectsConfig JSON for Remotion rendering via Gemini AI."""
     final_api_key, _gemini_model = await resolve_gemini(request)
-
-    if not final_api_key:
+    openai_key, openai_model, openai_base = resolve_openai(request)
+    # Same two-arm gate as /api/edit (Gemini preferred, key-or-real-base).
+    use_openai = (not final_api_key
+                  and openai_configured(openai_key, openai_base))
+    openai_prov = None
+    if use_openai:
+        loop = asyncio.get_event_loop()
+        openai_prov, arm_error = await loop.run_in_executor(
+            None, openai_vision_arm, openai_key, openai_model, openai_base)
+        if openai_prov is None:
+            raise HTTPException(status_code=400, detail=arm_error)
+    if not final_api_key and not use_openai:
         raise gemini_missing_error()
 
     await _ensure_job_files(req.job_id, request)
@@ -4674,7 +4721,7 @@ async def generate_effects_config(
             raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
         def run_effects_generation():
-            editor = VideoEditor(api_key=final_api_key)
+            editor = VideoEditor(api_key=final_api_key, openai_provider=openai_prov)
 
             # Create safe ASCII filename to avoid encoding issues
             safe_filename = f"temp_effects_{req.job_id}.mp4"
@@ -4682,8 +4729,11 @@ async def generate_effects_config(
             shutil.copy(input_path, safe_input_path)
 
             try:
-                # Upload video to Gemini
-                vid_file = editor.upload_video(safe_input_path)
+                # Upload video to Gemini — Files arm only; the frames arm
+                # samples locally inside frames_effects_config.
+                vid_file = None
+                if not use_openai:
+                    vid_file = editor.upload_video(safe_input_path)
 
                 # Get video metadata via ffprobe
                 probe_cmd = [
@@ -4723,9 +4773,14 @@ async def generate_effects_config(
                     print(f"âš ï¸ Could not load transcript for effects config: {e}")
 
                 # Generate effects config
-                effects_config = editor.get_effects_config(
-                    vid_file, duration, fps=fps, width=width, height=height, transcript=transcript
-                )
+                if use_openai:
+                    effects_config = frames_effects_config(
+                        openai_prov, safe_input_path, duration, fps=fps,
+                        width=width, height=height, transcript=transcript)
+                else:
+                    effects_config = editor.get_effects_config(
+                        vid_file, duration, fps=fps, width=width, height=height, transcript=transcript
+                    )
 
                 return effects_config
             finally:
@@ -6051,7 +6106,19 @@ async def thumbnail_generate(
     not. frame: url of a frame from /api/thumbnail/frames to use as the
     person reference when no face photo is uploaded."""
     api_key, _gemini_model = await resolve_gemini(request)
-    if not api_key:
+    openai_key, openai_model, openai_base = resolve_openai(request)
+    # Gemini preferred (D2): the unified endpoint is the no-key fallback, the
+    # same precedence as every rerouted stage. The Slice 5 gate predicate,
+    # already imported, rejects resolve_openai's bare fallbacks (default base
+    # + empty key), so an unset server env can never point a request at
+    # api.openai.com. The not-BILLING leg keeps cloud byte-identical to HEAD:
+    # an entitled user always resolves the managed key (so the arm never
+    # fires), and an anonymous/free caller with BYOK X-OpenAI-* headers — or
+    # a stray server OPENAI_* env — must not reach the unmetered executor.
+    # The billing branch below is untouched.
+    use_openai = ((not BILLING_ENABLED) and (not api_key)
+                  and openai_configured(openai_key, openai_base))
+    if not api_key and not use_openai:
         raise gemini_missing_error()
     llm_cfg = await resolve_llm(request, task="thumbnail")
 
@@ -6108,14 +6175,32 @@ async def thumbnail_generate(
                 frame_reference = next((f for f in session.get("frames", []) if f["url"] == frame), None)
 
         loop = asyncio.get_event_loop()
-        thumbnails = await loop.run_in_executor(
-            None,
-            functools.partial(
-                generate_thumbnail, api_key, title, session_id, face_path, bg_path,
-                extra_prompt, count, video_context, burn_text=burn_text,
-                thumbnail_text_hint=text_hint, language=language,
-                frame_reference=frame_reference, llm_config=llm_cfg),
-        )
+        # D14: the images arm is text-prompt only; the model default resolves
+        # inside thumbnail.py (resolve_openai's "gpt-4o-mini" fallback is a
+        # chat model and cannot draw).
+        openai_image = ({"api_key": openai_key, "model": openai_model,
+                         "base_url": openai_base} if use_openai else None)
+        try:
+            thumbnails = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    generate_thumbnail, api_key, title, session_id, face_path, bg_path,
+                    extra_prompt, count, video_context, burn_text=burn_text,
+                    thumbnail_text_hint=text_hint, language=language,
+                    frame_reference=frame_reference, llm_config=llm_cfg,
+                    openai_image_config=openai_image),
+            )
+        except Exception as e:
+            if use_openai:
+                # The clean-unavailable state: a configured endpoint that
+                # cannot generate images is a configuration problem, not a
+                # server fault. 400 — and the outer HTTPException handler
+                # releases the reservation.
+                raise HTTPException(status_code=400, detail=(
+                    "Image generation is not available on the configured endpoint "
+                    f"({e}). Set a Gemini key, or point the AI provider at an "
+                    "image-capable model."))
+            raise
 
         if not thumbnails:
             raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your Gemini API key has access to image generation (gemini-3.1-flash-image-preview model).")

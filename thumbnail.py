@@ -16,6 +16,12 @@ from gemini_worker import GeminiBlockedError
 # stays on gemini-3.1-flash-image; the text models cannot draw.
 TEXT_MODEL = os.environ.get("GEMINI_MODEL_THUMBNAIL") or "gemini-3.7-flash"
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-image"
+# The OpenAI-compatible images arm (D14). resolve_openai fills an unset model
+# with the CHAT default "gpt-4o-mini" (app.py), which cannot draw; that value
+# and an empty model both land on this default. An explicitly chosen model
+# always wins. An env knob, like IMAGE_MODEL/TEXT_MODEL beside it, because
+# default image-model names differ per compatible server.
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 
 # Frames sent with the transcript instead of the whole video. Gemini bills
 # video at ~300 tokens/s, so an hour is ~1M tokens for what is a text task;
@@ -437,6 +443,12 @@ OUTPUT JSON:
         if llm_config is not None:
             import llm_client
             text, _cost = llm_client.chat(prompt, config=llm_config, json_mode=True)
+        elif client is None:
+            # Keyless unified endpoint (no Gemini key, no complete satellite
+            # triple): the generic fallback concept IS the design — one clean
+            # line, not a swallowed AttributeError on client.models.
+            print("ℹ️ [Thumbnail] No text backend for concepts — using the generic scene")
+            return normalise_concepts([], count, title, thumbnail_text_hint)
         else:
             response = client.models.generate_content(
                 model=TEXT_MODEL, contents=[prompt],
@@ -574,8 +586,12 @@ def _image_part(path):
     return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
 
-def _generate_one(client, concept, reference_images, out_path, burn_text):
-    """One image call for one concept; returns the saved path or raises."""
+def _image_prompt(concept, burn_text):
+    """The image prompt — ONE prompt, two transports: the Gemini call
+    (_generate_one) and the OpenAI-compatible images arm
+    (_generate_one_openai). Extracted verbatim from _generate_one. The
+    IDENTITY clause is deliberately NOT part of it: reference images are
+    Gemini-arm only (D14)."""
     if burn_text:
         pos = concept['text_position']
         share = "45% of the width" if pos in ("left", "right") else "40% of the height"
@@ -587,13 +603,21 @@ def _generate_one(client, concept, reference_images, out_path, burn_text):
         text_rule = (f'Render the text "{concept["text"]}" in huge bold condensed sans-serif capitals, '
                      f'{concept["text_color"]} with a thick black outline, on the {concept["text_position"]} '
                      "side, spelled EXACTLY as given. No other text.")
-    prompt = f"""Generate a professional YouTube thumbnail, 16:9.
+    return f"""Generate a professional YouTube thumbnail, 16:9.
 
 {concept['scene']}
 
 {text_rule}
 
 Style: high contrast, saturated colours, crisp subject separation, cinematic lighting, sharp focus on the subject, readable at 168x94 pixels. No clutter, no small details, no borders, no watermark."""
+
+
+def _generate_one(client, concept, reference_images, out_path, burn_text):
+    """One image call for one concept; returns the saved path or raises."""
+    # One prompt, two transports: shared verbatim with the images arm
+    # (_generate_one_openai). The IDENTITY clause rides only here —
+    # reference images are Gemini-arm only (D14).
+    prompt = _image_prompt(concept, burn_text)
     if reference_images:
         prompt += ("\nIDENTITY: the person in the provided photo must appear as EXACTLY the same real person: "
                    "identical face shape, skin, eyes, glasses, facial hair, hairstyle and hair length, age and "
@@ -625,19 +649,79 @@ Style: high contrast, saturated colours, crisp subject separation, cinematic lig
     raise RuntimeError("Gemini returned no image")
 
 
+def _generate_one_openai(openai_image_config, concept, out_path, burn_text):
+    """One /v1/images/generations call for one concept; returns the saved
+    path or raises. Text-prompt only (D14): this endpoint cannot carry
+    reference images, and /v1/images/edits stays unprobed — an endpoint
+    without image support surfaces through the caller as the
+    clean-unavailable state, which replaces the vision probe the chat arms
+    use. No size and no response_format: both are model-specific (gpt-image-1
+    rejects response_format; dall-e-3 rejects 1536x1024) and
+    finalize_thumbnail cover-crops whatever aspect arrives — one code path
+    for every OpenAI-compatible server."""
+    import base64
+    import httpx
+
+    base = (openai_image_config.get("base_url") or "").rstrip("/")
+    headers = {}
+    key = (openai_image_config.get("api_key") or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    model = (openai_image_config.get("model") or "").strip()
+    if model in ("", "gpt-4o-mini"):
+        model = OPENAI_IMAGE_MODEL  # resolve_openai's chat default cannot draw
+    prompt = _image_prompt(concept, burn_text)
+    response = httpx.post(f"{base}/images/generations",
+                          json={"model": model, "prompt": prompt, "n": 1},
+                          headers=headers, timeout=180)
+    response.raise_for_status()
+    items = (response.json() or {}).get("data") or []
+    item = next((d for d in items
+                 if isinstance(d, dict) and (d.get("b64_json") or d.get("url"))), None)
+    if item is None:
+        raise RuntimeError("the endpoint's reply contained no image data")
+    if item.get("b64_json"):
+        raw = base64.b64decode(item["b64_json"])
+    else:
+        # dall-e style URL reply — fetch the bytes from the provider.
+        raw = httpx.get(item["url"], timeout=60, follow_redirects=True).content
+    pil = Image.open(io.BytesIO(raw))
+    if burn_text:
+        pil = burn_thumbnail_text(pil, concept["text"],
+                                  concept["text_position"], concept["text_color"])
+    return finalize_thumbnail(pil, out_path)
+
+
 def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_image_path=None,
                        extra_prompt="", count=3, video_context="", burn_text=True,
                        thumbnail_text_hint="", language="en", frame_reference=None,
-                       llm_config=None):
+                       llm_config=None, openai_image_config=None):
     """
     Generates `count` thumbnails, each from its own concept, in parallel.
     frame_reference: {"path", "face"} from extract_face_frames, used as the
     person reference when the user picked a frame instead of uploading a photo.
+    openai_image_config: {"base_url", "api_key", "model"} from resolve_openai
+    (app.py) — the /v1/images/generations arm when no Gemini key resolved.
+    D14: that arm is text-prompt only; reference images are Gemini-arm only.
     Returns [{"url", "text", "why"}] (only the ones that rendered).
     """
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key) if api_key else None
+    if client is None and not openai_image_config:
+        raise RuntimeError(
+            "No image backend: a Gemini key or an OpenAI-compatible endpoint is required")
     output_dir = os.path.join("output", "thumbnails", session_id)
     os.makedirs(output_dir, exist_ok=True)
+
+    # D14: /v1/images/generations cannot carry reference images — refs are the
+    # Gemini arm's privilege, and with no Gemini key they are dropped (logged).
+    # Dropped BEFORE the concepts call so has_person stays honest: the concept
+    # prompt must not promise a person photo this arm cannot send.
+    if client is None and (face_image_path or frame_reference or bg_image_path):
+        print("⚠️ [Thumbnail] Reference images are honored by the Gemini arm only — "
+              "generating without them on the OpenAI-compatible endpoint")
+        face_image_path = None
+        frame_reference = None
+        bg_image_path = None
 
     # References travel as immutable byte parts: one PIL Image shared by the
     # worker threads below raced inside the SDK's encoder and every call died.
@@ -666,10 +750,16 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
         concept = concepts[i]
         try:
             try:
-                _generate_one(client, concept, reference_images, out_path, burn_text)
+                if client is not None:
+                    _generate_one(client, concept, reference_images, out_path, burn_text)
+                else:
+                    _generate_one_openai(openai_image_config, concept, out_path, burn_text)
                 fallback = False
             except RuntimeError as e:
-                if "no image" not in str(e):
+                # The blocked-retry below is the Gemini refusal shape; the
+                # images arm has no references to drop, so its failures go
+                # straight to the per-concept error return.
+                if client is None or "no image" not in str(e):
                     raise
                 # Gemini refuses recognisable public figures, by reference photo
                 # and by name alike (IMAGE_OTHER). Retry once with no reference
