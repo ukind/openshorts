@@ -11,6 +11,7 @@ import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import TikTokDraftNotice from './TikTokDraftNotice';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
+import { aiProviderSet, llmHeaders, openaiHeaders } from '../lib/llm';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
 
@@ -36,7 +37,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onVoiceOver = null, onReframeClip = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, aiProviderConfig = {}, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onVoiceOver = null, onReframeClip = null }) {
     const [showModal, setShowModal] = useState(false);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
@@ -281,24 +282,30 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         setIsEditing(true);
         setEditError(null);
         try {
-            // Was: const apiKey = geminiApiKey || a dead localStorage fallback (the
-            // legacy plaintext key). App.jsx always passes geminiApiKey, and the
-            // geminiKey_v1 migration removes the key that fallback used to find.
             const apiKey = geminiApiKey;
 
-            // Managed (paid) users get the Gemini key resolved server-side;
-            // only BYOK/self-host needs a local key.
-            if (!apiKey && !isManaged) {
-                throw new Error("Gemini API Key is missing. Please set it in Settings.");
+            // Managed (paid) users get the Gemini key resolved server-side. A
+            // self-host user is covered by EITHER a Gemini key or the unified
+            // AI provider card — a base URL alone is a runnable keyless
+            // endpoint (D10), carried by X-OpenAI-*.
+            if (!apiKey && !isManaged && !aiProviderSet(aiProviderConfig)) {
+                throw new Error("No AI backend: set a Gemini key or an AI provider in Settings.");
             }
-            const geminiHeaders = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+            // One store, both families, one emitter (lib/llm.js) — the same
+            // spread /api/process sends. X-LLM-* is inert on these endpoints;
+            // X-OpenAI-* activates the editor frames path when Slice 5 lands.
+            const aiHeaders = {
+                ...llmHeaders(aiProviderConfig),
+                ...openaiHeaders(aiProviderConfig),
+                ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
+            };
 
             // Try Remotion effects endpoint first
             const effectsRes = hasServerBurns ? null : await apiFetch('/api/effects/generate', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    ...geminiHeaders
+                    ...aiHeaders
                 },
                 body: JSON.stringify({
                     job_id: jobId,
@@ -330,7 +337,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    ...geminiHeaders
+                    ...aiHeaders
                 },
                 body: JSON.stringify({
                     job_id: jobId,

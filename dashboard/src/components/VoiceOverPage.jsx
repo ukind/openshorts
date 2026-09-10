@@ -6,6 +6,7 @@ import {
 import SubtitleModal from './SubtitleModal';
 import RemotionPreview from './RemotionPreview';
 import { apiFetch, apiJson } from '../lib/api';
+import { aiProviderSet, llmHeaders, openaiHeaders } from '../lib/llm';
 import { getApiUrl } from '../config';
 
 // VoiceOver workflow page: source → caption options (4) → select/edit (with
@@ -37,7 +38,7 @@ const loadVoSession = () => {
     return session;
   } catch { return null; }
 };
-export const clearVoSession = () => { localStorage.removeItem(VO_SESSION_KEY); };
+const clearVoSession = () => { localStorage.removeItem(VO_SESSION_KEY); };
 
 // Same full-name map Qwen TTS uses — the dropdown sends codes; backend resolves.
 const LANGUAGES = [
@@ -81,9 +82,7 @@ export default function VoiceOverPage({
   aiProvider,
   geminiApiKey,
   geminiModel,
-  openaiApiKey,
-  openaiModel,
-  openaiBaseUrl,
+  aiProviderConfig,
   elevenLabsKey,
   results,
   jobId,
@@ -230,7 +229,6 @@ export default function VoiceOverPage({
         setStylePrompt(picked.prompt);
       }
     }).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -343,15 +341,18 @@ export default function VoiceOverPage({
   };
 
   // --- caption generation -------------------------------------------------------------
-  const byokHeaders = () => {
-    const headers = { 'X-AI-Provider': captionProvider };
-    if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
-    if (geminiModel) headers['X-Gemini-Model'] = geminiModel;
-    if (openaiApiKey) headers['X-OpenAI-Key'] = openaiApiKey;
-    if (openaiModel) headers['X-OpenAI-Model'] = openaiModel;
-    if (openaiBaseUrl) headers['X-OpenAI-Base-Url'] = openaiBaseUrl;
-    return headers;
-  };
+  // The caption request's headers. The provider pair (X-AI-Provider +
+  // X-Gemini-*) is this page's own toggle; both config families come from
+  // the ONE unified store via the lib/llm.js builders — never inline
+  // (single-emitter rule). resolve_ai_provider ignores X-LLM-* here; it
+  // rides along for uniformity and costs nothing.
+  const byokHeaders = () => ({
+    'X-AI-Provider': captionProvider,
+    ...(geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {}),
+    ...(geminiModel ? { 'X-Gemini-Model': geminiModel } : {}),
+    ...llmHeaders(aiProviderConfig),
+    ...openaiHeaders(aiProviderConfig),
+  });
 
   const generateCaptions = async () => {
     if (!sourceReady) return;
@@ -359,8 +360,10 @@ export default function VoiceOverPage({
       setError('Add your Gemini API key in Settings first.');
       return;
     }
-    if (captionProvider === 'openai' && !openaiApiKey) {
-      setError('Add your OpenAI API key in Settings first.');
+    if (captionProvider === 'openai' && !aiProviderSet(aiProviderConfig)) {
+      // D10: a base URL alone is a runnable keyless local endpoint; the old
+      // key-only gate blocked exactly those.
+      setError('Set your AI provider in Settings first.');
       return;
     }
     setGeneratingCaptions(true);

@@ -2,11 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { X, Search, Loader2, Check, AlertCircle } from 'lucide-react';
 import Modal from './ui/Modal';
 import { apiJson } from '../lib/api';
+import { llmHeaders, openaiHeaders } from '../lib/llm';
 
 export default function CreateEditProfileModal({ isOpen, onClose, profile, onSave,
                                                 aiProvider, geminiApiKey,
-                                                openaiApiKey, openaiModel,
-                                                openaiBaseUrl }) {
+                                                aiProviderConfig }) {
   const [formData, setFormData] = useState({
     name: '',
     game_title: '',
@@ -250,18 +250,14 @@ export default function CreateEditProfileModal({ isOpen, onClose, profile, onSav
     if (!title) { setAiError('Enter a Game Title first (or run Steam Lookup)'); return; }
     setAiAnalyzing(true); setAiError(null);
     try {
-      const headers = { 'X-AI-Provider': provider };
-      if (provider === 'openai') {
-        if (openaiApiKey) headers['X-OpenAI-Key'] = openaiApiKey;
-        if (openaiModel) headers['X-OpenAI-Model'] = openaiModel;
-        if (openaiBaseUrl) headers['X-OpenAI-Base-Url'] = openaiBaseUrl;
-        if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
-      } else {
-        if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
-        if (openaiApiKey) headers['X-OpenAI-Key'] = openaiApiKey;
-        if (openaiModel) headers['X-OpenAI-Model'] = openaiModel;
-        if (openaiBaseUrl) headers['X-OpenAI-Base-Url'] = openaiBaseUrl;
-      }
+      // One spread replaces the old two-branch builder (both branches sent
+      // as the server's fallback leg (app.py reads them after the headers).
+      const headers = {
+        'X-AI-Provider': provider,
+        ...(geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {}),
+        ...llmHeaders(aiProviderConfig),
+        ...openaiHeaders(aiProviderConfig),
+      };
       const data = await apiJson('/api/game-profiles/analyze', {
         method: 'POST',
         headers,
@@ -271,9 +267,8 @@ export default function CreateEditProfileModal({ isOpen, onClose, profile, onSav
           steam_genres: formData.steam_genres || [],
           steam_tags: formData.steam_tags || [],
           provider,
-          openai_model: openaiModel || undefined,
-          openai_base_url: openaiBaseUrl || undefined,
-          openai_key: openaiApiKey || undefined,
+          openai_model: aiProviderConfig?.model || undefined,
+          openai_base_url: aiProviderConfig?.baseUrl || undefined
         },
       });
       setFormData(prev => ({
