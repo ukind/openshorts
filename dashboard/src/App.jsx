@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Users as UsersIcon, Mic, AudioLines } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
-import LlmProviderCard from './components/LlmProviderCard';
+import AiProviderCard from './components/AiProviderCard';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -33,8 +33,10 @@ import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 // The X-LLM-* header builder rides with its sibling: the AI-backend gate and
 // the /api/process headers below are its first consumers.
-import { llmConfigComplete, llmHeaders } from './lib/llm';
+import { aiProviderSet, llmConfigComplete, llmHeaders, openaiHeaders } from './lib/llm';
 import { track } from './lib/panel';
+
+const AI_PROVIDER_STORE_KEY = 'aiProviderConfig_v1';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -209,7 +211,8 @@ function App() {
   // Cloud auth/billing session + the two LLM surfaces: llmConfigured/Model/BaseUrl
   // are our satellite family (/api/config), localLlm is their pipeline family.
   const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds,
-          llmConfigured, llmModel, llmBaseUrl, localLlm } = useAuth();
+          llmConfigured, llmModel, llmBaseUrl, localLlm,
+          openaiConfigured, openaiModel, openaiBaseUrl } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
@@ -243,15 +246,8 @@ function App() {
     try { localStorage.removeItem('gemini_key'); } catch (_) { /* ignore */ }
     return value;
   });
-  const [openaiKey, setOpenaiKey] = useState(localStorage.getItem('openai_key') || '');
-  const [openaiModel, setOpenaiModel] = useState(localStorage.getItem('openai_model') || 'gpt-4o-mini');
   const [geminiModel, setGeminiModel] = useState(localStorage.getItem('gemini_model') || 'gemini-3.1-flash-lite');
-  const [openaiBaseUrl, setOpenaiBaseUrl] = useState(localStorage.getItem('openai_base_url') || '');
   const [aiProvider, setAiProvider] = useState(localStorage.getItem('ai_provider') || 'gemini');
-  const [openaiModels, setOpenaiModels] = useState([]);
-  const [openaiModelsLoading, setOpenaiModelsLoading] = useState(false);
-  const [openaiModelsError, setOpenaiModelsError] = useState(null);
-  const [openaiModelDropdownOpen, setOpenaiModelDropdownOpen] = useState(false);
   const [geminiModelDropdownOpen, setGeminiModelDropdownOpen] = useState(false);
   // Phase 4: Cheap multimodal toggles (each enhancement beyond default Whisper toggleable)
   const [enableScene, setEnableScene] = useState(() => {
@@ -307,27 +303,43 @@ function App() {
     return '';
   });
 
-  // --- llmConfig state — after the falKey initializer -----------------------------
-  // One encrypted JSON blob, not three keys: one localStorage read, one write.
-  // The JSON parse is the corruption guard — every bad path (bad base64,
-  // key-rotated garbage, non-JSON, wrong shape) lands in the catch and starts
-  // from the empty triple. Nothing here blocks the app from booting.
-  // The AI Provider card's Save is the only writer of this config.
-  const [llmConfig, setLlmConfig] = useState(() => {
+  // --- aiProviderConfig state — the ONE provider store (unified AI provider config) ---
+  // One encrypted JSON blob {baseUrl, apiKey, model} under aiProviderConfig_v1.
+  // First load migrates the two legacy sources in: the encrypted llmConfig_v1
+  // triple (the more deliberate configuration) wins over the plaintext
+  // openai_* triple; an existing aiProviderConfig_v1 wins over both. The
+  // legacy keys are removed AFTER adoption, adopted or not — the
+  // App.jsx:229-250 (gemini_key) pattern. Nothing here blocks booting.
+  const [aiProviderConfig, setAiProviderConfig] = useState(() => {
+    const empty = { baseUrl: '', apiKey: '', model: '' };
+    const shape = (parsed) => ((parsed && typeof parsed === 'object') ? {
+      baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
+      apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+      model: typeof parsed.model === 'string' ? parsed.model : '',
+    } : null);
+    let value = null;
     try {
-      const stored = localStorage.getItem('llmConfig_v1');
-      if (stored) {
-        const parsed = JSON.parse(decrypt(stored));
-        if (parsed && typeof parsed === 'object') {
-          return {
-            baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
-            apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
-            model: typeof parsed.model === 'string' ? parsed.model : '',
-          };
-        }
-      }
-    } catch (_) { /* corrupt or key-rotated blob — start empty */ }
-    return { baseUrl: '', apiKey: '', model: '' };
+      const stored = localStorage.getItem(AI_PROVIDER_STORE_KEY);
+      if (stored) value = shape(JSON.parse(decrypt(stored)));
+    } catch (_) { /* corrupt or key-rotated blob — fall through to migration */ }
+    if (!value || !value.baseUrl) {
+      try {
+        const legacy = localStorage.getItem('llmConfig_v1');
+        if (legacy) value = shape(JSON.parse(decrypt(legacy))) || value;
+      } catch (_) { /* unreadable legacy blob — ignore */ }
+    }
+    if (!value || !value.baseUrl) {
+      value = {
+        ...(value || empty),
+        baseUrl: (value && value.baseUrl) || localStorage.getItem('openai_base_url') || '',
+        apiKey: (value && value.apiKey) || localStorage.getItem('openai_key') || '',
+        model: (value && value.model) || localStorage.getItem('openai_model') || '',
+      };
+    }
+    ['llmConfig_v1', 'openai_key', 'openai_model', 'openai_base_url'].forEach((k) => {
+      try { localStorage.removeItem(k); } catch (_) { /* ignore */ }
+    });
+    return value || empty;
   });
 
   const [uploadUserId, setUploadUserId] = useState(() => localStorage.getItem('uploadUserId') || '');
@@ -694,22 +706,23 @@ function App() {
     }
   }, [apiKey]);
 
-  // --- llmConfig persistence — same effect shape as the other keys (D8) -----------
-  // Guarded like the sibling keys: only a complete triple is persisted, so
-  // deleting the blob (and saving nothing after) restores the pre-feature
-  // state. Half-configured values live in memory only (D2).
+  // --- aiProviderConfig persistence — encrypted JSON, baseUrl-gated (D10) --------
+  // A base URL alone is a usable (keyless local) configuration, so that is
+  // the persistence gate. Clearing the card removes the blob, so Reset is a
+  // real reset across reloads.
   useEffect(() => {
-    if (llmConfigComplete(llmConfig)) {
-      try { localStorage.setItem('llmConfig_v1', encrypt(JSON.stringify(llmConfig))); } catch (_) { /* ignore */ }
-    }
-  }, [llmConfig]);
+    try {
+      if (aiProviderSet(aiProviderConfig)) {
+        localStorage.setItem(AI_PROVIDER_STORE_KEY, encrypt(JSON.stringify(aiProviderConfig)));
+      } else {
+        localStorage.removeItem(AI_PROVIDER_STORE_KEY);
+      }
+    } catch (_) { /* ignore */ }
+  }, [aiProviderConfig]);
 
 
   useEffect(() => {
-    if (openaiKey) localStorage.setItem('openai_key', openaiKey); else localStorage.removeItem('openai_key');
-    if (openaiModel) localStorage.setItem('openai_model', openaiModel);
     if (geminiModel) localStorage.setItem('gemini_model', geminiModel);
-    if (openaiBaseUrl) localStorage.setItem('openai_base_url', openaiBaseUrl); else localStorage.removeItem('openai_base_url');
     localStorage.setItem('ai_provider', aiProvider);
     localStorage.setItem('enable_scene', enableScene ? '1' : '0');
     localStorage.setItem('enable_audio', enableAudio ? '1' : '0');
@@ -721,7 +734,7 @@ function App() {
     localStorage.setItem('target_clips', String(targetClips));
     if (deepProvider) localStorage.setItem('deep_provider', deepProvider); else localStorage.removeItem('deep_provider');
     if (selectedProfileId) localStorage.setItem('selected_game_profile', selectedProfileId); else localStorage.removeItem('selected_game_profile');
-  }, [apiKey, openaiKey, openaiModel, openaiBaseUrl, geminiModel, aiProvider, enableScene, enableAudio, enableVisual, enableVision, enableDeep, enableEnhance, enableEmoji, targetClips, deepProvider, selectedProfileId]);
+  }, [apiKey, geminiModel, aiProvider, enableScene, enableAudio, enableVisual, enableVision, enableDeep, enableEnhance, enableEmoji, targetClips, deepProvider, selectedProfileId]);
 
   useEffect(() => {
     if (uploadPostKey) {
@@ -912,9 +925,15 @@ function App() {
   // makes every consumer inert under billing.
   const providerCfg = billingEnabled
     ? { baseUrl: '', apiKey: '', model: '' }
-    : llmConfig;
+    : aiProviderConfig;
+  // D10: a base URL alone is a runnable (keyless local) pipeline config.
+  const aiProviderActive = aiProviderSet(providerCfg);
+  // With no Gemini key and the unified card set, a stale 'gemini' toggle
+  // choice would 400 the job on a missing key. The toggle below renders this
+  // value too — what it shows is what runs.
+  const effectiveProvider = (!apiKey && aiProviderActive && aiProvider === 'gemini') ? 'openai' : aiProvider;
   const llmActive = llmConfigComplete(providerCfg) || !!llmConfigured || !!localLlm;
-  const needsAiBackend = !apiKey && !llmActive;
+  const needsAiBackend = !apiKey && !llmActive && !aiProviderActive;
   const keysMissing = !billingEnabled && (needsAiBackend || !uploadPostKey);
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
@@ -1050,16 +1069,17 @@ function App() {
 
     try {
       let body;
-      // BYOK: the satellite triple (X-LLM-*) rides with the pipeline family.
-      // llmHeaders builds from the cloud-gated providerCfg, so a stale
-      // self-host blob cannot leak into a cloud request (D3). The Gemini key
-      // is our encrypted apiKey, attached once here; the provider-family
-      // fields below are theirs (X-AI-Provider / X-OpenAI-* / toggles /
-      // X-Target-Clips / X-Deep-Provider / X-Game-Profile-Id).
+      // One store, both families, one emitter (lib/llm.js): derived
+      // X-LLM-* for the satellites (inert without base+key), X-OpenAI-* for
+      // the pipeline (key/model omitted when unset). The Gemini key is our
+      // encrypted apiKey, attached once here; the family fields below are
+      // theirs (X-AI-Provider / toggles / X-Target-Clips / X-Deep-Provider /
+      // X-Game-Profile-Id).
       const headers = {
         ...llmHeaders(providerCfg),
+        ...openaiHeaders(providerCfg),
         ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
-        'X-AI-Provider': aiProvider,
+        'X-AI-Provider': effectiveProvider,
         'X-Enable-Scene': enableScene ? '1' : '0',
         'X-Enable-Audio': enableAudio ? '1' : '0',
         'X-Enable-Visual': enableVisual ? '1' : '0',
@@ -1071,10 +1091,7 @@ function App() {
         ...(deepProvider ? { 'X-Deep-Provider': deepProvider } : {}),
         ...(selectedProfileId ? { 'X-Game-Profile-Id': selectedProfileId } : {}),
       };
-      if (openaiKey) headers['X-OpenAI-Key'] = openaiKey;
-      if (openaiModel) headers['X-OpenAI-Model'] = openaiModel;
       if (geminiModel) headers['X-Gemini-Model'] = geminiModel;
-      if (openaiBaseUrl) headers['X-OpenAI-Base-Url'] = openaiBaseUrl;
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
@@ -1624,141 +1641,21 @@ function App() {
               ) : (
                 <>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} geminiModel={geminiModel} setGeminiModel={setGeminiModel} dropdownOpen={geminiModelDropdownOpen} setDropdownOpen={setGeminiModelDropdownOpen} />
-              {/* Self-host only: this mount lives in the !billingEnabled branch, so the
-                  provider surface is structurally absent on cloud (Requirement). This
-                  card writes the satellite triple (X-LLM-*); the OpenAI card below
-                  writes the pipeline family (X-OpenAI-*) — both coexist (D5). */}
-              <LlmProviderCard
-                savedConfig={llmConfig}
-                onConfigSet={setLlmConfig}
+              {/* The ONE provider card (self-host only): its store feeds BOTH
+                  header families via lib/llm.js — the pipeline triple and the
+                  derived satellite triple (D5, unified). */}
+              <AiProviderCard
+                savedConfig={aiProviderConfig}
+                onConfigSet={setAiProviderConfig}
                 llmConfigured={llmConfigured}
                 llmModel={llmModel}
                 llmBaseUrl={llmBaseUrl}
+                openaiConfigured={openaiConfigured}
+                openaiModel={openaiModel}
+                openaiBaseUrl={openaiBaseUrl}
               />
 
-              {/* OpenAI / Compatible API — overrides env if provided */}
-              <div className="card p-4 sm:p-6 mb-8 animate-fade">
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="p-2 bg-paper3 rounded-input text-brass">
-                    <Bot size={18} />
-                  </div>
-                  <h2 className="font-display lowercase text-lg text-ink">OpenAI / Compatible API</h2>
-                  <span className="readout">BYOK</span>
-                </div>
-                <p className="text-xs text-muted mb-4 leading-relaxed">
-                  Optional — when set, these override server env <code className="readout">OPENAI_MODEL</code> / <code className="readout">OPENAI_BASE_URL</code> / <code className="readout">OPENAI_API_KEY</code>. Leave empty to use server defaults. Works with OpenAI, Azure, or local servers (LM Studio / Ollama).
-                </p>
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-ink mb-1">API Key <span className="text-muted font-normal">(not required for local servers)</span></label>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="password"
-                        value={openaiKey}
-                        onChange={(e) => setOpenaiKey(e.target.value)}
-                        placeholder="sk-... (leave empty for local)"
-                        className="input-field font-mono flex-1"
-                      />
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          const base = (openaiBaseUrl || "").trim().replace(/\/$/, "") || "https://api.openai.com/v1";
-                          try {
-                            const h = {};
-                            if (openaiKey) h["Authorization"] = `Bearer ${openaiKey}`;
-                            let res = await fetch(`/api/openai/models?base_url=${encodeURIComponent(base)}`, { headers: h });
-                            if (!res.ok) res = await fetch(`${base}/models`, { headers: openaiKey ? { Authorization: `Bearer ${openaiKey}` } : {} });
-                            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-                            const j = await res.json();
-                            const list = j.data || j.models || j;
-                            const ids = Array.isArray(list) ? list.map(m => m.id || m.name || m).filter(Boolean) : [];
-                            if (ids.length === 0) throw new Error("No models returned");
-                            setOpenaiModels(ids);
-                            alert(`OpenAI OK — ${ids.length} models from server`);
-                          } catch (e) { alert(`Test failed: ${e.message || e}`); }
-                        }}
-                        className="btn-quiet px-3 py-1.5 text-xs whitespace-nowrap"
-                        title="Test OpenAI connection + fetch models"
-                      >
-                        Test
-                      </button>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-ink mb-1">Model</label>
-                      <div className="flex gap-1.5 relative">
-                        <input
 
-                          value={openaiModel}
-                          onChange={(e) => setOpenaiModel(e.target.value)}
-                          placeholder="gpt-4o-mini"
-                          onFocus={() => setOpenaiModelDropdownOpen(true)}
-                          onBlur={() => setTimeout(() => setOpenaiModelDropdownOpen(false), 150)}
-                          className="input-field font-mono flex-1"
-                        />
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const base = (openaiBaseUrl || '').trim().replace(/\/$/, '') || 'https://api.openai.com/v1';
-                            setOpenaiModelsLoading(true); setOpenaiModelsError(null);
-                            try {
-                              const h = {};
-                              if (openaiKey) h['Authorization'] = `Bearer ${openaiKey}`;
-                              // First try via backend proxy to avoid CORS on local servers
-                              let res = await fetch(`/api/openai/models?base_url=${encodeURIComponent(base)}`, { headers: h });
-                              if (!res.ok) {
-                                // Fallback direct fetch (for browser-accessible servers)
-                                res = await fetch(`${base}/models`, { headers: openaiKey ? { Authorization: `Bearer ${openaiKey}` } : {} });
-                              }
-                              if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-                              const j = await res.json();
-                              // OpenAI format: {data:[{id:...}]} or {models:[...]}
-                              const list = j.data || j.models || j;
-                              const ids = Array.isArray(list) ? list.map(m => m.id || m.name || m).filter(Boolean) : [];
-                              if (ids.length === 0) throw new Error('No models returned');
-                              setOpenaiModels(ids);
-                            } catch (e) {
-                              setOpenaiModelsError(e.message || 'Failed to fetch models');
-                            } finally { setOpenaiModelsLoading(false); }
-                          }}
-                          className="btn-quiet px-2 py-1 text-xs whitespace-nowrap"
-                          title="Fetch models from Base URL"
-                        >
-                          {openaiModelsLoading ? <Loader2 size={12} className="animate-spin" /> : 'Refresh'}
-                        </button>
-                      </div>
-
-                      {openaiModelDropdownOpen && (
-                          <div className="mt-1 max-h-48 overflow-y-auto bg-paper border border-rule rounded-input shadow-lg custom-scrollbar">
-                            {(() => {
-                              const base = openaiModels.length > 0 ? openaiModels : ["gpt-4o","gpt-4o-mini","gpt-4-turbo","gpt-3.5-turbo","qwen3-vl-8b-instruct","qwen2.5-72b-instruct"];
-                              return base.map(m => (
-                                <button key={m} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setOpenaiModel(m); setOpenaiModelDropdownOpen(false); }}
-                                  className={`w-full text-left px-3 py-2 text-sm font-mono hover:bg-paper3 transition-colors ${openaiModel===m ? "bg-paper3 text-brass" : "text-ink"}`}>{m}</button>
-                              ));
-                            })()}
-                          </div>
-                        )}
-                        {openaiModelsError && <p className="text-micro text-warn mt-1">{openaiModelsError}</p>}
-                      {openaiModels.length > 0 && <p className="text-micro text-muted mt-1">{openaiModels.length} models from server — pick or type custom.</p>}
-                      {!openaiModels.length && !openaiModelsError && <p className="text-micro text-muted mt-1">Click Refresh to detect local models, or type custom.</p>}
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-ink mb-1">Base URL</label>
-                      <input
-                        type="text"
-                        value={openaiBaseUrl}
-                        onChange={(e) => setOpenaiBaseUrl(e.target.value)}
-                        placeholder="https://api.openai.com/v1"
-                        className="input-field font-mono"
-                      />
-                      <p className="text-micro text-muted mt-1">e.g. <code className="readout">http://host.docker.internal:1234/v1</code> for LM Studio</p>
-                    </div>
-                  </div>
-                  <p className="text-micro text-muted">Saves automatically — use Test next to API Key to verify.</p>
-                </div>
-              </div>
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -2090,9 +1987,7 @@ function App() {
                   aiProvider={aiProvider}
                   geminiApiKey={apiKey}
                   geminiModel={geminiModel}
-                  openaiApiKey={openaiKey}
-                  openaiModel={openaiModel}
-                  openaiBaseUrl={openaiBaseUrl}
+                  aiProviderConfig={providerCfg}
                   elevenLabsKey={elevenLabsKey}
                   results={results}
                   jobId={jobId}
@@ -2169,20 +2064,22 @@ function App() {
                   <div className="flex items-center gap-2">
                     <Bot size={14} className="text-brass" />
                     <span className="text-sm font-medium text-ink lowercase">AI provider for this job</span>
-                    <span className="readout">{aiProvider}</span>
+                    <span className="readout">{effectiveProvider}</span>
                   </div>
                   <div className="flex gap-1.5">
                     <button
                       type="button"
                       onClick={() => setAiProvider('gemini')}
-                      className={aiProvider === 'gemini' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
+                      disabled={!apiKey && aiProviderActive}
+                      title={!apiKey && aiProviderActive ? 'No Gemini key set — using your AI provider' : undefined}
+                      className={effectiveProvider === 'gemini' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
                     >
                       Gemini
                     </button>
                     <button
                       type="button"
                       onClick={() => setAiProvider('openai')}
-                      className={aiProvider === 'openai' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
+                      className={effectiveProvider === 'openai' ? 'btn-primary px-3 py-1 text-xs' : 'btn-quiet px-3 py-1 text-xs'}
                     >
                       OpenAI
                     </button>
@@ -2246,7 +2143,7 @@ function App() {
                           <button type="button" onClick={() => setDeepProvider('openai')} className={deepProvider === 'openai' ? 'btn-primary px-2 py-1 text-xs' : 'btn-quiet px-2 py-1 text-xs'}>OpenAI</button>
                         </div>
                       </div>
-                      <div className="text-micro text-muted">{deepProvider ? `Deep will use ${deepProvider} separate from main ${aiProvider} — ${deepProvider === 'gemini' ? geminiModel : openaiModel}` : `Deep uses same provider as job (${aiProvider})`}</div>
+                      <div className="text-micro text-muted">{deepProvider ? `Deep will use ${deepProvider} separate from main ${aiProvider} — ${deepProvider === 'gemini' ? geminiModel : (providerCfg.model || 'server default')}` : `Deep uses same provider as job (${aiProvider})`}</div>
                     </div>
                   )}
                 </div>
@@ -2350,7 +2247,7 @@ function App() {
                 </div>
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
                 {editingSelectedProfile && (
-                  <CreateEditProfileModal isOpen={!!editingSelectedProfile} profile={editingSelectedProfile} onClose={() => setEditingSelectedProfile(null)} onSave={async () => { setEditingSelectedProfile(null); try { const d = await apiJson('/api/game-profiles'); setGameProfiles(Array.isArray(d)?d:[]);} catch { /* ignore */ } }} aiProvider={aiProvider} geminiApiKey={apiKey} openaiApiKey={openaiKey} openaiModel={openaiModel} openaiBaseUrl={openaiBaseUrl} />
+                  <CreateEditProfileModal isOpen={!!editingSelectedProfile} profile={editingSelectedProfile} onClose={() => setEditingSelectedProfile(null)} onSave={async () => { setEditingSelectedProfile(null); try { const d = await apiJson('/api/game-profiles'); setGameProfiles(Array.isArray(d)?d:[]);} catch { /* ignore */ } }} aiProvider={aiProvider} geminiApiKey={apiKey} aiProviderConfig={providerCfg} />
                 )}
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
@@ -2608,6 +2505,7 @@ function App() {
                           uploadUserId={uploadUserId}
                           geminiApiKey={apiKey}
                           elevenLabsKey={elevenLabsKey}
+                          aiProviderConfig={providerCfg}
                           isManaged={isManaged}
                           connectedPlatforms={(userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected ?? null}
                           onConnectSocials={isManaged ? handleConnectSocials : null}

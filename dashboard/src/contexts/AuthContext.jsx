@@ -154,6 +154,12 @@ export function AuthProvider({ children }) {
   const llmModel = config.llmModel || null;
   const llmBaseUrl = config.llmBaseUrl || null;
 
+  // FR9: the server's pipeline-family env (OPENAI_*), read-only — the other
+  // half of the unified card's server badge.
+  const openaiConfigured = !!config.openaiConfigured;
+  const openaiModel = config.openaiModel || null;
+  const openaiBaseUrl = config.openaiBaseUrl || null;
+
   const value = {
     billingEnabled: config.billingEnabled,
     localLlm: config.localLlm || null,
@@ -162,6 +168,9 @@ export function AuthProvider({ children }) {
     llmConfigured,
     llmModel,
     llmBaseUrl,
+    openaiConfigured,
+    openaiModel,
+    openaiBaseUrl,
     loading,
     signingIn,
     user: me?.user || null,
