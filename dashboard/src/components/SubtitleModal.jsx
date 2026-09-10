@@ -138,7 +138,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             }
             const presetsRaw = localStorage.getItem('openshorts_subtitle_presets');
             if (presetsRaw) setUserPresets(JSON.parse(presetsRaw));
-        } catch {}
+        } catch { /* ignored */ }
     }, [isOpen]);
 
     const handleSaveDefault = useCallback(() => {
@@ -156,14 +156,14 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         const preset = { id: `user-${slug}-${Date.now()}`, label: name.trim(), name: name.trim(), style, effect, highlightColor, baseOpacity, uppercase, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, animation, fontSize, marginV, maxChars, maxDuration, wordGap, lineHeight, letterSpacing, position };
         const next = [...userPresets, preset];
         setUserPresets(next);
-        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch {}
+        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch { /* ignored */ }
         showToast(`Preset "${name.trim()}" saved`);
     }, [style, effect, highlightColor, baseOpacity, uppercase, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, animation, fontSize, marginV, maxChars, maxDuration, wordGap, lineHeight, letterSpacing, position, userPresets, showToast]);
 
     const removePreset = useCallback((id) => {
         const next = userPresets.filter(p => p.id !== id);
         setUserPresets(next);
-        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch {}
+        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch { /* ignored */ }
         if (activePreset === id) setActivePreset(null);
         showToast('Preset removed');
     }, [userPresets, activePreset, showToast]);
@@ -219,7 +219,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         const next = [...userPresets];
         next[idx] = updated;
         setUserPresets(next);
-        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch {}
+        try { localStorage.setItem('openshorts_subtitle_presets', JSON.stringify(next)); } catch { /* ignored */ }
         showToast(`Preset "${prev.label}" updated ✓`);
     }, [activePreset, userPresets, style, effect, highlightColor, baseOpacity, uppercase, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, animation, fontSize, marginV, maxChars, maxDuration, wordGap, lineHeight, letterSpacing, position, showToast]);
 
@@ -251,7 +251,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                 showToast('Reset to default ✓');
                 return;
             }
-        } catch {}
+        } catch { /* ignored */ }
         // fallback: hard defaults
         setMarginV(43); setWordGap(8); setLineHeight(1.0); setLetterSpacing(0);
         setFontSize(32); setFontName('Verdana'); setFontColor('#FFFFFF'); setHighlightColor('#FFDD00');
@@ -302,7 +302,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const seekToMs = useCallback((ms) => {
         const clamped = Math.max(0, Math.min(durationSec * 1000, ms));
         const frame = Math.round((clamped / 1000) * 30);
-        try { playerRef.current?.seekTo?.(frame); } catch {}
+        try { playerRef.current?.seekTo?.(frame); } catch { /* ignored */ }
         playerTimeRef.current = clamped;
         setPlaybackMs(clamped);
     }, [durationSec]);
@@ -353,7 +353,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                 playerTimeRef.current = d.playbackMs;
                 // seek player after mount
                 setTimeout(() => {
-                    try { playerRef.current?.seekTo?.(Math.round((d.playbackMs / 1000) * 30)); } catch {}
+                    try { playerRef.current?.seekTo?.(Math.round((d.playbackMs / 1000) * 30)); } catch { /* ignored */ }
                 }, 100);
             }
             return;
@@ -397,7 +397,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     // do NOT stretch across gaps. Inserted words get 100ms and attach to
     // nearest neighbor (prefer playback position). Replacements inherit
     // the old word's timing at same index in the gap.
-    const handleTextEdit = (newText, cursorPos = null) => {
+    const handleTextEdit = useCallback((newText, cursorPos = null) => {
         setEditableText(newText);
         lastEditRef.current = Date.now();
         // Use current captions as base for incremental edits so a selected placeholder keeps its 100ms timing
@@ -440,9 +440,8 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         for (const w of rawWords) {
             // if word contains emoji mixed with text, split on emoji boundaries
             if (/[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764]/u.test(w) && /[a-zA-Z0-9]/.test(w)) {
-                let last = 0;
                 // use matchAll to split keep emoji
-                const re = /[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764\uFE0F\u200D]+/gu;
+                const re = /(?:\uFE0F|[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764\u200D])+/gu;
                 let m;
                 let idx = 0;
                 while ((m = re.exec(w)) !== null) {
@@ -484,51 +483,8 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         for (let nj = 0; nj < n; nj++) if (newToOld[nj] !== -1) anchors.push({ nj, oi: newToOld[nj] });
         // sentinel boundaries
         const FIXED_MS = 100;
-        const EMOJI_MS = 1000;
-        const emojiRe = /[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2300-\u23FF\u2B50\u2764]/u;
-        const durFor = (txt) => emojiRe.test(txt) ? EMOJI_MS : FIXED_MS;
-        const buildForGap = (gapNewStart, gapNewEnd, gapOldStartIdx, gapOldEndIdx, prevEndMs, nextStartMs) => {
-            const gapNew = newWords.slice(gapNewStart, gapNewEnd + 1);
-            const gapOld = gapOldStartIdx <= gapOldEndIdx ? baseCaptions.slice(gapOldStartIdx, gapOldEndIdx + 1) : [];
-            const out = [];
-            for (let k = 0; k < gapNew.length; k++) {
-                if (k < gapOld.length) {
-                    // Replacement — keep same place/length as the old word at this position in gap
-                    const oc = gapOld[k];
-                    out.push({ text: gapNew[k], startMs: oc.startMs, endMs: oc.endMs });
-                } else {
-                    // Truly new word — attach to closest neighbor near playback point
-                    const dur = durFor(gapNew[k]);
-                    // Prefer sequencing after previous word in this gap (or anchor), with dur
-                    const anchorPrev = out.length > 0 ? out[out.length - 1].endMs : prevEndMs;
-                    // If gap is huge, don't stretch: just place dur after previous, or 1s for emoji if space allows
-                    let s = anchorPrev + 6;
-                    // If playback point inside this gap, bias toward it (so new word appears near playhead)
-                    const pb = playerTimeRef.current || prevEndMs;
-                    if (pb > prevEndMs && pb < nextStartMs) {
-                        // place near playhead, but still sequential
-                        s = Math.max(s, pb - Math.round((gapNew.length - k) * dur / 2));
-                    }
-                    let e = s + dur;
-                    // Clamp inside gap — for emoji try to keep 1s if space allows, else shrink
-                    const gapLen = nextStartMs - (out.length > 0 ? out[out.length-1].endMs : prevEndMs) - 6;
-                    if (e > nextStartMs - 6) {
-                        // Not enough space for full dur — use what fits (at least 80ms)
-                        const avail = Math.max(80, nextStartMs - s - 6);
-                        e = s + Math.min(dur, avail);
-                        if (e > nextStartMs - 6) { e = nextStartMs - 6; s = Math.max(prevEndMs + 6, e - dur); }
-                    }
-                    out.push({ text: gapNew[k], startMs: Math.round(s), endMs: Math.round(e) });
-                    // update prev for next extra word
-                    prevEndMs = e;
-                }
-            }
-            return out;
-        };
 
         const newCaptions = [];
-        let prevOiEnd = -1; // index in old
-        let prevNjEnd = -1;
         // iterate gaps: before first anchor, between anchors, after last anchor
         const gaps = [];
         if (anchors.length === 0) {
@@ -551,8 +507,6 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         }
 
         // Build in order, interleaving anchors
-        let gapIdx = 0;
-        let anchorIdx = 0;
         // We walk new index 0..n-1 merging gaps+anchors
         // Simpler: build by scanning new positions, picking from gaps or anchors
         const gapMap = new Map(); // nj -> gap that owns it
@@ -593,11 +547,6 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                     let s = prevEnd + 6;
                     if (caretWordIdx != null && caretWordIdx >= g.newStart && caretWordIdx <= g.newEnd) {
                         const caretNj = caretWordIdx;
-                        let anchorMs = prevEnd;
-                        for (let k = newCaptions.length - 1; k >= 0; k--) {
-                            const c = newCaptions[k];
-                            if (c.startMs >= g.prevEnd && c.endMs <= g.nextStart) { anchorMs = c.endMs; break; }
-                        }
                         const gapSpan = Math.max(120, g.nextStart - g.prevEnd);
                         const posInGap = (caretNj - g.newStart) / Math.max(1, g.newEnd - g.newStart + 1);
                         const cursorMsInGap = g.prevEnd + Math.round(gapSpan * posInGap);
@@ -622,7 +571,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             }
         }
         setCaptions(newCaptions);
-    };
+    }, [captions, originalCaptions]);
 
     // When user selects a word in the textbox, jump timeline/playhead to that word (like Edit Clip)
     const handleTextAreaSelect = useCallback(() => {
@@ -634,7 +583,6 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         // Map character position to word index by scanning whitespace
         const text = editableText;
         let wordIdx = -1;
-        let charIdx = 0;
         let curWord = 0;
         let inWord = false;
         let wordStart = 0;
@@ -697,7 +645,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                     const wordLen = text.slice(ws, we).length;
                     el.focus({ preventScroll: true });
                     requestAnimationFrame(() => {
-                        try { el.setSelectionRange(ws, ws + wordLen); } catch {}
+                        try { el.setSelectionRange(ws, ws + wordLen); } catch { /* ignored */ }
                         el.scrollTop = el.scrollHeight;
                     });
                     lastEditRef.current = Date.now() + 800;
@@ -721,7 +669,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             const newPos = before.length + emoji.length;
             handleTextEdit(newText, newPos);
             requestAnimationFrame(() => {
-                if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(newPos, newPos); } catch {} }
+                if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(newPos, newPos); } catch { /* ignored */ } }
             });
         } else {
             // No selection -> insert at playhead point (timeline position), not textbox caret
@@ -772,7 +720,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             setCaptions(newCaps);
             const newPos = newText.indexOf(emoji, 0) + emoji.length;
             requestAnimationFrame(() => {
-                if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(newPos, newPos); } catch {} }
+                if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(newPos, newPos); } catch { /* ignored */ } }
             });
             setFollowPlayhead(true);
             seekToMs(cs);
@@ -780,12 +728,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         // Update recent and auto-close picker
         setRecentEmojis(prev => {
             const next = [emoji, ...prev.filter(e => e !== emoji)].slice(0, 24);
-            try { localStorage.setItem('openshorts_recent_emojis', JSON.stringify(next)); } catch {}
+            try { localStorage.setItem('openshorts_recent_emojis', JSON.stringify(next)); } catch { /* ignored */ }
             return next;
         });
         setShowEmojiPicker(false);
         setEmojiSearch('');
-    }, [editableText, captions, playbackMs, durationSec, seekToMs]);
+    }, [editableText, captions, playbackMs, durationSec, seekToMs, handleTextEdit]);
 
     const insertWordAtPlayhead = useCallback(() => {
         if (!captions.length) return;
@@ -830,7 +778,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                 if (inWord && (isSpace || i === newText.length)) {
                     if (curWord === insertIdx) {
                         const we = i;
-                        try { el.setSelectionRange(ws, we); } catch {}
+                        try { el.setSelectionRange(ws, we); } catch { /* ignored */ }
                         break;
                     }
                     curWord++; inWord = false;
@@ -848,6 +796,20 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         if (!dragging || !timelineRef) return;
         const durMs = durationSec * 1000;
         const vpMs = zoomSec === 0 ? durMs : Math.min(durMs, zoomSec * 1000);
+        const updateWordTiming = (index, nextStart, nextEnd) => {
+            setCaptions(prev => {
+                const cap = prev[index];
+                if (!cap) return prev;
+                const prevEnd = index > 0 ? prev[index - 1].endMs + GAP_MS : 0;
+                const nextStartLimit = index < prev.length - 1 ? prev[index + 1].startMs - GAP_MS : durationSec * 1000;
+                let s = Math.max(prevEnd, Math.min(nextStart, nextEnd - MIN_WORD_MS));
+                let e = Math.min(nextStartLimit, Math.max(nextEnd, s + MIN_WORD_MS));
+                // Clamp to valid after s adjustment
+                s = Math.min(s, e - MIN_WORD_MS);
+                const copy = prev.map((c, i) => i === index ? { ...c, startMs: Math.round(s), endMs: Math.round(e) } : c);
+                return copy;
+            });
+        };
         const handleMove = (e) => {
             const rect = timelineRef.getBoundingClientRect();
             const pxToMs = vpMs / Math.max(1, rect.width);
@@ -873,21 +835,6 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         window.addEventListener('mouseup', handleUp);
         return () => { window.removeEventListener('mousemove', handleMove); window.removeEventListener('mouseup', handleUp); };
     }, [dragging, timelineRef, durationSec, captions, zoomSec]);
-
-    const updateWordTiming = (index, nextStart, nextEnd) => {
-        setCaptions(prev => {
-            const cap = prev[index];
-            if (!cap) return prev;
-            const prevEnd = index > 0 ? prev[index - 1].endMs + GAP_MS : 0;
-            const nextStartLimit = index < prev.length - 1 ? prev[index + 1].startMs - GAP_MS : durationSec * 1000;
-            let s = Math.max(prevEnd, Math.min(nextStart, nextEnd - MIN_WORD_MS));
-            let e = Math.min(nextStartLimit, Math.max(nextEnd, s + MIN_WORD_MS));
-            // Clamp to valid after s adjustment
-            s = Math.min(s, e - MIN_WORD_MS);
-            const copy = prev.map((c, i) => i === index ? { ...c, startMs: Math.round(s), endMs: Math.round(e) } : c);
-            return copy;
-        });
-    };
 
     const durMs = Math.max(1, durationSec * 1000);
     const viewportMs = zoomSec === 0 ? durMs : Math.min(durMs, zoomSec * 1000);

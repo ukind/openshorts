@@ -53,7 +53,7 @@ export default function RemotionPreview({
                 } else if (tries++ < 100) {
                     // Player not yet mounted — keep polling
                 }
-            } catch {}
+            } catch { /* preview frame polling is best-effort */ }
             raf = requestAnimationFrame(tick);
         };
         raf = requestAnimationFrame(tick);

@@ -31,17 +31,6 @@ function GroupDropdown({ value, options, onChange }) {
     return () => document.removeEventListener('mousedown', onDoc);
   }, [open]);
 
-  // Suggested groups: existing ones matching the typed query; the raw query
-  // shows as a "create new" row on top when it's not an exact match.
-  const suggestions = useMemo(() => {
-    const q = (query || '').toLowerCase().trim();
-    const matches = options.filter((o) => !q || o.toLowerCase().includes(q));
-    if (q && !matches.some((m) => m === q)) {
-      return [{ value: q, isNew: true }, ...matches.map((m) => ({ value: m, isNew: false }))];
-    }
-    return matches.map((m) => ({ value: m, isNew: false }));
-  }, [options, query]);
-
   return (
     <div className="relative" ref={boxRef}>
       <button
@@ -226,7 +215,7 @@ function PresetEditModal({ isOpen, onClose, kind, preset, stylePresets = [], onS
   );
 }
 
-function PresetList({ kind, icon: Icon, stylePresets = [] }) {
+function PresetList({ kind, icon: _Icon, stylePresets = [] }) {
   const [presets, setPresets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -238,7 +227,7 @@ function PresetList({ kind, icon: Icon, stylePresets = [] }) {
   const fileInputRef = useRef(null);
   const isVoice = kind === 'voice';
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -248,9 +237,9 @@ function PresetList({ kind, icon: Icon, stylePresets = [] }) {
     } finally {
       setLoading(false);
     }
-  };
+  }, [kind]);
 
-  useEffect(() => { load(); }, [kind]);
+  useEffect(() => { load(); }, [load]);
 
   const flash = (text) => { setMsg(text); setTimeout(() => setMsg(null), 3000); };
 
@@ -360,7 +349,7 @@ function PresetList({ kind, icon: Icon, stylePresets = [] }) {
     <div className="space-y-4">
       <div className="flex justify-between items-center gap-3 flex-wrap">
         <h2 className="text-lg font-semibold text-ink flex items-center gap-2">
-          <Icon size={18} className="text-brass" />
+          <_Icon size={18} className="text-brass" />
           {isVoice ? 'Voice Presets' : 'Style Presets'}
           <span className="readout">{presets.length}</span>
         </h2>
@@ -456,7 +445,7 @@ function PresetList({ kind, icon: Icon, stylePresets = [] }) {
                 ? (p.tags || []).map((t) => (
                     <span key={t} className="readout bg-brass/15 text-brass px-2 py-0.5 rounded-full">{styleTitle(t)}</span>
                   ))
-                : (p.kind || 'generic') && (
+                : (
                     <span className="readout bg-paper3 px-2 py-0.5 rounded-full">{p.kind}</span>
                   )}
             </div>
@@ -496,7 +485,7 @@ export default function VoiceStylePresetsPage() {
         {[
           { id: 'voice', label: 'Voice', icon: Mic },
           { id: 'style', label: 'Style', icon: Type },
-        ].map(({ id, label, icon: TabIcon }) => (
+        ].map(({ id, label, icon: _TabIcon }) => (
           <button
             key={id}
             onClick={() => setTab(id)}
@@ -504,7 +493,7 @@ export default function VoiceStylePresetsPage() {
               tab === id ? 'text-brass border-b-2 border-brass bg-paper3/50' : 'text-muted hover:text-ink2'
             }`}
           >
-            <TabIcon size={15} /> {label}
+            <_TabIcon size={15} /> {label}
           </button>
         ))}
       </div>
