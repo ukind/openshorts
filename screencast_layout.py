@@ -25,8 +25,9 @@ What is different here is the question asked and what the answer is used for.
     counter. Here the worst case is showing the content full width above the
     speaker, which is a reasonable frame even when the trigger was wrong.
 
-Off by default (``SCREENCAST_LAYOUT=1``). Needs GEMINI_API_KEY; without one it
-is a silent no-op, like every other optional Gemini path here.
+Off by default (``SCREENCAST_LAYOUT=1``). Needs a Gemini key, or this job's
+``OPENAI_*`` endpoint when its model passes the vision probe; with neither it
+is a silent no-op, like every other optional path here.
 """
 import json
 import os
@@ -164,6 +165,92 @@ def overlapping_width(scene_start, scene_end, ranges):
     return widest
 
 
+def _openai_provider():
+    """An OpenAI-compatible provider from the JOB's ``OPENAI_*`` env, or None.
+
+    Same gate as hook_grounding._openai_provider: app.py writes the
+    ``OPENAI_*`` defaults into EVERY job env, so a bare base-URL check would
+    see a "configured" endpoint in a job that never set one. A configuration
+    is: a key, or a base URL other than the injected default. A model alone
+    is never one. Namespace law: pipeline family only — the ``LLM_*``
+    satellite env never reaches this module (pinned by the canary in
+    tests/test_screencast_layout.py). Never raises: a missing OpenAI SDK
+    degrades to None with one log line (detect_content_ranges must never
+    raise out of its gate).
+    """
+    base = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not key and (not base or base.rstrip("/") == "https://api.openai.com/v1"):
+        return None
+    try:
+        import ai_provider
+        return ai_provider.create_ai_provider(
+            "openai",
+            (os.environ.get("OPENAI_MODEL") or "").strip() or None,
+            api_key=key or None,
+            base_url=base or None,
+            temperature=0.2, max_tokens=3000, timeout=90)
+    except ImportError as e:
+        print(f"   ⚠️ On-screen check: OpenAI SDK unavailable ({e}) — keeping "
+              "face-only routing.")
+        return None
+
+
+def _ask_openai_frames(frames, prompt, provider):
+    """The OpenAI-compatible arm of the Files upload: the same question, the
+    frames as ``image_url`` parts, the SAME ``WideContentResponse`` schema
+    (the provider sends strict json_schema and retries once without it on
+    local servers that lack it). Split out so tests can stub it, like
+    ``_ask_gemini`` in hook_grounding. The provider's model has already
+    passed the vision probe."""
+    import base64
+    import gemini_worker
+
+    content = [{"type": "text", "text": prompt}]
+    for b in frames:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(b).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+    result = provider.generate_content(
+        prompt, schema=gemini_worker.WideContentResponse,
+        messages=[{"role": "user", "content": content}])
+    return (result["response"] or {}).get("ranges") or []
+
+
+def _ask_gemini_files(api_key, model_name, video_path, prompt):
+    """The Gemini arm, split out UNCHANGED from detect_content_ranges so the
+    precedence test can stub it without network — the hook_grounding
+    ``_ask_gemini`` shape. Whole-video Files upload, then the
+    ``WideContentResponse`` call. Raises on failure; the caller's try turns
+    that into []. One accepted log delta on the rare unusable-upload path:
+    the ✅ summary line now follows the ⚠️ line (nothing parses these)."""
+    from google import genai
+    from google.genai import types as genai_types
+    import gemini_worker
+
+    client = genai.Client(api_key=api_key)
+    file_upload = client.files.upload(file=video_path)
+    deadline = time.time() + 180
+    while True:
+        info = client.files.get(name=file_upload.name)
+        state = str(getattr(getattr(info, "state", info), "name", "")).upper()
+        if state == "ACTIVE":
+            break
+        if state == "FAILED" or time.time() > deadline:
+            print("   ⚠️ Upload not usable — keeping face-only routing.")
+            return []
+        time.sleep(2)
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[file_upload, prompt],
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=gemini_worker.WideContentResponse,
+        ))
+    gemini_worker.raise_if_blocked(response)
+    return (json.loads(response.text) or {}).get("ranges") or []
+
+
 def detect_content_ranges(video_path, video_duration):
     """Time ranges where on-screen content spans most of the frame width.
 
@@ -173,40 +260,40 @@ def detect_content_ranges(video_path, video_duration):
     if not ENABLED:
         return []
     api_key = os.getenv("GEMINI_API_KEY")
+    provider = None
     if not api_key:
-        return []
+        # Gemini stays preferred; the frames arm is the no-key fallback (D2).
+        provider = _openai_provider()
+        if provider is None:
+            return []
+        import ai_provider
+        # One probe per provider identity (cached in ai_provider). "unknown"
+        # proceeds — only a confirmed text-only model skips, and the probe
+        # cost never enters the job total (OpenAICompatibleProvider).
+        if ai_provider.probe_vision_support(provider) == "no_vision":
+            print("   ⚠️ On-screen check skipped: the selected model cannot "
+                  "see images — keeping face-only routing.")
+            return []
 
-    from google import genai
-    from google.genai import types as genai_types
     import gemini_worker
 
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print("🔎 Checking for full-width on-screen content…")
     try:
-        client = genai.Client(api_key=api_key)
-        file_upload = client.files.upload(file=video_path)
-        deadline = time.time() + 180
-        while True:
-            info = client.files.get(name=file_upload.name)
-            state = str(getattr(getattr(info, "state", info), "name", "")).upper()
-            if state == "ACTIVE":
-                break
-            if state == "FAILED" or time.time() > deadline:
-                print("   ⚠️ Upload not usable — keeping face-only routing.")
+        prompt = gemini_worker.WIDE_CONTENT_PROMPT_TEMPLATE.format(
+            video_duration=video_duration)
+        if provider is not None:
+            # 12 frames at 1024px, not the video: the layout_picker economy
+            # (~3k tokens whatever the source length, vs a 1-2 GB Files
+            # upload billed at ~300 tokens/s of video).
+            import layout_picker
+            frames = layout_picker.sample_frames(video_path)
+            if not frames:
+                print("   ⚠️ No readable frames — keeping face-only routing.")
                 return []
-            time.sleep(2)
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[file_upload,
-                      gemini_worker.WIDE_CONTENT_PROMPT_TEMPLATE.format(
-                          video_duration=video_duration)],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=gemini_worker.WideContentResponse,
-            ))
-        gemini_worker.raise_if_blocked(response)
-        raw = (json.loads(response.text) or {}).get("ranges") or []
+            raw = _ask_openai_frames(frames, prompt, provider)
+        else:
+            model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+            raw = _ask_gemini_files(api_key, model_name, video_path, prompt)
     except Exception as e:
         print(f"   ⚠️ On-screen check failed ({e}) — keeping face-only routing.")
         return []

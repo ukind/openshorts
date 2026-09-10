@@ -129,11 +129,13 @@ shown. After the render, if the `<clip>.layout.json` sidecar says at least
 25% of the clip is `screencast` / `wide` / `inset` (plus `general` when the
 layout picker called the video a screencast: a face-less scene there is a
 slide or a dialog, not a group shot), three frames from those
-stretches at 1024px plus the clip's own words go to Gemini
-(`GroundedHook`) and `viral_hook_text` / `video_title_for_youtube_short`
-are rewritten in place before `auto_hook_clip` burns them; the originals
-stay under `hook_grounding.before`. Gemini-only (frames): with just a local
-LLM it logs one line and keeps the transcript hook. `HOOK_GROUNDING=0`
+stretches at 1024px plus the clip's own words go to Gemini or the job's
+`OPENAI_*` endpoint (`GroundedHook`; the OpenAI arm is gated by the vision
+probe) and `viral_hook_text` / `video_title_for_youtube_short` are
+rewritten in place before `auto_hook_clip` burns them; the originals stay
+under `hook_grounding.before`. Gemini stays preferred; with no Gemini key
+the OpenAI-compatible arm runs, and with neither configured it logs one
+line and keeps the transcript hook. `HOOK_GROUNDING=0`
 disables it. The detail prompt itself now carries the rule "about this
 moment, not the video", which is the cheap half of the same fix.
 
@@ -242,7 +244,9 @@ portrait clip cannot reproduce the shrink either.
   the new cut (`layout_ranges.remap`, in `recut.perform_recut`). Only the
   ASS path can do this; SRT burns keep one alignment for the whole file.
 - **SCREENCAST / WIDE Modes** (`screencast_layout.py`, `SCREENCAST_LAYOUT=1`):
-  for scenes whose meaning lives outside the centre. Gemini reports each range's
+  for scenes whose meaning lives outside the centre. Gemini — or, with no
+  Gemini key, the job's OpenAI-compatible endpoint over 12 sampled frames —
+  reports each range's
   **width_fraction**, and that is the gate — coverage was tried before and did
   not separate a spreadsheet from a corner ticker, while width does (a bug spans
   ~15% and survives any crop, a spreadsheet spans ~100% and cannot). Content

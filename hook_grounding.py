@@ -14,9 +14,10 @@ and title are rewritten to name what is shown. Same principle as the layout
 picker: a few frames at a legible resolution answering one concrete
 question. About 3k tokens per clip.
 
-Frames need a model that can see, so this is Gemini-only: with just a local
-LLM (``LLM_BASE_URL``) the function returns None and the transcript-based
-hook stands. Never raises: a hook problem must never cost the clip.
+Frames need a model that can see: a Gemini key, or this job's
+``OPENAI_*`` endpoint when its model passes the vision probe. With neither
+the function returns None and the transcript-based hook stands. Never
+raises: a hook problem must never cost the clip.
 """
 from __future__ import annotations
 
@@ -141,15 +142,79 @@ def _ask_gemini(frames, prompt, api_key):
     return json.loads(response.text) or {}
 
 
+def _openai_provider():
+    """An OpenAI-compatible provider from the JOB's ``OPENAI_*`` env, or None.
+
+    app.py injects this env into EVERY job — missing values arrive as the
+    codebase defaults (``OPENAI_BASE_URL`` falls back to api.openai.com, the
+    key to ``""``), so a bare base-URL check would see a "configured"
+    endpoint in a job that never set one. A configuration is therefore: a
+    key, or a base URL other than the injected default. A model alone is
+    never one. Namespace law: pipeline family only — the ``LLM_*`` satellite
+    env never reaches this module (pinned by the canary in
+    tests/test_hook_grounding.py). Never raises: a missing OpenAI SDK
+    degrades to None with one log line (reground's caller is unguarded).
+    """
+    base = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not key and (not base or base.rstrip("/") == "https://api.openai.com/v1"):
+        return None
+    try:
+        import ai_provider
+        return ai_provider.create_ai_provider(
+            "openai",
+            (os.environ.get("OPENAI_MODEL") or "").strip() or None,
+            api_key=key or None,
+            base_url=base or None,
+            temperature=0.2, max_tokens=800, timeout=60)
+    except ImportError as e:
+        print(f"   ⚠️ Hook grounding: OpenAI SDK unavailable ({e}) — keeping "
+              "the transcript hook.")
+        return None
+
+
+def _ask_openai(frames, prompt, provider):
+    """The OpenAI-compatible arm of ``_ask_gemini``: the same question, the
+    frames as ``image_url`` parts, the SAME ``GroundedHook`` schema (the
+    provider sends strict json_schema and retries once without it on local
+    servers that lack it). Split out so tests can stub it, like
+    ``_ask_gemini``. The provider's model has already passed the vision
+    probe."""
+    import base64
+    import gemini_worker
+
+    content = [{"type": "text", "text": prompt}]
+    for b in frames:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(b).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+    result = provider.generate_content(
+        prompt, schema=gemini_worker.GroundedHook,
+        messages=[{"role": "user", "content": content}])
+    return result["response"] or {}
+
+
 def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
     """Rewrite ``clip['viral_hook_text']`` / ``video_title_for_youtube_short``
     in place from the clip's frames. Returns what changed (also stored under
     ``clip['hook_grounding']``), or None when skipped or failed."""
     api_key = os.getenv("GEMINI_API_KEY")
+    provider = None
     if not api_key:
-        print("   🪝 Hook grounding skipped: needs a Gemini key (frames), "
-              "keeping the transcript hook.")
-        return None
+        # Gemini stays preferred; the OpenAI arm is the no-key fallback (D2).
+        provider = _openai_provider()
+        if provider is None:
+            print("   🪝 Hook grounding skipped: needs a Gemini key or an "
+                  "OpenAI-compatible endpoint (frames), keeping the "
+                  "transcript hook.")
+            return None
+        import ai_provider
+        # One probe per provider identity (cached in ai_provider). "unknown"
+        # proceeds — only a confirmed text-only model skips, and the probe
+        # cost never enters the job total (OpenAICompatibleProvider).
+        if ai_provider.probe_vision_support(provider) == "no_vision":
+            print("   🪝 Hook grounding skipped: the selected model cannot "
+                  "see images (frames), keeping the transcript hook.")
+            return None
     try:
         import gemini_worker
 
@@ -163,7 +228,8 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
             current_hook=clip.get("viral_hook_text") or "",
             current_title=clip.get("video_title_for_youtube_short") or "",
             transcript=clip_words(transcript, start, end)[:4000] or "(no speech)")
-        answer = _ask_gemini(frames, prompt, api_key)
+        answer = (_ask_openai(frames, prompt, provider) if provider is not None
+                  else _ask_gemini(frames, prompt, api_key))
         hook = str(answer.get("viral_hook_text") or "").strip()
         title = str(answer.get("video_title_for_youtube_short") or "").strip()
         if not hook:
