@@ -7,7 +7,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
                             lookup_model_prices)
@@ -80,6 +80,21 @@ class VisualClipModel(BaseModel):
     video_title_for_youtube_short: str
     viral_hook_text: str
 
+    @field_validator("predicted_score", mode="before")
+    @classmethod
+    def _score_accepts_float(cls, v):
+        # Gemini's native schema enforcement always sends ints. OpenAI-
+        # compatible models without response_format support answer 8.5 for
+        # an int field — round instead of failing the whole clip list.
+        if isinstance(v, str):
+            try:
+                v = float(v)
+            except ValueError:
+                return v
+        if isinstance(v, float):
+            return int(round(v))
+        return v
+
 
 class VisualResponse(BaseModel):
     shorts: List[VisualClipModel]
@@ -102,6 +117,14 @@ TIME CONTRACT — STRICT:
 For each clip write catchy copy in {language} (a scroll-stopping hook, a TikTok
 and an Instagram description, and a YouTube title ≤100 chars). Order clips best
 to worst by how likely they are to stop a viewer scrolling.
+
+Return ONLY a JSON object — no markdown, no prose, no code fences:
+{{"shorts": [{{"start": 12.5, "end": 42.0, "predicted_score": 8,
+  "viral_hook_text": "max 10 words",
+  "video_description_for_tiktok": "1-2 sentences",
+  "video_description_for_instagram": "1-2 sentences",
+  "video_title_for_youtube_short": "max 100 chars"}}]}}
+Keys and JSON shape are exactly as shown; {min_clips}-{max_clips} entries in "shorts".
 """
 
 

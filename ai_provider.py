@@ -317,6 +317,66 @@ class GeminiProvider(AIProvider):
         return "gemini"
 
 
+def _schema_required_array(schema):
+    """The schema's single required array field name (e.g. "shorts"), or None."""
+    import json as _json
+    try:
+        js = schema.model_json_schema()
+        req = js.get("required") or []
+        props = js.get("properties") or {}
+        arrays = [k for k in req
+                  if isinstance(props.get(k), dict) and props[k].get("type") == "array"]
+        return arrays[0] if len(arrays) == 1 else None
+    except Exception:
+        return None
+
+
+def _json_candidates(content):
+    """Loose-JSON candidates: every fenced block first, then the outermost
+    {...} and [...]. Models that ignore response_format answer in prose with
+    embedded fragments — these are the places a payload can hide."""
+    cands = []
+    pos = 0
+    while True:
+        i = content.find("```", pos)
+        if i == -1:
+            break
+        j = content.find("```", i + 3)
+        if j == -1:
+            break
+        block = content[i + 3:j]
+        block = block.split("\n", 1)[-1] if block.lstrip().lower().startswith("json") else block
+        cands.append(block.strip())
+        pos = j + 3
+    for opener, closer in (("{", "}"), ("[", "]")):
+        s, e2 = content.find(opener), content.rfind(closer)
+        if s != -1 and e2 > s:
+            cands.append(content[s:e2 + 1])
+    return cands
+
+
+def _salvage_schema_json(content, schema):
+    """Best-effort schema validation over loose JSON. A bare list of items is
+    wrapped under the schema's single required array field. Returns the
+    model_dump()ed payload, or None when nothing in the content fits."""
+    field = _schema_required_array(schema)
+    for cand in _json_candidates(content):
+        try:
+            data = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(data, list) and field:
+            data = {field: data}
+        if not isinstance(data, dict):
+            continue
+        try:
+            validated = schema(**data)
+            return validated.model_dump() if hasattr(validated, "model_dump") else validated
+        except Exception:
+            continue
+    return None
+
+
 class OpenAICompatibleProvider(AIProvider):
     """OpenAI-compatible AI provider implementation."""
 
@@ -417,9 +477,11 @@ class OpenAICompatibleProvider(AIProvider):
             params["timeout"] = timeout
 
         max_attempts = 3
+        last_finish = None
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self.client.chat.completions.create(**params)
+                last_finish = getattr(response.choices[0], "finish_reason", None)
 
                 # Extract the content from the response
                 content = response.choices[0].message.content
@@ -431,11 +493,20 @@ class OpenAICompatibleProvider(AIProvider):
                         model=self.model_name
                     )
 
-                # Try to parse as JSON
+                # Try to parse as JSON, tolerating prose-wrapped payloads
+                # (fenced blocks, outermost object/array) from servers that
+                # skip response_format enforcement.
+                parsed = None
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
-                    # If we can't parse it, return the raw content but warn
+                    for cand in _json_candidates(content):
+                        try:
+                            parsed = json.loads(cand)
+                            break
+                        except Exception:
+                            continue
+                if parsed is None:
                     raise AIProviderError(
                         f"Failed to parse JSON response from OpenAI: {content[:200]}...",
                         provider="openai",
@@ -448,11 +519,14 @@ class OpenAICompatibleProvider(AIProvider):
                         validated = schema(**parsed)
                         parsed = validated.model_dump() if hasattr(validated, "model_dump") else validated
                     except Exception as e:
-                        raise AIProviderError(
-                            f"Failed to validate JSON response against schema: {str(e)}",
-                            provider="openai",
-                            model=self.model_name
-                        )
+                        salvaged = _salvage_schema_json(content, schema)
+                        if salvaged is None:
+                            raise AIProviderError(
+                                f"Failed to validate JSON response against schema: {str(e)}",
+                                provider="openai",
+                                model=self.model_name
+                            )
+                        parsed = salvaged
 
                 # For now, we don't have cost analysis in this implementation
                 # but we can return empty dict for compatibility
@@ -462,6 +536,19 @@ class OpenAICompatibleProvider(AIProvider):
                 }
             except Exception as e:
                 msg = str(e)
+                # Reasoning models can burn the whole completion budget on
+                # thinking and answer with an empty or truncated content
+                # (finish_reason="length"). Escalate the budget instead of
+                # retrying into the same wall.
+                if last_finish == "length":
+                    # 8192 ceiling: some servers answer 200-with-empty-content
+                    # when max_tokens exceeds the model's output cap, and an
+                    # over-limit request must not win the retry.
+                    _bumped = min(int(params.get("max_tokens") or 4096) * 4, 8192)
+                    if _bumped > int(params.get("max_tokens") or 0):
+                        print(f"[ai_provider] max_tokens={params.get('max_tokens')} exhausted "
+                              f"(finish_reason=length) — retrying with {_bumped}")
+                        params["max_tokens"] = _bumped
                 # LM Studio local compat: json_schema/json_object not supported → retry once without response_format
                 if use_schema and 'response_format' in msg.lower() and ('400' in msg or 'unsupported' in msg.lower() or 'json_schema' in msg.lower() or 'json_object' in msg.lower()):
                     print(f"[ai_provider] response_format not supported ({msg[:120]}), retrying without it")
