@@ -27,8 +27,8 @@ from gemini_worker import (
 # --- Sampling-parameter sanitization ----------------------------------------
 # Garbage, set-but-empty, and None values sanitize to None (= unset). At
 # request time an unset value falls through to the stored constructor value,
-# then to the frozen default. Bounds: temperature 0-2, max_tokens 1-8192,
-# timeout 5-600 seconds.
+# then to the frozen default. Bounds: temperature 0-2, max_tokens 1-65536
+# (reasoning models need head-room for thinking), timeout 5-600 seconds.
 
 def _sanitize_temperature(value) -> Optional[float]:
     """Coerce a temperature setting to a bounded float, or None if unset."""
@@ -53,7 +53,7 @@ def _sanitize_max_tokens(value) -> Optional[int]:
         return None
     if num < 1:
         return None
-    return min(8192, num)
+    return min(65536, num)
 
 
 def _sanitize_timeout(value) -> Optional[float]:
@@ -405,10 +405,27 @@ class OpenAICompatibleProvider(AIProvider):
             # but never expose this as user credential
             api_key_to_use = "lm-studio-placeholder-key-please-ignore"
 
-        self.client = self.openai.OpenAI(
-            api_key=api_key_to_use,
-            base_url=self.base_url
+        # No keep-alive across requests: ollama.com-class servers can poison
+        # a reused connection after a long completion — every later request on
+        # that socket answers 200 with an empty body. A fresh connection per
+        # call costs a handshake; an empty response kills a pipeline stage.
+        import httpx as _httpx
+        _http = _httpx.Client(
+            headers={"Connection": "close"},
+            limits=_httpx.Limits(max_keepalive_connections=0),
         )
+        try:
+            self.client = self.openai.OpenAI(
+                api_key=api_key_to_use,
+                base_url=self.base_url,
+                http_client=_http,
+            )
+        except TypeError:
+            # Test stubs and minimal SDK shims don't take http_client.
+            self.client = self.openai.OpenAI(
+                api_key=api_key_to_use,
+                base_url=self.base_url,
+            )
 
     def generate_content(
         self,
@@ -476,15 +493,62 @@ class OpenAICompatibleProvider(AIProvider):
         if timeout is not None:
             params["timeout"] = timeout
 
-        max_attempts = 3
+        # ollama.com-class servers intermittently answer 200 with an empty
+        # body (measured on every budget size). Empty attempts return
+        # instantly, so the ladder can afford more rolls.
+        # Reasoning models (minimax-m3 on ollama.com) burn the whole
+        # completion budget on hidden thinking for structured prompts and
+        # answer empty at finish_reason=length; effort=low measured finish=stop
+        # with valid JSON where default reasoning never finished. Servers that
+        # reject the knob 400 with its name — popped in the retry ladder.
+        params.setdefault("reasoning_effort", "low")
+
+        # Offline diagnosis hook: dump the exact outgoing payload when
+        # AI_DUMP_PROMPTS is set (bytes + shape are what servers judge).
+        if os.environ.get("AI_DUMP_PROMPTS"):
+            try:
+                os.makedirs("output/_prompts", exist_ok=True)
+                _blob = json.dumps({"model": self.model_name,
+                                    "params": {k: (v if isinstance(v, (str, int, float, bool, type(None))) else repr(v)) for k, v in params.items() if k != "messages"},
+                                    "messages": final_messages}, ensure_ascii=False, default=str)
+                with open(f"output/_prompts/{int(time.time()*1000)}.json", "w", encoding="utf-8") as _df:
+                    _df.write(_blob)
+                print(f"[ai_provider] dumped prompt ({len(_blob)} bytes)")
+            except Exception as _de:
+                print(f"[ai_provider] prompt dump failed: {_de}")
+
+        max_attempts = 5
         last_finish = None
+        _last_good_budget = None
+        _orig_budget = int(params.get("max_tokens") or 0)
+        _last_raw = None
+        repair_note = None
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                # Exponential courtesy backoff: a congested endpoint needs
+                # room to drain between rolls (1.5s, 3s, 6s, 12s).
+                time.sleep(1.5 * (2 ** (attempt - 2)))
+            _t0 = time.time()
+            if repair_note and _last_raw:
+                # FilterRepair pattern (from editor.py): show the model its own
+                # output plus the exact validation errors and let it correct
+                # itself instead of rolling fresh dice.
+                params["messages"] = final_messages + [
+                    {"role": "assistant", "content": _last_raw},
+                    {"role": "user", "content":
+                        "Your JSON failed schema validation:\n" + repair_note +
+                        "\nReturn ONLY the corrected JSON object — no markdown, no prose."},
+                ]
             try:
                 response = self.client.chat.completions.create(**params)
                 last_finish = getattr(response.choices[0], "finish_reason", None)
 
                 # Extract the content from the response
                 content = response.choices[0].message.content
+
+                if content:
+                    _last_good_budget = int(params.get("max_tokens") or 0)
+                    _last_raw = content
 
                 if not content:
                     raise AIProviderError(
@@ -521,11 +585,10 @@ class OpenAICompatibleProvider(AIProvider):
                     except Exception as e:
                         salvaged = _salvage_schema_json(content, schema)
                         if salvaged is None:
-                            raise AIProviderError(
-                                f"Failed to validate JSON response against schema: {str(e)}",
-                                provider="openai",
-                                model=self.model_name
-                            )
+                            repair_note = str(e)[:800]
+                            print(f"[ai_provider] schema validation failed "
+                                  f"({str(e)[:110]}) — retrying with the errors shown to the model")
+                            continue
                         parsed = salvaged
 
                 # For now, we don't have cost analysis in this implementation
@@ -541,14 +604,45 @@ class OpenAICompatibleProvider(AIProvider):
                 # (finish_reason="length"). Escalate the budget instead of
                 # retrying into the same wall.
                 if last_finish == "length":
-                    # 8192 ceiling: some servers answer 200-with-empty-content
-                    # when max_tokens exceeds the model's output cap, and an
-                    # over-limit request must not win the retry.
-                    _bumped = min(int(params.get("max_tokens") or 4096) * 4, 8192)
-                    if _bumped > int(params.get("max_tokens") or 0):
-                        print(f"[ai_provider] max_tokens={params.get('max_tokens')} exhausted "
+                    # Reasoning models spend completion tokens on thinking
+                    # before answering; keep escalating to a generous 64k
+                    # ceiling instead of retrying into the same wall.
+                    _cur = int(params.get("max_tokens") or 4096)
+                    _bumped = min(_cur * 2, 65536)
+                    if _bumped > _cur:
+                        print(f"[ai_provider] max_tokens={_cur} exhausted "
                               f"(finish_reason=length) — retrying with {_bumped}")
                         params["max_tokens"] = _bumped
+                    # Cut the reasoning depth too: the answer must fit the
+                    # budget, and these stages need JSON compliance, not deep
+                    # deliberation.
+                    params["reasoning_effort"] = "low"
+                elif "timed out" in msg.lower() and params.get("timeout") is not None:
+                    # Reasoning endpoints routinely exceed a 30s call budget.
+                    # Stretch the per-attempt timeout up to the 600s bound —
+                    # a timeout is not evidence the endpoint is broken.
+                    _cur_t = int(params.get("timeout") or 0)
+                    _bumped_t = min(_cur_t * 3, 600)
+                    if _bumped_t > _cur_t:
+                        print(f"[ai_provider] request timed out at timeout={_cur_t}s — "
+                              f"retrying with {_bumped_t}s")
+                        params["timeout"] = _bumped_t
+                elif "Empty response" in msg and (_last_good_budget or _orig_budget) and int(params.get("max_tokens") or 0) > (_last_good_budget or _orig_budget):
+                    # A too-large max_tokens gets a fast 200 + empty body from
+                    # some servers. Step back to the last budget that produced
+                    # content so the remaining attempts still can.
+                    _elapsed = time.time() - _t0
+                    _cur = int(params.get("max_tokens") or 0)
+                    _target = _last_good_budget or _orig_budget
+                    if _elapsed < 3.0 and _cur > _target:
+                        print(f"[ai_provider] empty in {_elapsed:.1f}s at max_tokens={_cur} "
+                              f"— over the server cap, stepping back to {_target}")
+                        params["max_tokens"] = _target
+                    # Cheap rolls: cut reasoning depth on every empty retry.
+                    params["reasoning_effort"] = "low"
+                if "reasoning_effort" in msg.lower() or ("400" in msg and "reasoning" in msg.lower()):
+                    # Server refuses the knob — drop it and retry plain.
+                    params.pop("reasoning_effort", None)
                 # LM Studio local compat: json_schema/json_object not supported → retry once without response_format
                 if use_schema and 'response_format' in msg.lower() and ('400' in msg or 'unsupported' in msg.lower() or 'json_schema' in msg.lower() or 'json_object' in msg.lower()):
                     print(f"[ai_provider] response_format not supported ({msg[:120]}), retrying without it")

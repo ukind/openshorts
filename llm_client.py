@@ -77,6 +77,7 @@ cloud/alerts._classify_failure keys the "llm provider" failure class on.
 import base64
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
@@ -454,7 +455,19 @@ def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
                 if isinstance(content, list) \
                 else content + "\n\n" + _json_contract(schema)
             payload["messages"] = [{"role": "user", "content": bare}]
-        body = _post(client, headers, payload)
+        # Transient blips (empty 200s, timeouts) are routine on
+        # ollama.com-class endpoints: retry the rung, and cut reasoning
+        # depth on later tries so the answer fits the budget.
+        body = None
+        for _try in range(3):
+            try:
+                body = _post(client, headers, payload)
+                break
+            except LlmTransientError:
+                if _try == 2:
+                    raise
+                time.sleep(2.0)
+                payload["reasoning_effort"] = "low"
         if body is not None:
             break
 

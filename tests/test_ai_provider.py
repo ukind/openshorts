@@ -86,7 +86,8 @@ class TestSanitizeMaxTokens:
         assert _sanitize_max_tokens(8192) == 8192
 
     def test_clamped_to_bounds(self):
-        assert _sanitize_max_tokens(999_999) == 8192
+        # 64k ceiling: reasoning models spend completion tokens thinking
+        assert _sanitize_max_tokens(999_999) == 65536
 
 
 class TestSanitizeTimeout:

@@ -112,7 +112,7 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 AI_TEMPERATURE = float(os.environ.get("AI_TEMPERATURE", "0.7"))
-AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "4096"))
+AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "16384"))
 AI_TIMEOUT = int(os.environ.get("AI_TIMEOUT", "30"))
 
 # --- Cheap multimodal toggles (Phase 4) ---
@@ -3160,7 +3160,7 @@ def _enhance_transcript_with_llm(transcript):
             f"CONTEXT AFTER:\n{_json.dumps(context_after, ensure_ascii=False)}"
         )
         chunk_indices = {item["i"] for item in chunk}
-        attempt_max_tokens = 5000
+        attempt_max_tokens = 16000
 
         for attempt in (1, 2):
             try:
@@ -3194,7 +3194,7 @@ def _enhance_transcript_with_llm(transcript):
                 # Retry only when the response looks truncated (many missing)
                 if missing <= max(1, len(chunk) // 4) or attempt == 2:
                     return accepted
-                attempt_max_tokens = 9000
+                attempt_max_tokens = 64000
             except Exception as exc:
                 if attempt == 2:
                     print(f"   ⚠️ Polish pass: chunk {chunk_no}/{total} failed: {type(exc).__name__}: {exc} — originals kept")
