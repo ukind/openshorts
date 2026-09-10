@@ -58,3 +58,4 @@ profiles/
 .dirac-cache/
 # rpiv: tmp is session scratch; artifacts/ stays tracked
 .rpiv/tmp/
+.pi/
