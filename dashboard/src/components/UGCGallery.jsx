@@ -109,7 +109,7 @@ export default function UGCGallery() {
           isOpen
           onClose={() => setSelected(null)}
           size="sm"
-          eyebrow={selected.video_mode === 'lowcost' ? 'LOW COST' : 'PREMIUM'}
+          eyebrow={selected.video_mode === 'local' ? 'LOCAL' : selected.video_mode === 'lowcost' ? 'LOW COST' : 'PREMIUM'}
           title={selected.title || 'Untitled'}
         >
           <video
@@ -201,8 +201,11 @@ function VideoCard({ video, copied, onCopy, onOpen }) {
           <Play size={20} className="text-white/80" />
         </div>
         <div className="absolute top-1.5 right-1.5">
-          <span className={`${mode === 'lowcost' ? 'badge-ok' : 'badge-brass'} bg-black/70`}>
-            {mode === 'lowcost' ? 'LOW COST' : 'PREMIUM'}
+          <span
+            className={`${mode === 'lowcost' ? 'badge-ok' : 'badge-brass'} bg-black/70`}
+            style={mode === 'local' ? { background: '#0ea5e9', color: '#fff' } : undefined}
+          >
+            {mode === 'local' ? 'LOCAL' : mode === 'lowcost' ? 'LOW COST' : 'PREMIUM'}
           </span>
         </div>
       </button>

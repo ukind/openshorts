@@ -15,6 +15,33 @@ const STYLE_OPTIONS = [
   { id: 'comparison', label: 'Before/After', desc: 'Comparison style' },
 ];
 
+// Per-mode wizard cost preview. The server's cost_estimate stays the
+// authoritative breakdown; local rows mirror the $0 cost branch (FR7).
+const COST_PREVIEWS = {
+  lowcost: [
+    ['Flux image', '$0.05'],
+    ['ElevenLabs voice', '$0.10'],
+    ['Hailuo 2.3 img2video', '$0.19'],
+    ['VEED Lipsync', '$0.20'],
+    ['Flux b-roll', '$0.10'],
+  ],
+  premium: [
+    ['Flux image', '$0.05'],
+    ['ElevenLabs voice', '$0.10'],
+    ['Kling avatar', '$1.69'],
+    ['Kling b-roll', '$0.70'],
+  ],
+  local: [
+    ['ComfyUI actor image', '$0.00'],
+    ['Local TTS voice', '$0.00'],
+    ['Wan 2.2 head + lipsync', '$0.00'],
+    ['ComfyUI b-roll', '$0.00'],
+    ['ffmpeg compositing', '$0.00'],
+  ],
+};
+
+const COST_TOTALS = { lowcost: '0.65', premium: '2.50', local: '0.00' };
+
 const STEPS = ['Setup', 'Analysis', 'Configure', 'Generate', 'Result'];
 
 const CACHE_KEY = 'saasshorts_cache';
@@ -54,7 +81,7 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
 
   // Step 0: URL input
   const [url, setUrl] = useState(() => loadCache()?.url || '');
-  const [videoMode, setVideoMode] = useState('lowcost'); // "lowcost" or "premium"
+  const [videoMode, setVideoMode] = useState('lowcost'); // "lowcost", "premium" or "local"
   const [description, setDescription] = useState('');
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('en');
@@ -73,6 +100,7 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
   // Step 2: Configure
   const [shareToGallery, setShareToGallery] = useState(false);
   const [voices, setVoices] = useState([]);
+  const [voicesError, setVoicesError] = useState(''); // local mode: TTS list failure copy (D9)
   const [selectedVoice, setSelectedVoice] = useState('21m00Tcm4TlvDq8ikWAM');
   const [actorDescription, setActorDescription] = useState('');
   const [editedNarration, setEditedNarration] = useState('');
@@ -121,16 +149,25 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
       .finally(() => setLoadingGallery(false));
   }, []);
 
-  // Fetch voices on mount
+  // Fetch voices on mount and on every mode switch. Local lists TTS-server
+  // voices without any key (D9); cloud keeps the ElevenLabs list when a key
+  // exists, the hardcoded defaults otherwise.
   useEffect(() => {
-    if (elevenLabsKey) {
+    if (videoMode === 'local' || elevenLabsKey) {
       fetchVoices();
+    } else {
+      // Leaving local mode with no ElevenLabs key: drop server voices so no
+      // local voice id leaks into a cloud job.
+      setVoices([]);
+      setVoicesError('');
+      setSelectedVoice('21m00Tcm4TlvDq8ikWAM');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [elevenLabsKey]);
+  }, [elevenLabsKey, videoMode]);
 
   // Reset selected voice when actor gender changes
   useEffect(() => {
+    if (videoMode === 'local') return; // local selection: fetchVoices snap + picker clicks (D9)
     const genderDefaults = {
       'en-female': '21m00Tcm4TlvDq8ikWAM',  // Rachel
       'en-male': '29vD33N1CtxCmqQRPOHJ',    // Drew
@@ -186,16 +223,31 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
   }, [jobId, genStatus]);
 
   const fetchVoices = async () => {
+    const local = videoMode === 'local';
     try {
-      const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
-        headers: { 'X-ElevenLabs-Key': elevenLabsKey },
+      const res = await fetch(getApiUrl(`/api/saasshorts/voices?video_mode=${videoMode}`), {
+        headers: local ? {} : { 'X-ElevenLabs-Key': elevenLabsKey },
       });
       if (res.ok) {
         const data = await res.json();
         setVoices(data.voices || []);
+        setVoicesError(local ? (data.error || '') : '');
+        if (local) {
+          // Keep the selection only when the server list actually has it;
+          // otherwise take the first entry (empty id = server default, D9).
+          const ids = (data.voices || []).map((v) => v.voice_id);
+          setSelectedVoice((prev) => (ids.includes(prev) || !ids.length ? prev : ids[0]));
+        }
+      } else if (local) {
+        setVoices([]);
+        setVoicesError('Voice list unavailable. Generation can still run with the server default voice.');
       }
     } catch (e) {
       console.error('Voices fetch error:', e);
+      if (local) {
+        setVoices([]);
+        setVoicesError('Voice list unavailable. Generation can still run with the server default voice.');
+      }
     }
   };
 
@@ -266,13 +318,15 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
   };
 
   const handleGenerate = async () => {
-    if (!falKey) {
-      alert('fal.ai API key required. Set it in Settings.');
-      return;
-    }
-    if (!elevenLabsKey) {
-      alert('ElevenLabs API key required. Set it in Settings.');
-      return;
+    if (videoMode !== 'local') {
+      if (!falKey) {
+        alert('fal.ai API key required. Set it in Settings.');
+        return;
+      }
+      if (!elevenLabsKey) {
+        alert('ElevenLabs API key required. Set it in Settings.');
+        return;
+      }
     }
 
     setGenerating(true);
@@ -294,8 +348,7 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
-          'X-ElevenLabs-Key': elevenLabsKey,
+          ...(videoMode !== 'local' && { 'X-Fal-Key': falKey, 'X-ElevenLabs-Key': elevenLabsKey }),
         },
         body: JSON.stringify({
           script: scriptToSend,
@@ -341,8 +394,7 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
-          'X-ElevenLabs-Key': elevenLabsKey,
+          ...(videoMode !== 'local' && { 'X-Fal-Key': falKey, 'X-ElevenLabs-Key': elevenLabsKey }),
         },
         body: JSON.stringify({
           script: scriptToSend,
@@ -427,7 +479,7 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
               {/* Video Mode Selector */}
               <div>
                 <label className="eyebrow block mb-3">Video Mode</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <button
                     onClick={() => setVideoMode('lowcost')}
                     className={`card card-hover p-4 text-left ${
@@ -453,6 +505,19 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
                     </div>
                     <p className="readout mb-1.5">~$2.00 / VIDEO</p>
                     <p className="text-xs text-muted leading-relaxed">Kling Avatar v2 Standard. Full integrated movement.</p>
+                  </button>
+                  <button
+                    onClick={() => setVideoMode('local')}
+                    className={`card card-hover p-4 text-left ${
+                      videoMode === 'local' ? 'border-brass' : ''
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1.5 gap-2">
+                      <span className={`text-sm font-medium lowercase ${videoMode === 'local' ? 'text-ink' : 'text-ink2'}`}>Local</span>
+                      <span className="badge-ok">$0 · your GPU</span>
+                    </div>
+                    <p className="readout mb-1.5">FREE / YOUR HARDWARE</p>
+                    <p className="text-xs text-muted leading-relaxed">ComfyUI + local TTS server on your machine. Needs a ~10 GB VRAM GPU. No per-video cost, no time limit.</p>
                   </button>
                 </div>
               </div>
@@ -812,6 +877,46 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
                   Voice {language === 'es' ? '(Spanish)' : '(English)'}
                 </label>
                 {(() => {
+                  // Local mode: read-only TTS-server catalog. No gender/accent
+                  // filtering, no preview, no ElevenLabs fallback (design D9).
+                  if (videoMode === 'local') {
+                    if (voicesError) {
+                      return (
+                        <div className="p-3 bg-warn/10 rounded-input flex items-start gap-2 text-sm text-warn">
+                          <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                          <span>{voicesError}</span>
+                        </div>
+                      );
+                    }
+                    if (voices.length === 0) {
+                      return (
+                        <p className="text-xs lowercase text-muted">
+                          No voices returned by the TTS server — its default voice will be used.
+                        </p>
+                      );
+                    }
+                    return (
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
+                        {voices.map((v) => (
+                          <button
+                            key={v.voice_id}
+                            onClick={() => setSelectedVoice(v.voice_id)}
+                            className={`w-full flex items-center gap-3 p-2.5 rounded-input border text-left transition-colors duration-200 ${
+                              selectedVoice === v.voice_id
+                                ? 'border-brass bg-paper3'
+                                : 'border-rule bg-paper hover:bg-paper3'
+                            }`}
+                          >
+                            <div className="flex-1 min-w-0">
+                              <div className={`text-sm truncate ${selectedVoice === v.voice_id ? 'text-ink' : 'text-ink2'}`}>{v.name}</div>
+                              <div className="readout mt-0.5">local server voice</div>
+                            </div>
+                            {selectedVoice === v.voice_id && <Check size={14} className="text-brass shrink-0" />}
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  }
                   // Filter voices by language/accent
                   const filtered = voices.length > 0
                     ? voices.filter((v) => {
@@ -899,7 +1004,9 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
                   );
                 })()}
                 <p className="text-xs lowercase text-muted mt-1.5">
-                  {actorGender === 'female' ? 'female' : 'male'} voices &middot; multilingual model speaks your selected language &middot; click speaker to preview
+                  {videoMode === 'local'
+                    ? 'voices from your local TTS server · read-only list'
+                    : `${actorGender === 'female' ? 'female' : 'male'} voices · multilingual model speaks your selected language · click speaker to preview`}
                 </p>
               </div>
 
@@ -1016,15 +1123,18 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
 
                 <button
                   onClick={async () => {
-                    if (!falKey || !actorDescription) return;
+                    if ((videoMode !== 'local' && !falKey) || !actorDescription) return;
                     setGeneratingActors(true);
                     setActorOptions([]);
                     setSelectedActor(null);
                     try {
                       const res = await apiFetch('/api/saasshorts/actor-options', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Fal-Key': falKey },
-                        body: JSON.stringify({ actor_description: actorDescription, num_options: 3 }),
+                        headers: {
+                          'Content-Type': 'application/json',
+                          ...(videoMode !== 'local' && { 'X-Fal-Key': falKey }),
+                        },
+                        body: JSON.stringify({ actor_description: actorDescription, num_options: 3, video_mode: videoMode }),
                       });
                       if (res.ok) {
                         const data = await res.json();
@@ -1039,10 +1149,10 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
                     } catch (e) { console.error(e); }
                     finally { setGeneratingActors(false); }
                   }}
-                  disabled={generatingActors || !falKey || !actorDescription}
+                  disabled={generatingActors || (videoMode !== 'local' && !falKey) || !actorDescription}
                   className="btn-ghost mt-2 w-full py-2.5 text-sm"
                 >
-                  {generatingActors ? <><Loader2 size={14} className="animate-spin" /> Generating 3 actors...</> : <><User size={14} /> {actorOptions.length > 0 ? 'Regenerate actors' : 'Generate 3 new actors'} <span className="readout">~$0.06</span></>}
+                  {generatingActors ? <><Loader2 size={14} className="animate-spin" /> Generating 3 actors...</> : <><User size={14} /> {actorOptions.length > 0 ? 'Regenerate actors' : 'Generate 3 new actors'} <span className="readout">{videoMode === 'local' ? 'free · ComfyUI' : '~$0.06'}</span></>}
                 </button>
 
                 {/* Newly Generated Actor Options */}
@@ -1096,24 +1206,12 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
               <div className="card p-4">
                 <div className="flex items-center justify-between mb-3">
                   <span className="eyebrow">Estimated Cost</span>
-                  <span className="readout text-ink">~${videoMode === 'lowcost' ? '0.65' : '2.50'}</span>
+                  <span className="readout text-ink">
+                    {videoMode === 'local' ? 'FREE' : `~$${COST_TOTALS[videoMode] || '0.65'}`}
+                  </span>
                 </div>
                 <div className="space-y-1">
-                  {(videoMode === 'lowcost'
-                    ? [
-                        ['Flux image', '$0.05'],
-                        ['ElevenLabs voice', '$0.10'],
-                        ['Hailuo 2.3 img2video', '$0.19'],
-                        ['VEED Lipsync', '$0.20'],
-                        ['Flux b-roll', '$0.10'],
-                      ]
-                    : [
-                        ['Flux image', '$0.05'],
-                        ['ElevenLabs voice', '$0.10'],
-                        ['Kling avatar', '$1.69'],
-                        ['Kling b-roll', '$0.70'],
-                      ]
-                  ).map(([item, cost]) => (
+                  {(COST_PREVIEWS[videoMode] || COST_PREVIEWS.lowcost).map(([item, cost]) => (
                     <div key={item} className="flex items-center justify-between readout">
                       <span>{item}</span>
                       <span>{cost}</span>
@@ -1122,8 +1220,8 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
                 </div>
               </div>
 
-              {/* Missing keys warning */}
-              {(!falKey || !elevenLabsKey) && (
+              {/* Missing keys warning (local mode runs without cloud keys) */}
+              {videoMode !== 'local' && (!falKey || !elevenLabsKey) && (
                 <div className="p-3 bg-warn/10 rounded-input flex items-center gap-2 text-sm text-warn">
                   <AlertCircle size={14} />
                   {!falKey && 'fal.ai API key missing. '}{!elevenLabsKey && 'ElevenLabs API key missing. '}
@@ -1153,13 +1251,15 @@ export default function SaaShortsTab({ geminiApiKey, llmConfig, llmActive, eleve
               </button>
               <button
                 onClick={handleGenerate}
-                disabled={!falKey || !elevenLabsKey || !selectedActor || generating}
+                disabled={(videoMode !== 'local' && (!falKey || !elevenLabsKey)) || !selectedActor || generating}
                 className="btn-primary px-6 py-2 text-sm"
               >
                 {generating ? (
                   <><Loader2 size={14} className="animate-spin" /> Generating...</>
                 ) : !selectedActor ? (
                   <><User size={14} /> Select an actor first</>
+                ) : videoMode === 'local' ? (
+                  <><Film size={14} /> Generate video (free · your GPU)</>
                 ) : (
                   <><Film size={14} /> Generate video (~${videoMode === 'lowcost' ? '0.65' : '2.00'})</>
                 )}
