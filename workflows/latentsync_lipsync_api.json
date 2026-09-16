@@ -1,0 +1,60 @@
+{
+  "_meta": {
+    "title": "LatentSync 1.5 lipsync - GPU-host export (wrapper 1.5, pin 920c15ea)",
+    "note": "Finalized against the pinned ComfyUI-LatentSyncWrapper 1.5 install (git checkout 920c15ea); video load/save via ComfyUI-VideoHelperSuite (required by the wrapper's own example graph). PATCH CONTRACT (fixed by the design): node 'load_video'.inputs.video and node 'load_audio'.inputs.audio each receive the upload reference STRING built by comfyui_client.image_ref(name, subfolder) - 'name' or 'subfolder/name'. Never a [name, subfolder] list: API-format prompts parse a 2-element list as a node link. Exactly one output node (VHS_VideoCombine) saves one video file fetchable via GET /view. saasshorts_local.generate_talking_head_local patches only these two keys."
+  },
+  "load_video": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "",
+      "force_rate": 25,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "AnimateDiff"
+    }
+  },
+  "load_audio": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": ""
+    }
+  },
+  "lipsync": {
+    "class_type": "LatentSyncNode",
+    "inputs": {
+      "images": [
+        "load_video",
+        0
+      ],
+      "audio": [
+        "load_audio",
+        0
+      ],
+      "seed": 1247,
+      "lips_expression": 1.5,
+      "inference_steps": 20
+    }
+  },
+  "save": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": [
+        "lipsync",
+        0
+      ],
+      "audio": [
+        "lipsync",
+        1
+      ],
+      "frame_rate": 25,
+      "loop_count": 0,
+      "filename_prefix": "openshorts/lipsync",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}

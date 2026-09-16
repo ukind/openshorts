@@ -19,7 +19,7 @@ import signal
 import socket
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Literal
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -6529,6 +6529,33 @@ from saasshorts import (
     DEFAULT_VOICES,
 )
 
+import saasshorts_local  # local video_mode arm (env-configured, zero cloud calls)
+
+
+def _local_arm_startup_warnings() -> List[str]:
+    # Lesson 5: a set-but-unreachable COMFYUI_URL / TTS_BASE_URL surfaces at
+    # startup as one warning line naming the env var and URL (llm_client
+    # half-config spirit). Unset vars stay silent. Needs os (imported at HEAD)
+    # and a local httpx import - no new module dependency.
+    import httpx
+
+    out: List[str] = []
+    for env, label in (("COMFYUI_URL", "ComfyUI"), ("TTS_BASE_URL", "local TTS")):
+        url = (os.environ.get(env) or "").strip()
+        if not url:
+            continue
+        try:
+            httpx.get(url, timeout=2.0)
+        except Exception as e:
+            out.append(
+                f"{env}={url} unreachable ({e}) - local video_mode {label} calls will fail until it is up"
+            )
+    return out
+
+
+for _warning in _local_arm_startup_warnings():
+    print(f"[local] {_warning}", flush=True)
+
 # State for SaaSShorts jobs (separate from video processing jobs)
 saas_jobs: Dict[str, Dict] = {}
 
@@ -6617,6 +6644,7 @@ class SaaSActorRequest(BaseModel):
     actor_description: str
     num_options: int = 3
     product_description: Optional[str] = None
+    video_mode: Literal["premium", "lowcost", "local"] = "lowcost"
 
 
 @app.post("/api/saasshorts/actor-upload")
@@ -6666,7 +6694,7 @@ async def saasshorts_actor_options(
     """Generate multiple actor image options for the user to choose from."""
     await require_managed_entitlement(request)
     fal_key = x_fal_key
-    if not fal_key:
+    if req.video_mode != "local" and not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key")
 
     try:
@@ -6676,6 +6704,23 @@ async def saasshorts_actor_options(
 
         loop = asyncio.get_running_loop()
         import functools
+        if req.video_mode == "local":
+            # Local mode: ComfyUI portraits, no keys, no S3 upload - the images
+            # are served from the instance's /videos/ mount.
+            paths = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    saasshorts_local.generate_actor_images_local,
+                    req.actor_description, out_dir, "actor", req.num_options,
+                    product_description=req.product_description,
+                ),
+            )
+            return {
+                "images": [
+                    f"/videos/saas_actors_{job_id}/{os.path.basename(p)}" for p in paths
+                ]
+            }
+
         paths = await loop.run_in_executor(
             None,
             functools.partial(
@@ -7780,7 +7825,10 @@ async def gallery_html_page():
         product = html_mod.escape(v.get("product_name", ""))
         caption = html_mod.escape(v.get("caption", "")[:120])
 
-        mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>' if mode == "lowcost" else '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
+        if mode == "local":
+            mode_badge = '<span style="background:#0ea5e9;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOCAL</span>'
+        else:
+            mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>' if mode == "lowcost" else '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
 
         cards_html += f'''
         <a href="/video/{video_id}" style="text-decoration:none;color:inherit">
@@ -7859,7 +7907,7 @@ async def video_html_page(video_id: str):
 
     ld_json = f'{{"@context":"https://schema.org","@type":"VideoObject","name":"{title}","description":"{caption}","thumbnailUrl":"{actor_url}","contentUrl":"{video_url}","uploadDate":"{created}","duration":"PT{int(duration)}S","width":1080,"height":1920,"inLanguage":"{language}"}}'
 
-    mode_label = "Low Cost" if mode == "lowcost" else "Premium"
+    mode_label = {"lowcost": "Low Cost", "local": "Local"}.get(mode, "Premium")
 
     return f'''<!DOCTYPE html>
 <html lang="{language}">
@@ -7931,7 +7979,7 @@ class SaaSGenerateRequest(BaseModel):
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
     retry_job_id: Optional[str] = None
-    video_mode: str = "lowcost"  # "lowcost" or "premium"
+    video_mode: Literal["premium", "lowcost", "local"] = "lowcost"  # "local" = self-hosted ComfyUI + TTS
     # Publishing to the public /gallery is opt-in: generated videos carry the
     # user's product name, URL and full script.
     share_to_gallery: bool = False
@@ -7949,10 +7997,13 @@ async def saasshorts_generate(
     fal_key = x_fal_key
     elevenlabs_key = x_elevenlabs_key
 
-    if not fal_key:
-        raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
-    if not elevenlabs_key:
-        raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+    if req.video_mode != "local":
+        # Cloud modes need paid keys; local mode runs against env-configured
+        # self-hosted services (design D5). Cloud behavior is byte-identical.
+        if not fal_key:
+            raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
+        if not elevenlabs_key:
+            raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
@@ -8120,8 +8171,26 @@ async def saasshorts_status(job_id: str, request: Request):
 @app.get("/api/saasshorts/voices")
 async def saasshorts_voices(
     x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
+    video_mode: str = "lowcost",
 ):
-    """List available ElevenLabs voices."""
+    """List voices: ElevenLabs by default, the local TTS server in local mode."""
+    if video_mode == "local":
+        # Read-only TTS-server catalog (design D9). Never falls back to cloud
+        # defaults in local mode: an empty list plus the error lets the picker
+        # say why, and generation still works via the server default voice.
+        try:
+            loop = asyncio.get_event_loop()
+            voices = await loop.run_in_executor(None, saasshorts_local.get_local_tts_voices)
+            return {
+                "voices": [
+                    {"voice_id": v.get("voice_id"), "name": v.get("name"), "category": "local"}
+                    for v in voices
+                ],
+                "source": "local",
+            }
+        except Exception as e:
+            return {"voices": [], "source": "local", "error": str(e)}
+
     if x_elevenlabs_key:
         try:
             loop = asyncio.get_event_loop()

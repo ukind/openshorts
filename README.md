@@ -50,7 +50,7 @@ Generate marketing videos with AI actors for **any product or business**. No cam
 
 ![AI Shorts Setup](screenshots/ai-shorts.png)
 
-- **Two cost modes**: Low Cost (~$0.65/video) and Premium (~$2/video)
+- **Three cost modes**: Low Cost (~$0.65/video), Premium (~$2/video), or fully local on your own GPU at $0 — see [AI Shorts fully local](#7-ai-shorts-fully-local-video_mode-local-optional)
 - Works for any business: SaaS, restaurants, e-commerce, coaching, local businesses
 - AI-generated actors with lip-sync, voiceover, b-roll, and TikTok-style subtitles
 - Choose from a shared avatar gallery or upload your own photo
@@ -266,7 +266,7 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 
 - **Docker & Docker Compose**
 - **Google Gemini API Key** ([Free — get it here](https://aistudio.google.com/app/apikey)) — required for all AI features
-- **fal.ai API Key** ([Pay-per-use](https://fal.ai)) — required for AI Shorts (actor generation, video, lip-sync)
+- **fal.ai API Key** ([Pay-per-use](https://fal.ai)) — required for the AI Shorts cloud modes; the fully local mode needs none (see [AI Shorts fully local](#7-ai-shorts-fully-local-video_mode-local-optional))
 - **ElevenLabs API Key** ([Free tier](https://elevenlabs.io)) — required for voiceover/dubbing
 - **Upload-Post API Key** ([free tier](https://upload-post.com)) — required for direct social posting
 
@@ -410,6 +410,36 @@ Gemini key. Two things to know:
   Gemini keeps watching the native video upload when it is selected. The
   layout picker and the thumbnail text stages reroute to the `LLM_*`
   endpoint. Add a Gemini key alongside and you get both.
+
+### 7. AI Shorts fully local (video_mode `local`, optional)
+
+The third AI Shorts mode runs every paid media stage on your own GPU: actor portraits (Flux GGUF), the talking head (Wan2.2 image-to-video + LatentSync lip-sync), b-roll (Flux schnell), and the voiceover (any OpenAI-compatible TTS server). Generation makes zero cloud calls, costs $0 per video, and has no time limit. Sharing a finished video to the public gallery stays an explicit choice, same as the cloud modes. The analyze and script text stages are unchanged — they follow the normal text configuration: a Gemini key or the `LLM_*` endpoint (a local Ollama works, see section 6).
+
+Hardware: an NVIDIA GPU with ~10 GB VRAM (calibrated on an RTX 3080) and 32 GB RAM. Start ComfyUI and the TTS server before you start a job.
+
+**ComfyUI** (the Windows portable works — `F:/AI/ComfyUI_windows_portable`):
+
+- Custom nodes: [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) and [ComfyUI-LatentSyncWrapper](https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper) pinned to 1.5 (`git checkout 920c15ea`; the wrapper's `main` carries 1.6). With the portable's embedded Python: `..\..\..\python_embeded\python.exe -m pip install -r requirements.txt` inside the wrapper folder, then drop the LatentSync 1.5 checkpoint and Whisper `tiny.pt` where the wrapper README says.
+- Models: `Wan2.2-TI2V-5B-Q8_0.gguf`, `wan2.2_vae.safetensors`, `umt5_xxl_fp8_e4m3fn_scaled.safetensors`, the `wan2.2_ti2v_5B_fastwan` LoRA; `flux1-dev-Q4_K_S.gguf` and `flux1-schnell-Q4_K_S.gguf` with `t5-v1_1-xxl-encoder-Q4_K_S.gguf`, `clip_l.safetensors`, and `ae.safetensors`.
+- The repo ships API-format workflows under `workflows/`. To run a different model on one stage, export your own workflow from the ComfyUI UI ("Save (API Format)") and point the stage's `COMFYUI_WORKFLOW_*` variable at it. Keep the `load_video` / `load_audio` node ids and their string upload refs in the lipsync template; the validator below checks that.
+
+**TTS server:** any OpenAI-compatible server exposing `POST /v1/audio/speech` and `GET /v1/voices` (for example omnivoice-server). `TTS_BASE_URL` has no default: a local job fails fast and names the missing variable.
+
+**Environment (`.env`):**
+```bash
+COMFYUI_URL=http://127.0.0.1:8188
+TTS_BASE_URL=http://127.0.0.1:8000
+```
+
+**How a local job runs:** the actor image and the voiceover run one after the other, never in parallel — together they exceed 10 GB VRAM. The talking head writes three retryable intermediates (`{slug}_head_wan_cache.mp4`, a looped copy, `{slug}_head_lipsync_cache.mp4`); only the final muxed `{slug}_head.mp4` counts as done, so an interrupted head never poisons the retry cache. ComfyUI polling has no deadline, but an error or cancelled status, or a dropped connection, fails the job immediately and names the service and URL.
+
+**Calibration:** every local stage logs elapsed seconds (`[local] ...` lines in the job log). If Wan2.2 runs out of VRAM at 121 frames, set the template's `length` to 81 — the loop stage re-extends the clip to the narration length. Still tight, drop to 480x832. Otherwise the shipped template is calibrated as-is: 704x1280, 121 frames, 8 steps, fastwan LoRA, shift 8.0.
+
+**Template validator** (run it after swapping any workflow template):
+
+```bash
+python -c "import json; g=json.load(open('workflows/latentsync_lipsync_api.json',encoding='utf-8')); assert isinstance(g['load_video']['inputs']['video'],str); assert isinstance(g['load_audio']['inputs']['audio'],str); outs=[k for k,v in g.items() if isinstance(v,dict) and ('save' in str(v.get('class_type','')).lower() or 'videocombine' in str(v.get('class_type','')).lower())]; assert len(outs)==1, outs; print('lipsync template OK:', outs[0])"
+```
 
 ## Technical Pipeline
 

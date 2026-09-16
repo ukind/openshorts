@@ -390,8 +390,8 @@ def _require_usable(config: LlmConfig) -> str:
 
 
 def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
-         temperature=None, max_tokens=None,
-         json_mode: bool = False) -> Tuple[object, Optional[dict]]:
+         temperature=None, max_tokens=None, json_mode: bool = False,
+         strict: bool = False) -> Tuple[object, Optional[dict]]:
     """One chat-completions call against the configured endpoint. See the
     module docstring for the full contract. Never retries on its own except
     the response_format ladder; transient retries belong to callers."""
@@ -421,7 +421,7 @@ def chat(prompt, schema=None, *, config: LlmConfig, images: Sequence = (),
         rungs.append({"type": "json_schema",
                       "json_schema": {"name": getattr(schema, "__name__", "response"),
                                       "schema": schema.model_json_schema(),
-                                      "strict": False}})
+                                      "strict": bool(strict)}})
         rungs.append({"type": "json_object"})
     elif json_mode:
         # No pydantic schema exists for these shapes (thumbnail/saas prompts

@@ -23,6 +23,8 @@ import httpx
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pydantic import BaseModel, ConfigDict
+import saasshorts_local
 
 
 ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
@@ -258,6 +260,46 @@ def scrape_website(url: str) -> dict:
     return result
 
 
+class _SaasScriptSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    start: int
+    end: int
+    narration: str
+    visual: str
+    broll_prompt: Optional[str] = None
+    emotion: str
+    subtitle_text: str
+
+
+class _SaasScript(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    style: str
+    duration_seconds: int
+    target_platform: str
+    hook_text: str
+    segments: List[_SaasScriptSegment]
+    full_narration: str
+    actor_description: str
+    hashtags: List[str]
+    caption: str
+
+
+class SaasScriptSet(BaseModel):
+    """Object-wrapped script array: {"scripts": [...]}. Passed to
+    llm_client.chat as the response schema: providers with structured
+    outputs (Ollama json_schema, OpenAI) grammar-force this exact shape, so
+    small local models cannot garble it, and object roots work with
+    llm_client's parser and the json_object rung alike (a top-level array
+    would fail its object-oriented JSON extraction). Providers that reject
+    response_format drop rungs inside llm_client itself."""
+
+    scripts: List[_SaasScript]
+
+
 def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None,
                  llm_config=None) -> dict:
     """
@@ -394,6 +436,96 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
     return analysis
 
 
+def _script_word_count(raw) -> int:
+    """Total narration words of the first script in `raw` - a dict from the
+    schema rung or a JSON-ish string from the fallback rung. Weak local
+    models answer the 60-second script request with 10-word segments and
+    stage directions; the caller retries on a low count so the video length
+    tracks the design, not the model's laziness."""
+    try:
+        data = raw
+        if isinstance(data, str):
+            text = data.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\n?", "", text)
+                text = re.sub(r"\n?```$", "", text)
+            start = min((i for i in (text.find("{"), text.find("[")) if i != -1),
+                        default=-1)
+            end = max(text.rfind("}"), text.rfind("]"))
+            if start == -1 or end == -1:
+                return 0
+            data = json.loads(text[start:end + 1])
+        if isinstance(data, dict):
+            data = data.get("scripts", [])
+        scripts = list(data or [])
+        if not scripts or not isinstance(scripts[0], dict):
+            return 0
+        segs = scripts[0].get("segments", []) or []
+        words = " ".join(str(s.get("narration", "")) for s in segs).split()
+        return len(words)
+    except Exception:
+        return 0
+
+
+# The promo cut is a fixed 5-beat shape; every promo follows it.
+_PROMO_BEATS = [
+    {"type": "hook", "visual": "actor_talking"},
+    {"type": "problem", "visual": "broll"},
+    {"type": "solution", "visual": "actor_talking"},
+    {"type": "demo", "visual": "broll"},
+    {"type": "cta", "visual": "actor_talking"},
+]
+
+
+def _enforce_promo_shape(script: dict, product_hint: str) -> dict:
+    """Small local models answer the 5-segment promo request with 2 segments
+    and no b-roll beats. The beat LAYOUT is a template, not creative output,
+    so rebuild it here and keep whatever narration text the model wrote:
+    narrations spread over the beats, missing b-roll prompts derived from
+    the product name. No-op when the script already complies."""
+    segs = script.get("segments") or []
+    brolls = [s for s in segs if s.get("visual") == "broll" and s.get("broll_prompt")]
+    if len(segs) >= 5 and len(brolls) >= 2:
+        return script
+    voice = [(s.get("narration") or "").strip() for s in segs]
+    voice = [v for v in voice if v]
+    full = (script.get("full_narration") or "").strip()
+    if len(voice) < 5 and full:
+        sents = re.split(r"(?<=[.!?]) +", full)
+        per = max(1, -(-len(sents) // 5))
+        voice = [" ".join(sents[i:i + per]).strip()
+                 for i in range(0, len(sents), per)]
+    while len(voice) < 5:
+        voice.append(full or "Check the link in my bio.")
+    product = product_hint or "the product"
+    beats = []
+    for i, beat in enumerate(_PROMO_BEATS):
+        seg = dict(segs[i]) if i < len(segs) else {}
+        broll_prompt = None
+        if beat["visual"] == "broll":
+            broll_prompt = (seg.get("broll_prompt") if i < len(segs) else None) or (
+                f"Cinematic product shot of {product} standing on a modern office "
+                "desk, soft daylight, shallow depth of field" if i == 1 else
+                f"{product} being used during a workout at the gym, condensation "
+                "on the surface, energetic motion")
+        seg.update({
+            "type": beat["type"],
+            "start": i * 12,
+            "end": (i + 1) * 12,
+            "narration": voice[i],
+            "subtitle_text": seg.get("subtitle_text") or voice[i][:40],
+            "emotion": seg.get("emotion") or ("excited" if i in (0, 3) else "confident"),
+            "visual": beat["visual"],
+            "broll_prompt": broll_prompt,
+        })
+        beats.append(seg)
+    script["segments"] = beats
+    script["duration_seconds"] = 60
+    print(f"[SaaSShorts] 🔧 Rebuilt promo shape: 5 beats, 2 b-roll "
+          f"(model gave {len(segs)} segments, {len(brolls)} b-roll)")
+    return script
+
+
 def generate_scripts(
     analysis: dict,
     gemini_key: str,
@@ -449,18 +581,22 @@ YOU MUST USE EXACTLY THIS 5-SEGMENT STRUCTURE. NO EXCEPTIONS:
 1. HOOK (0-5s): type="hook", visual="actor_talking", broll_prompt=null — Avatar says a punchy hook.
 2. B-ROLL 1 (5-9s): type="problem", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the problem.
 3. BODY (9-16s): type="solution", visual="actor_talking", broll_prompt=null — Avatar presents the solution.
-4. B-ROLL 2 (16-21s): type="demo", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the product.
-5. CTA (21-25s): type="cta", visual="actor_talking", broll_prompt=null — Avatar says CTA with link in bio.
+4. B-ROLL 2 (a mid/late time slot): type="demo", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the product.
+5. CTA (the final time slot): type="cta", visual="actor_talking", broll_prompt=null — Avatar says CTA with link in bio.
 
 CRITICAL — READ CAREFULLY:
 - EXACTLY 5 segments. Not 3, not 4, not 6. FIVE.
 - Segments 2 and 4 MUST have visual="broll" and a non-null broll_prompt string.
 - Segments 1, 3, 5 MUST have visual="actor_talking" and broll_prompt=null.
-- duration_seconds MUST be between 20 and 25.
+- duration_seconds MUST be exactly 60.
+- Each of the 5 segments spans 12 seconds: segment ends at 12, 24, 36, 48, 60.
+- Each narration field MUST be 25-35 words long (about 12 seconds of speech).
+- full_narration = all narration text joined together.
 - full_narration = all narration text joined together.
 
-Return a JSON array:
-[
+Return a JSON object with a "scripts" key:
+{{
+    "scripts": [
     {{
         "title": "Short internal title",
         "style": "{style}",
@@ -524,13 +660,14 @@ Return a JSON array:
         "hashtags": ["#saas", "#productivity", "#techtools"],
         "caption": "Suggested Instagram/TikTok caption"
     }}
-]
+    ]
+}}
 
 RULES:
 - EXACTLY 5 segments in order: actor, broll, actor, broll, actor
 - EXACTLY 2 broll segments with detailed broll_prompt (NOT null)
 - full_narration = ALL narration text (both actor and broll voiceover segments joined)
-- Total duration MUST be 18-22 seconds, never more
+- Total duration MUST be 60 seconds. Never shorter.
 - Keep narrations punchy, conversational, with contractions
 - Actor descriptions: casual, real-person look (NOT model/influencer)
 - B-roll prompts: cinematic, specific, detailed visual descriptions
@@ -547,11 +684,36 @@ RULES:
 
     if llm_config is not None:
         import llm_client
-        # ARRAY response, PLAIN TEXT: json_object constrains output to an object
-        # and would break the array-slice parse below (the parser greps for the
-        # first open bracket and last close bracket). 8192 mirrors the Gemini
-        # arm's max_output_tokens.
-        raw, _cost = llm_client.chat(prompt, config=llm_config, max_tokens=8192)
+        # Structured outputs first: the json_schema rung grammar-forces the
+        # {"scripts": [...]} shape, so small local models cannot emit
+        # malformed JSON. A provider that rejects response_format drops rungs
+        # inside llm_client itself; retry the legacy bare call only when the
+        # schema call otherwise fails transiently (kept verbatim below).
+        # Quality gate: the prompt demands 5 segments x 25-35 words (60 s of
+        # speech), but shape validation cannot see length. Small local models
+        # hand back 10-word telegraph lines, and every downstream stage scales
+        # to the narration - a 35-word script ships a 13-second video. Retry
+        # with an explicit correction; accept whatever comes back after 3.
+        for attempt in range(3):
+            attempt_prompt = prompt if attempt == 0 else prompt + (
+                "\n\nCRITICAL CORRECTION: your previous script was REJECTED as too short."
+                " Each narration is spoken words the actor says aloud - NEVER a stage direction."
+                " Each narration MUST be 25-35 spoken words; all narrations together MUST total 125-175 words.")
+            try:
+                raw, _cost = llm_client.chat(
+                    attempt_prompt, config=llm_config, schema=SaasScriptSet,
+                    strict=True, max_tokens=8192)
+            except llm_client.LlmTransientError as e:
+                if "truncated" in str(e).lower():
+                    raise  # context-size failure: the bare call truncates identically
+                # PLAIN TEXT fallback: 8192 mirrors the Gemini arm's
+                # max_output_tokens; the brace-slice parse below handles both
+                # object and array shapes.
+                raw, _cost = llm_client.chat(attempt_prompt, config=llm_config, max_tokens=8192)
+            words = _script_word_count(raw)
+            if words >= 100:
+                break
+            print(f"[SaaSShorts] ⚠️ script narration too short ({words} words < 100), retrying ({attempt + 1}/3)...")
     else:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -565,13 +727,21 @@ RULES:
     if not raw:
         raise Exception("Gemini returned empty response for script generation")
 
+    if isinstance(raw, dict) and "scripts" in raw:
+        # Schema rung succeeded: llm_client already validated and unwrapped
+        # the object (obj.model_dump()).
+        print(f"[SaaSShorts] ✅ Generated {len(raw['scripts'])} scripts")
+        return [_enforce_promo_shape(s, (analysis or {}).get("product_name", ""))
+                for s in raw["scripts"]]
+
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
 
-    start = text.find("[")
-    end = text.rfind("]")
+    start = min((i for i in (text.find("{"), text.find("[")) if i != -1),
+                default=-1)
+    end = max(text.rfind("}"), text.rfind("]"))
     if start != -1 and end != -1:
         text = text[start : end + 1]
 
@@ -579,9 +749,13 @@ RULES:
         scripts = json.loads(text)
     except json.JSONDecodeError as e:
         raise Exception(f"Failed to parse scripts JSON: {e}\nRaw: {text[:500]}")
+    if isinstance(scripts, dict):
+        scripts = scripts.get("scripts", [])
 
-    print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
-    return scripts
+    seg_counts = [len(s.get("segments", [])) for s in scripts]
+    print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts (segments per script: {seg_counts})")
+    return [_enforce_promo_shape(s, (analysis or {}).get("product_name", ""))
+            for s in scripts]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1211,11 +1385,13 @@ def composite_video(
         sub_filter = f"subtitles='{safe_sub}':force_style='{sub_style}'"
 
     if not broll_clips:
-        # Simple: talking head + subtitles only
+        # Simple: talking head + subtitles only, but still normalize to the
+        # delivery canvas (1080x1920@30) - the local head is 704x1280@25 and
+        # a bare passthrough would ship an off-spec file.
         cmd = [
             "ffmpeg", "-y",
             "-i", talking_head_path,
-            "-vf", sub_filter,
+            "-vf", f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1,{sub_filter}",
             *video_encode_args(DELIVERY),
             "-c:a", "aac", "-b:a", "128k",
             output_path,
@@ -1258,6 +1434,10 @@ def composite_video(
 
     if prev_end < th_duration:
         segments.append({"type": "th", "start": prev_end, "end": th_duration})
+
+    # Normalize the talking-head track even when no b-roll exists, so every
+    # final ships at 1080x1920@30 regardless of the head's native rate (the
+    # LatentSync loop runs at 25 fps and the Wan source at 32).
 
     # Build FFmpeg filter_complex
     inputs = ["-i", talking_head_path]
@@ -1345,10 +1525,11 @@ def generate_full_video(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    fal_key = config["fal_key"]
-    elevenlabs_key = config["elevenlabs_key"]
+    fal_key = config.get("fal_key")                 # None in local mode: no paid stage runs
+    elevenlabs_key = config.get("elevenlabs_key")   # None in local mode
     voice_id = config.get("voice_id", "21m00Tcm4TlvDq8ikWAM")
     actor_desc = config.get("actor_description") or script.get("actor_description", "a young professional in their late 20s, wearing a casual modern outfit, clean background")
+    video_mode = config.get("video_mode", "premium")  # read once, used by every dispatch site below
 
     title_slug = re.sub(r"[^a-z0-9]+", "_", script.get("title", "video").lower())[:30]
 
@@ -1385,18 +1566,30 @@ def generate_full_video(
             tasks.append("actor image")
         if need_voice:
             tasks.append("voiceover")
-        log(f"[1/6] Generating {' + '.join(tasks)} (parallel)...")
+        how = "sequential" if video_mode == "local" else "parallel"
+        log(f"[1/6] Generating {' + '.join(tasks)} ({how})...")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_img = executor.submit(generate_actor_image, actor_desc, fal_key, actor_img) if need_img else None
-            future_voice = executor.submit(
-                generate_voiceover, full_narration, elevenlabs_key, audio_path, voice_id
-            ) if need_voice else None
+        if video_mode == "local":
+            # Local mode serializes steps 1-2 (design D7): the TTS server peaks
+            # 5-7 GB VRAM and Wan2.2 peaks ~8 GB - one 10 GB card OOMs on overlap.
+            if need_img:
+                actor_img = saasshorts_local.generate_actor_image_local(actor_desc, actor_img, log=log)
+            if need_voice:
+                audio_path = saasshorts_local.generate_voiceover_local(
+                    full_narration, audio_path, voice_id, log=log,
+                    segments=[seg.get("narration", "") for seg in script.get("segments", [])],
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_img = executor.submit(generate_actor_image, actor_desc, fal_key, actor_img) if need_img else None
+                future_voice = executor.submit(
+                    generate_voiceover, full_narration, elevenlabs_key, audio_path, voice_id
+                ) if need_voice else None
 
-            if future_img:
-                actor_img = future_img.result()
-            if future_voice:
-                audio_path = future_voice.result()
+                if future_img:
+                    actor_img = future_img.result()
+                if future_voice:
+                    audio_path = future_voice.result()
 
         log("[2/6] Actor image and voiceover ready.")
     else:
@@ -1404,9 +1597,26 @@ def generate_full_video(
         log("[2/6] ✅ Using cached assets.")
 
     # ── Step 3: Generate talking head ──
-    video_mode = config.get("video_mode", "premium")
     if not _exists(talking_head):
-        if video_mode == "lowcost":
+        if video_mode == "local":
+            log("[3/6] Generating talking head (Local: Wan2.2 i2v + LatentSync lipsync)... No time limit.")
+            actor_marks = [
+                {"start": seg.get("start", 0), "end": seg.get("end", 0)}
+                for seg in script.get("segments", [])
+                if seg.get("visual") != "broll"
+            ]
+            # Multi-cam: same person from several framings (ReActor identity
+            # swap onto angle portraits) so actor beats cut between angles.
+            actor_angles = saasshorts_local.generate_actor_angles_local(
+                actor_img, actor_desc, output_dir, title_slug, log=log)
+            log(f"[local] Shot marks: {len(actor_marks)} of {len(script.get('segments', []))} segments")
+            talking_head = saasshorts_local.generate_talking_head_local(
+                actor_img, audio_path, talking_head, log=log,
+                shot_marks=actor_marks,
+                planned_duration=script.get("duration_seconds"),
+                image_paths=actor_angles,
+            )
+        elif video_mode == "lowcost":
             log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This takes 2-5 minutes.")
             talking_head = generate_talking_head_lowcost(actor_img, audio_path, fal_key, talking_head)
         else:
@@ -1422,6 +1632,17 @@ def generate_full_video(
         if seg.get("broll_prompt") and seg.get("visual") == "broll"
     ]
 
+    # The script's beat times assume the planned 60 s; the real narration
+    # runs at its own pace. Scale the placements by the same factor the
+    # shot plan uses, or a 48 s b-roll beat lands past the end of a 45 s
+    # video and the composite silently drops it.
+    try:
+        audio_dur = _get_media_duration(audio_path)
+    except Exception:
+        audio_dur = 0.0
+    planned = float(script.get("duration_seconds") or 0)
+    time_factor = (audio_dur / planned) if (audio_dur > 0 and planned > 0) else 1.0
+
     broll_clips = []
     if broll_segments:
         # Check which b-roll clips need generating
@@ -1430,10 +1651,10 @@ def generate_full_video(
             broll_path = os.path.join(output_dir, f"{title_slug}_broll_{i}.mp4")
             if _exists(broll_path):
                 broll_clips.append({
-                    "path": broll_path,
-                    "start": seg["start"],
-                    "end": seg["end"],
-                })
+                            "path": broll_path,
+                            "start": seg["start"] * time_factor,
+                            "end": seg["end"] * time_factor,
+                        })
                 log(f"  ✅ B-roll {i} cached, skipping.")
             else:
                 broll_to_generate.append((i, seg, broll_path))
@@ -1443,9 +1664,19 @@ def generate_full_video(
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {}
                 for i, seg, broll_path in broll_to_generate:
-                    future = executor.submit(
-                        generate_broll, seg["broll_prompt"], fal_key, broll_path
-                    )
+                    if video_mode == "local":
+                        # ComfyUI's own queue serializes GPU work per instance -
+                        # the pool only parallelizes HTTP submissions (D7).
+                        future = executor.submit(
+                            saasshorts_local.generate_broll_local,
+                            seg["broll_prompt"], broll_path,
+                            str(max(1, int(round((seg.get("end") or 5) - (seg.get("start") or 0))))),
+                            log=log,
+                        )
+                    else:
+                        future = executor.submit(
+                            generate_broll, seg["broll_prompt"], fal_key, broll_path
+                        )
                     futures[future] = {"seg": seg, "path": broll_path}
 
                 for future in as_completed(futures):
@@ -1454,8 +1685,8 @@ def generate_full_video(
                         path = future.result()
                         broll_clips.append({
                             "path": path,
-                            "start": info["seg"]["start"],
-                            "end": info["seg"]["end"],
+                            "start": info["seg"]["start"] * time_factor,
+                            "end": info["seg"]["end"] * time_factor,
                         })
                         log(f"  ✅ B-roll clip ready: {os.path.basename(path)}")
                     except Exception as e:
@@ -1482,7 +1713,16 @@ def generate_full_video(
 
     # Cost estimate
     audio_duration = _get_media_duration(audio_path)
-    if video_mode == "lowcost":
+    if video_mode == "local":
+        # FR7: everything ran on the user's own GPU - nothing to bill.
+        cost = {
+            "actor_image_comfyui": 0.00,
+            "voiceover_local_tts": 0.00,
+            "talking_head_wan_lipsync": 0.00,
+            "broll_comfyui": 0.00,
+            "ffmpeg_compositing": 0.00,
+        }
+    elif video_mode == "lowcost":
         cost = {
             "actor_image_flux": 0.05,
             "voiceover_elevenlabs": round(len(full_narration) * 0.00003, 3),
