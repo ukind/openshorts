@@ -75,6 +75,7 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 - Individual SEO video pages with og:video meta tags (`/video/{id}`)
 - JSON-LD structured data for search engines
 - Avatar gallery with prompt history
+- **Mode badges**: each video card shows its cost mode — PREMIUM (gold), LOW COST (green), or LOCAL (blue) for fully-local generation
 
 ### 4. VoiceOver — AI-narrated shorts with styled captions
 Turn any clip into a narrated short: AI caption suggestions → TTS voiceover → ducked mix → burned captions, all in one guided workflow.
@@ -413,7 +414,7 @@ Gemini key. Two things to know:
 
 ### 7. AI Shorts fully local (video_mode `local`, optional)
 
-The third AI Shorts mode runs every paid media stage on your own GPU: actor portraits (Flux GGUF), the talking head (Wan2.2 image-to-video + LatentSync lip-sync), b-roll (Flux schnell), and the voiceover (any OpenAI-compatible TTS server). Generation makes zero cloud calls, costs $0 per video, and has no time limit. Sharing a finished video to the public gallery stays an explicit choice, same as the cloud modes. The analyze and script text stages are unchanged — they follow the normal text configuration: a Gemini key or the `LLM_*` endpoint (a local Ollama works, see section 6).
+The third AI Shorts mode runs every paid media stage on your own GPU: actor portraits (Flux GGUF), the talking head (Wan2.2 image-to-video + LatentSync lip-sync), b-roll (Flux schnell), and the voiceover (any OpenAI-compatible TTS server). Generation makes zero cloud calls, costs $0 per video, and has no time limit. Sharing a finished video to the public gallery stays an explicit choice, same as the cloud modes. The analyze and script text stages are the only text work in a local job — they do not run on ComfyUI. They follow the normal text configuration: a Gemini key or the `LLM_*` endpoint. A local Ollama works; see [Text stages (local LLM)](#text-stages-local-llm) below for model and context guidance.
 
 Hardware: an NVIDIA GPU with ~10 GB VRAM (calibrated on an RTX 3080) and 32 GB RAM. Start ComfyUI and the TTS server before you start a job.
 
@@ -424,6 +425,26 @@ Hardware: an NVIDIA GPU with ~10 GB VRAM (calibrated on an RTX 3080) and 32 GB R
 - The repo ships API-format workflows under `workflows/`. To run a different model on one stage, export your own workflow from the ComfyUI UI ("Save (API Format)") and point the stage's `COMFYUI_WORKFLOW_*` variable at it. Keep the `load_video` / `load_audio` node ids and their string upload refs in the lipsync template; the validator below checks that.
 
 **TTS server:** any OpenAI-compatible server exposing `POST /v1/audio/speech` and `GET /v1/voices` (for example omnivoice-server). `TTS_BASE_URL` has no default: a local job fails fast and names the missing variable.
+
+#### Text stages (local LLM)
+
+The analyze and script stages do not run on ComfyUI or the TTS server — they are text work. With no Gemini key, they run on the `LLM_*` endpoint (same vars as section 6). Three things matter for a local model:
+
+- **Model size.** The script stage sends `response_format=json_schema` with strict mode, so the model grammar-forces the `{"scripts": [...]}` shape and cannot garble it. 3B models still fail the shape; 7-8B models return valid JSON reliably. If the provider rejects `response_format`, the call falls back to plain text and parses it with a brace-slice, so an older server still works.
+- **Context length.** The script call sets `max_tokens=8192`, so the model needs at least 8k context. Ollama defaults to 4096 and truncates silently — raise `num_ctx` in a Modelfile.
+- **Quality gate.** A 3-retry loop checks the total narration word count (100+ words across all segments) and retries with an explicit correction if the model returns telegraph-style 10-word lines. Every downstream stage scales to the narration length, so a short script ships a 13-second video.
+
+```bash
+# .env — text stages for local AI Shorts (same vars as section 6)
+# Backend in Docker? Use http://host.docker.internal:11434/v1 — 127.0.0.1
+# inside the container is the container, not your Ollama.
+LLM_BASE_URL=http://127.0.0.1:11434/v1
+LLM_API_KEY=ollama
+LLM_MODEL=qwen2.5:14b
+LLM_MODEL_SAAS=qwen2.5:14b        # the SaaS analyze/script model (defaults to LLM_MODEL)
+```
+
+With a Gemini key set alongside, the text stages use Gemini and the media stages stay local — both paths work.
 
 **Environment (`.env`):**
 ```bash
